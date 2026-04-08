@@ -149,3 +149,291 @@ impl Default for SecurityLayer {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::IpAddr;
+
+    fn localhost() -> IpAddr {
+        "127.0.0.1".parse().unwrap()
+    }
+
+    fn other_ip() -> IpAddr {
+        "10.0.0.1".parse().unwrap()
+    }
+
+    // ─── Verdict helpers ─────────────────────────────────────────────────────
+
+    #[test]
+    fn verdict_allow_is_not_blocked() {
+        assert!(!Verdict::Allow.is_blocked());
+        assert!(Verdict::Allow.reason().is_none());
+    }
+
+    #[test]
+    fn verdict_block_is_blocked() {
+        let v = Verdict::Block("test reason".into());
+        assert!(v.is_blocked());
+        assert_eq!(v.reason(), Some("test reason"));
+    }
+
+    #[test]
+    fn verdict_equality() {
+        assert_eq!(Verdict::Allow, Verdict::Allow);
+        assert_eq!(Verdict::Block("x".into()), Verdict::Block("x".into()));
+        assert_ne!(Verdict::Allow, Verdict::Block("x".into()));
+    }
+
+    // ─── SecurityLayer disabled ──────────────────────────────────────────────
+
+    #[test]
+    fn disabled_layer_allows_everything() {
+        let layer = SecurityLayer::with_config(SecurityConfig {
+            enabled: false,
+            ..Default::default()
+        });
+        let params = &[("q", "1 UNION SELECT * FROM users")];
+        assert_eq!(layer.check_input(localhost(), params), Verdict::Allow);
+    }
+
+    #[test]
+    fn disabled_layer_allows_code_injection() {
+        let layer = SecurityLayer::with_config(SecurityConfig {
+            enabled: false,
+            ..Default::default()
+        });
+        let params = &[("input", "eval(base64_decode('bWFsaWNpb3Vz'))")];
+        assert_eq!(layer.check_input(localhost(), params), Verdict::Allow);
+    }
+
+    // ─── Individual guard toggles ────────────────────────────────────────────
+
+    #[test]
+    fn sql_guard_disabled_allows_injection() {
+        let layer = SecurityLayer::with_config(SecurityConfig {
+            enabled: true,
+            sql_guard: false,
+            code_injection_guard: false,
+            behaviour_guard: false,
+        });
+        let params = &[("id", "1 UNION SELECT * FROM users")];
+        assert_eq!(layer.check_input(localhost(), params), Verdict::Allow);
+    }
+
+    #[test]
+    fn code_guard_disabled_allows_code_injection() {
+        let layer = SecurityLayer::with_config(SecurityConfig {
+            enabled: true,
+            sql_guard: false,
+            code_injection_guard: false,
+            behaviour_guard: false,
+        });
+        let params = &[("cmd", "eval(base64_decode('bWFsaWNpb3Vz'))")];
+        assert_eq!(layer.check_input(localhost(), params), Verdict::Allow);
+    }
+
+    #[test]
+    fn sql_guard_enabled_blocks_injection() {
+        let layer = SecurityLayer::with_config(SecurityConfig {
+            enabled: true,
+            sql_guard: true,
+            code_injection_guard: false,
+            behaviour_guard: false,
+        });
+        let params = &[("id", "1 UNION SELECT * FROM users")];
+        assert!(layer.check_input(localhost(), params).is_blocked());
+    }
+
+    #[test]
+    fn code_guard_enabled_blocks_code_injection() {
+        let layer = SecurityLayer::with_config(SecurityConfig {
+            enabled: true,
+            sql_guard: false,
+            code_injection_guard: true,
+            behaviour_guard: false,
+        });
+        let params = &[("payload", "system('whoami')")];
+        assert!(layer.check_input(localhost(), params).is_blocked());
+    }
+
+    // ─── Empty / trivial inputs ──────────────────────────────────────────────
+
+    #[test]
+    fn empty_params_returns_allow() {
+        let layer = SecurityLayer::new();
+        assert_eq!(layer.check_input(localhost(), &[]), Verdict::Allow);
+    }
+
+    #[test]
+    fn safe_params_return_allow() {
+        let layer = SecurityLayer::new();
+        let params = &[
+            ("name", "Jane Doe"),
+            ("email", "jane@example.com"),
+            ("age", "30"),
+        ];
+        assert_eq!(layer.check_input(localhost(), params), Verdict::Allow);
+    }
+
+    // ─── Multi-param scanning ────────────────────────────────────────────────
+
+    #[test]
+    fn sql_in_second_param_is_blocked() {
+        let layer = SecurityLayer::with_config(SecurityConfig {
+            enabled: true,
+            sql_guard: true,
+            code_injection_guard: false,
+            behaviour_guard: false,
+        });
+        let params = &[
+            ("name", "safe value"),
+            ("id", "1 UNION SELECT * FROM users"),
+        ];
+        assert!(layer.check_input(localhost(), params).is_blocked());
+    }
+
+    #[test]
+    fn code_in_third_param_is_blocked() {
+        let layer = SecurityLayer::with_config(SecurityConfig {
+            enabled: true,
+            sql_guard: false,
+            code_injection_guard: true,
+            behaviour_guard: false,
+        });
+        let params = &[
+            ("a", "normal"),
+            ("b", "also normal"),
+            ("c", "eval(base64_decode('bWFsaWNpb3Vz'))"),
+        ];
+        assert!(layer.check_input(localhost(), params).is_blocked());
+    }
+
+    // ─── Behaviour guard integration ─────────────────────────────────────────
+
+    #[test]
+    fn behaviour_guard_disabled_allows_burst() {
+        let layer = SecurityLayer::with_behaviour_config(
+            SecurityConfig {
+                enabled: true,
+                sql_guard: false,
+                code_injection_guard: false,
+                behaviour_guard: false,
+            },
+            BehaviourConfig {
+                max_rps: 1,
+                ..Default::default()
+            },
+        );
+        // Fire 500 requests — should all be allowed because behaviour_guard is disabled
+        for _ in 0..500 {
+            assert_eq!(
+                layer.check_input(localhost(), &[("v", "safe")]),
+                Verdict::Allow
+            );
+        }
+    }
+
+    #[test]
+    fn sql_injection_records_sqli_attempt_for_behaviour_guard() {
+        // When SQL injection is detected, check_input calls record_sqli_attempt
+        // so that reaching the SQLi threshold blocks the IP even on clean requests.
+        let layer = SecurityLayer::with_behaviour_config(
+            SecurityConfig {
+                enabled: true,
+                sql_guard: true,
+                code_injection_guard: false,
+                behaviour_guard: true,
+            },
+            BehaviourConfig {
+                sqli_block_threshold: 2,
+                max_rps: 100_000,
+                ..Default::default()
+            },
+        );
+        let ip = other_ip();
+        let sqli = &[("id", "1 UNION SELECT 1,2,3")];
+        let safe = &[("id", "42")];
+
+        // Each SQL injection also calls record_sqli_attempt internally
+        assert!(layer.check_input(ip, sqli).is_blocked()); // 1st SQLi attempt
+        assert!(layer.check_input(ip, sqli).is_blocked()); // 2nd — reaches threshold
+
+        // Now even a safe request from this IP is blocked by the behaviour guard
+        assert!(layer.check_input(ip, safe).is_blocked(),
+            "IP should be permanently blocked after 2 SQLi attempts");
+    }
+
+    #[test]
+    fn record_request_error_propagates_to_behaviour_guard() {
+        let layer = SecurityLayer::with_behaviour_config(
+            SecurityConfig {
+                enabled: true,
+                sql_guard: false,
+                code_injection_guard: false,
+                behaviour_guard: true,
+            },
+            BehaviourConfig {
+                scanning_min_requests: 3,
+                scanning_error_rate: 0.6,
+                max_rps: 100_000,
+                ..Default::default()
+            },
+        );
+        let ip: IpAddr = "172.31.0.1".parse().unwrap();
+
+        for _ in 0..3 {
+            layer.check_input(ip, &[("x", "normal")]);
+        }
+        // Mark all 3 as errors → 100% error rate
+        for _ in 0..3 {
+            layer.record_request(ip, true);
+        }
+        // Next request should be flagged as scanning
+        let v = layer.check_input(ip, &[("x", "normal")]);
+        assert!(v.is_blocked(), "Scanning should be detected after high error rate");
+    }
+
+    // ─── Guard ordering: Behaviour → SQL → Code ──────────────────────────────
+
+    #[test]
+    fn blocked_by_behaviour_guard_before_sql_check() {
+        let layer = SecurityLayer::with_behaviour_config(
+            SecurityConfig {
+                enabled: true,
+                sql_guard: true,
+                code_injection_guard: true,
+                behaviour_guard: true,
+            },
+            BehaviourConfig {
+                sqli_block_threshold: 1,
+                max_rps: 100_000,
+                ..Default::default()
+            },
+        );
+        let ip: IpAddr = "192.168.1.100".parse().unwrap();
+
+        // Trigger behaviour block first
+        layer.check_input(ip, &[("id", "1 UNION SELECT 1")]);  // records SQLi
+        // IP is now blocked. Even with a SQL payload, behaviour guard fires first.
+        let v = layer.check_input(ip, &[("id", "1 UNION SELECT 1")]);
+        assert!(v.is_blocked());
+        // Reason should mention "temporarily blocked" (behaviour guard), not SQL
+        let reason = v.reason().unwrap();
+        assert!(
+            reason.contains("temporarily blocked") || reason.contains("Rate limit"),
+            "Expected behaviour-guard reason, got: {reason}"
+        );
+    }
+
+    // ─── SecurityConfig defaults ─────────────────────────────────────────────
+
+    #[test]
+    fn default_config_has_all_guards_enabled() {
+        let cfg = SecurityConfig::default();
+        assert!(cfg.enabled);
+        assert!(cfg.sql_guard);
+        assert!(cfg.code_injection_guard);
+        assert!(cfg.behaviour_guard);
+    }
+}

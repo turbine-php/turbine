@@ -1005,6 +1005,7 @@ fn cmd_serve(
     let behaviour_config = BehaviourConfig {
         max_rps: config.security.max_requests_per_second,
         window_seconds: config.security.rate_limit_window,
+        sqli_block_threshold: config.security.sqli_block_threshold,
         ..BehaviourConfig::default()
     };
     let security = SecurityLayer::with_behaviour_config(sec_config, behaviour_config);
@@ -2317,8 +2318,37 @@ async fn handle_request_inner(
     debug!(method = %request.method, path = %request.path, "Request received");
 
     let client_ip = remote_addr.ip();
+
+    // Build the list of input parameters to scan for injection patterns.
+    // We include GET query params, POST form params, AND the raw body — this
+    // ensures JSON POST bodies are also covered by the SQL / code injection guards.
     let query_params = request.get_params();
-    let param_refs: Vec<(&str, &str)> = query_params.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let post_params  = request.post_params();
+
+    // Raw body scan: treat the first BODY_SCAN_LIMIT bytes as a single parameter so
+    // that JSON-encoded payloads (e.g. {"q":"1 UNION SELECT *"}) are inspected even
+    // when Content-Type is application/json (which post_params() skips).
+    // We cap at 8 KB: injection payloads are always near the beginning; scanning
+    // a multi-MB upload body would waste CPU without any security benefit.
+    const BODY_SCAN_LIMIT: usize = 8192;
+    let raw_body_str = if !request.body.is_empty() && post_params.is_empty() {
+        let slice = &request.body[..request.body.len().min(BODY_SCAN_LIMIT)];
+        // Use from_utf8_lossy — non-UTF-8 bytes become U+FFFD, but patterns won't match them.
+        String::from_utf8_lossy(slice).into_owned()
+    } else {
+        String::new()
+    };
+
+    let mut all_params: Vec<(String, String)> = Vec::with_capacity(
+        query_params.len() + post_params.len() + if raw_body_str.is_empty() { 0 } else { 1 }
+    );
+    all_params.extend(query_params);
+    all_params.extend(post_params);
+    if !raw_body_str.is_empty() {
+        all_params.push(("_body".to_string(), raw_body_str));
+    }
+
+    let param_refs: Vec<(&str, &str)> = all_params.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 
     let php_path = app.resolve_path(&request.path);
 

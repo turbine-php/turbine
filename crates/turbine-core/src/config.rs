@@ -170,6 +170,9 @@ pub struct SecurityConfig {
     /// Rate limit: time window in seconds.
     #[serde(default = "default_rate_limit_window")]
     pub rate_limit_window: u64,
+    /// Number of SQL injection attempts from a single IP before permanently blocking it.
+    #[serde(default = "default_sqli_block_threshold")]
+    pub sqli_block_threshold: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -525,6 +528,10 @@ fn default_rate_limit_window() -> u64 {
     60
 }
 
+fn default_sqli_block_threshold() -> u32 {
+    3
+}
+
 fn default_workers() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
@@ -728,6 +735,7 @@ impl Default for SecurityConfig {
             behaviour_guard: true,
             max_requests_per_second: default_rate_limit_rps(),
             rate_limit_window: default_rate_limit_window(),
+            sqli_block_threshold: default_sqli_block_threshold(),
         }
     }
 }

@@ -205,4 +205,176 @@ mod tests {
         let v = guard.check("1; DELETE FROM sessions");
         assert!(v.is_blocked());
     }
+
+    // ─── Additional pattern coverage ─────────────────────────────────────────
+
+    #[test]
+    fn blocks_load_file() {
+        let guard = SqlGuard::new();
+        let v = guard.check("1 AND LOAD_FILE('/etc/passwd')");
+        assert!(v.is_blocked(), "load_file( should be blocked");
+    }
+
+    #[test]
+    fn blocks_into_outfile() {
+        let guard = SqlGuard::new();
+        let v = guard.check("1 INTO OUTFILE '/var/www/shell.php'");
+        assert!(v.is_blocked(), "into outfile should be blocked");
+    }
+
+    #[test]
+    fn blocks_concat_hex() {
+        let guard = SqlGuard::new();
+        let v = guard.check("1 AND EXTRACTVALUE(1,CONCAT(0x7e,(SELECT version())))");
+        assert!(v.is_blocked(), "concat(0x should be blocked");
+    }
+
+    #[test]
+    fn blocks_extractvalue() {
+        let guard = SqlGuard::new();
+        let v = guard.check("EXTRACTVALUE(1,CONCAT(0x7e,version()))");
+        assert!(v.is_blocked(), "extractvalue( should be blocked");
+    }
+
+    #[test]
+    fn blocks_updatexml() {
+        let guard = SqlGuard::new();
+        let v = guard.check("UPDATEXML(1,CONCAT(0x7e,(SELECT user())),1)");
+        assert!(v.is_blocked(), "updatexml( should be blocked");
+    }
+
+    #[test]
+    fn blocks_waitfor_delay() {
+        let guard = SqlGuard::new();
+        let v = guard.check("1'; WAITFOR DELAY '0:0:5'--");
+        assert!(v.is_blocked(), "waitfor delay should be blocked (MSSQL)");
+    }
+
+    #[test]
+    fn blocks_pg_sleep() {
+        let guard = SqlGuard::new();
+        let v = guard.check("1 AND PG_SLEEP(5)");
+        assert!(v.is_blocked(), "pg_sleep( should be blocked");
+    }
+
+    #[test]
+    fn blocks_benchmark() {
+        let guard = SqlGuard::new();
+        let v = guard.check("1 AND BENCHMARK(10000000,MD5('x'))");
+        assert!(v.is_blocked(), "benchmark( should be blocked");
+    }
+
+    #[test]
+    fn blocks_group_concat() {
+        let guard = SqlGuard::new();
+        let v = guard.check("1 AND GROUP_CONCAT(username,':',password) FROM users");
+        assert!(v.is_blocked(), "group_concat( should be blocked");
+    }
+
+    #[test]
+    fn blocks_char_hex() {
+        let guard = SqlGuard::new();
+        let v = guard.check("CHAR(0x41,0x42,0x43)");
+        assert!(v.is_blocked(), "char(0x should be blocked");
+    }
+
+    #[test]
+    fn blocks_comment_bypass() {
+        let guard = SqlGuard::new();
+        let v = guard.check("1/**/UNION/**/SELECT/**/1,2,3");
+        assert!(v.is_blocked(), "/**/ comment bypass should be blocked");
+    }
+
+    #[test]
+    fn blocks_drop_database() {
+        let guard = SqlGuard::new();
+        let v = guard.check("'; DROP DATABASE production;--");
+        assert!(v.is_blocked());
+    }
+
+    #[test]
+    fn blocks_truncate() {
+        let guard = SqlGuard::new();
+        let v = guard.check("'; TRUNCATE TABLE users;--");
+        assert!(v.is_blocked());
+    }
+
+    #[test]
+    fn blocks_delete_from() {
+        let guard = SqlGuard::new();
+        let v = guard.check("1; DELETE FROM users WHERE 1=1");
+        assert!(v.is_blocked());
+    }
+
+    #[test]
+    fn blocks_insert_injection() {
+        let guard = SqlGuard::new();
+        let v = guard.check("', 'hacked'); INSERT INTO users VALUES ('x");
+        assert!(v.is_blocked());
+    }
+
+    #[test]
+    fn blocks_column_name() {
+        let guard = SqlGuard::new();
+        let v = guard.check("1 UNION SELECT column_name FROM information_schema.columns");
+        assert!(v.is_blocked());
+    }
+
+    #[test]
+    fn blocks_into_dumpfile() {
+        let guard = SqlGuard::new();
+        let v = guard.check("1 INTO DUMPFILE '/tmp/out.txt'");
+        assert!(v.is_blocked());
+    }
+
+    #[test]
+    fn blocks_exp_blind() {
+        let guard = SqlGuard::new();
+        // exp(~(SELECT*FROM(SELECT...)x)) — overflow-based blind injection
+        let v = guard.check("1 AND EXP(~(SELECT * FROM users))");
+        assert!(v.is_blocked(), "exp(~( should be blocked");
+    }
+
+    #[test]
+    fn allows_normal_select_without_keywords() {
+        let guard = SqlGuard::new();
+        // "select" alone is not blocked — only dangerous combinations
+        assert_eq!(guard.check("products"), Verdict::Allow);
+        assert_eq!(guard.check("user profile"), Verdict::Allow);
+        assert_eq!(guard.check("orderby=price"), Verdict::Allow);
+    }
+
+    #[test]
+    fn block_reason_contains_pattern_name() {
+        let guard = SqlGuard::new();
+        let v = guard.check("1 UNION SELECT 1,2,3");
+        assert!(v.is_blocked());
+        let reason = v.reason().expect("blocked verdict must have reason");
+        assert!(
+            reason.contains("union select"),
+            "reason should name the matched pattern, got: {reason}"
+        );
+    }
+
+    #[test]
+    fn cached_safe_input_stays_safe() {
+        let guard = SqlGuard::new();
+        let input = "safe plain text";
+        assert_eq!(guard.check(input), Verdict::Allow);
+        assert_eq!(guard.check(input), Verdict::Allow);
+        assert_eq!(guard.cache_size(), 1);
+    }
+
+    #[test]
+    fn cache_cleared_then_rescanned() {
+        let guard = SqlGuard::new();
+        let input = "1 UNION SELECT 1";
+        assert!(guard.check(input).is_blocked());
+        assert_eq!(guard.cache_size(), 1);
+        guard.clear_cache();
+        assert_eq!(guard.cache_size(), 0);
+        // Re-scan after clear must still block
+        assert!(guard.check(input).is_blocked());
+        assert_eq!(guard.cache_size(), 1);
+    }
 }

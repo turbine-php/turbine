@@ -325,4 +325,191 @@ mod tests {
 
         assert!(guard.total_blocked() >= 2);
     }
+
+    // ─── Additional behaviour guard coverage ─────────────────────────────────
+
+    #[test]
+    fn fresh_guard_has_zero_total_blocked() {
+        let guard = BehaviourGuard::new();
+        assert_eq!(guard.total_blocked(), 0);
+    }
+
+    #[test]
+    fn fresh_guard_tracks_zero_ips() {
+        let guard = BehaviourGuard::new();
+        assert_eq!(guard.tracked_ips(), 0);
+    }
+
+    #[test]
+    fn first_request_is_always_allowed() {
+        let guard = BehaviourGuard::new();
+        let v = guard.check_request("192.168.1.1".parse().unwrap());
+        assert_eq!(v, Verdict::Allow);
+    }
+
+    #[test]
+    fn record_request_increments_error_count_toward_scanning() {
+        let config = BehaviourConfig {
+            scanning_min_requests: 4,
+            scanning_error_rate: 0.5,
+            max_rps: 100_000,
+            ..Default::default()
+        };
+        let guard = BehaviourGuard::with_config(config);
+        let ip = "10.10.10.1".parse::<IpAddr>().unwrap();
+
+        for _ in 0..4 {
+            guard.check_request(ip);
+        }
+        // All 4 are errors → 100 % error rate which exceeds 0.5
+        for _ in 0..4 {
+            guard.record_request(ip, true);
+        }
+        // The next check_request should evaluate scanning
+        let v = guard.check_request(ip);
+        assert!(v.is_blocked(), "100% error rate should trigger scanning block");
+        assert!(v.reason().unwrap().contains("Scanning"));
+    }
+
+    #[test]
+    fn scanning_block_raises_total_blocked_counter() {
+        let config = BehaviourConfig {
+            scanning_min_requests: 4,
+            scanning_error_rate: 0.5,
+            max_rps: 100_000,
+            ..Default::default()
+        };
+        let guard = BehaviourGuard::with_config(config);
+        let ip = "10.20.30.40".parse::<IpAddr>().unwrap();
+
+        for _ in 0..4 {
+            guard.check_request(ip);
+        }
+        for _ in 0..4 {
+            guard.record_request(ip, true);
+        }
+        guard.check_request(ip); // triggers scanning block
+        assert!(guard.total_blocked() >= 1);
+    }
+
+    #[test]
+    fn sqli_single_attempt_below_threshold_does_not_block() {
+        let config = BehaviourConfig {
+            sqli_block_threshold: 3,
+            ..Default::default()
+        };
+        let guard = BehaviourGuard::with_config(config);
+        let ip = localhost();
+
+        guard.check_request(ip);
+        guard.record_sqli_attempt(ip); // only 1, threshold is 3
+        assert_eq!(guard.check_request(ip), Verdict::Allow);
+    }
+
+    #[test]
+    fn sqli_at_threshold_blocks_immediately() {
+        let config = BehaviourConfig {
+            sqli_block_threshold: 3,
+            ..Default::default()
+        };
+        let guard = BehaviourGuard::with_config(config);
+        let ip = localhost();
+
+        guard.check_request(ip);
+        guard.record_sqli_attempt(ip);
+        guard.record_sqli_attempt(ip);
+        guard.record_sqli_attempt(ip); // reaches threshold
+
+        assert!(guard.check_request(ip).is_blocked());
+    }
+
+    #[test]
+    fn sqli_block_reason_mentions_ip() {
+        let config = BehaviourConfig {
+            sqli_block_threshold: 1,
+            ..Default::default()
+        };
+        let guard = BehaviourGuard::with_config(config);
+        let ip: IpAddr = "172.16.0.5".parse().unwrap();
+
+        guard.check_request(ip);
+        guard.record_sqli_attempt(ip);
+
+        let v = guard.check_request(ip);
+        assert!(v.is_blocked());
+        let reason = v.reason().unwrap();
+        assert!(reason.contains("172.16.0.5"), "Reason should include the IP, got: {reason}");
+    }
+
+    #[test]
+    fn multiple_ips_sqli_blocked_independently() {
+        let config = BehaviourConfig {
+            sqli_block_threshold: 1,
+            ..Default::default()
+        };
+        let guard = BehaviourGuard::with_config(config);
+        let bad: IpAddr = "1.2.3.4".parse().unwrap();
+        let good: IpAddr = "5.6.7.8".parse().unwrap();
+
+        guard.check_request(bad);
+        guard.record_sqli_attempt(bad);
+        guard.check_request(good);
+
+        assert!(guard.check_request(bad).is_blocked(), "bad IP should be blocked");
+        assert_eq!(guard.check_request(good), Verdict::Allow, "good IP must stay allowed");
+        assert_eq!(guard.tracked_ips(), 2);
+    }
+
+    #[test]
+    fn rate_limit_block_reason_contains_rps() {
+        let config = BehaviourConfig {
+            max_rps: 2,
+            ..Default::default()
+        };
+        let guard = BehaviourGuard::with_config(config);
+        let ip = localhost();
+
+        let mut blocked_reason = None;
+        for _ in 0..200 {
+            let v = guard.check_request(ip);
+            if v.is_blocked() {
+                blocked_reason = Some(v.reason().unwrap().to_owned());
+                break;
+            }
+        }
+        let reason = blocked_reason.expect("should have been rate-limited");
+        assert!(
+            reason.contains("Rate limit exceeded"),
+            "Reason should say 'Rate limit exceeded', got: {reason}"
+        );
+    }
+
+    #[test]
+    fn default_config_uses_100_max_rps() {
+        let cfg = BehaviourConfig::default();
+        assert_eq!(cfg.max_rps, 100);
+        assert_eq!(cfg.sqli_block_threshold, 3);
+        assert_eq!(cfg.window_seconds, 60);
+    }
+
+    #[test]
+    fn record_request_no_error_does_not_change_error_count() {
+        let config = BehaviourConfig {
+            scanning_min_requests: 2,
+            scanning_error_rate: 0.4,
+            max_rps: 100_000,
+            ..Default::default()
+        };
+        let guard = BehaviourGuard::with_config(config);
+        let ip = "192.168.50.1".parse::<IpAddr>().unwrap();
+
+        for _ in 0..2 {
+            guard.check_request(ip);
+        }
+        // Record successful responses — should NOT trigger scanning
+        for _ in 0..2 {
+            guard.record_request(ip, false);
+        }
+        assert_eq!(guard.check_request(ip), Verdict::Allow);
+    }
 }

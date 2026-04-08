@@ -1,0 +1,24 @@
+# Turbine — Security Demo
+# All OWASP guards enabled with a low rate-limit for demo purposes.
+
+[server]
+workers = 2
+listen = "127.0.0.1:8083"
+request_timeout = 10
+
+[php]
+memory_limit = "64M"
+max_execution_time = 10
+
+[security]
+enabled = true
+sql_guard              = true
+code_injection_guard   = true
+path_traversal_guard   = true
+behaviour_guard        = true
+max_requests_per_second = 10000      # high enough to never rate-limit during demo
+rate_limit_window       = 60
+sqli_block_threshold    = 100        # block IP only after 100 SQLi attempts (demo-friendly)
+
+[logging]
+level = "info"

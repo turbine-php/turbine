@@ -9,7 +9,7 @@ Turbine replaces the traditional **Nginx + PHP-FPM + OPcache** stack with a sing
 - **Single binary** — no Nginx, no PHP-FPM, no reverse proxy
 - **Persistent workers** — process and thread modes with automatic scaling
 - **Zero-copy IPC** — in-memory channels for thread mode (ZTS)
-- **OWASP security guards** — SQL injection, XSS, path traversal, code injection
+- **OWASP security guards** — SQL injection, code injection, path traversal, behaviour analysis — all in Rust, ~500 ns overhead, zero external WAF needed
 - **ACME auto-TLS** — automatic Let's Encrypt certificates
 - **Virtual hosting** — multiple domains on one server, SNI per-host TLS
 - **OPcache preload** — scripts compiled once, shared across workers
@@ -20,6 +20,46 @@ Turbine replaces the traditional **Nginx + PHP-FPM + OPcache** stack with a sing
 - **Early Hints** — HTTP 103 support
 - **X-Sendfile** — efficient large file delivery
 - **App embedding** — pack your PHP app into the binary
+
+## Security — Built-in, Zero Overhead
+
+Turbine includes a **multi-layered OWASP security system** written in Rust that runs inside the process — no ModSecurity, no WAF appliance, no extra hop.
+
+```
+Request → Execution Whitelist → Data Directory Guard → Path Guard
+        → SQL Injection Guard → Code Injection Guard → Behaviour Guard
+        → PHP Execution
+```
+
+Each guard is an Aho-Corasick automaton (~150 ns). Total overhead across all guards: **~500 ns per request** — negligible compared to PHP execution time.
+
+| Guard | What it blocks | Overhead |
+|-------|---------------|----------|
+| **SQL Injection** | `UNION SELECT`, `SLEEP()`, `WAITFOR DELAY`, `LOAD_FILE`, stacked queries, hex obfuscation, 36 patterns | ~150 ns |
+| **Code Injection** | `eval()`, `system()`, `shell_exec()`, obfuscation chains (`eval(base64_decode(…))`), backtick, `ReflectionFunction`, 36 patterns | ~100–200 ns |
+| **Behaviour Guard** | Rate limiting per IP, scanning detection (high 4xx rate), SQLi accumulation → permanent IP block | ~200 ns |
+| **Path Guard** | `../` traversal, null bytes, double-encoding | ~50 ns |
+| **Execution Whitelist** | Only whitelisted PHP files are executable via HTTP | O(1) hash |
+| **Data Dir Guard** | PHP execution inside `uploads/`, `storage/` is always blocked | O(1) |
+
+POST bodies (JSON and form-encoded) are also scanned — not just query strings.
+
+All guards are enabled by default. Toggle individually in `turbine.toml`:
+
+```toml
+[security]
+enabled                = true
+sql_guard              = true
+code_injection_guard   = true
+path_traversal_guard   = true
+behaviour_guard        = true
+max_requests_per_second = 100
+sqli_block_threshold   = 3      # block IP after N SQLi attempts
+```
+
+> **Try it live:** the [`examples/raw-php/security-demo`](examples/raw-php/security-demo/) example ships an interactive browser UI where you can fire every attack type and watch them blocked in real time.
+
+See [docs/security.md](docs/security.md) for the full reference.
 
 ## Requirements
 
@@ -213,7 +253,7 @@ See [docs/tls.md](docs/tls.md) for ACME auto-TLS setup.
 | **Worker modes** | [**docs/worker.md**](docs/worker.md) — process vs thread, the key choice |
 | Configuration reference | [docs/config.md](docs/config.md) |
 | Building from source | [docs/compile.md](docs/compile.md) |
-| Security model | [docs/security.md](docs/security.md) |
+| **Security model** | [**docs/security.md**](docs/security.md) — OWASP guards, sandbox, PHP hardening |
 | Performance | [docs/performance.md](docs/performance.md) |
 | Laravel integration | [docs/laravel.md](docs/laravel.md) |
 | TLS & ACME | [docs/tls.md](docs/tls.md) |

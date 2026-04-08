@@ -1,6 +1,6 @@
 # Turbine Documentation
 
-Turbine is a high-performance PHP application server written in Rust. It embeds PHP directly via the embed SAPI, eliminating the overhead of PHP-FPM, Nginx, and inter-process communication.
+Turbine is a high-performance PHP application server written in Rust. It embeds PHP directly via the embed SAPI, eliminating the overhead of PHP-FPM, Nginx, and inter-process communication — and ships with a **built-in OWASP security layer** that runs in the same process with ~500 ns overhead, replacing the need for an external WAF or ModSecurity.
 
 ## Architecture
 
@@ -38,7 +38,7 @@ See [Worker Mode](worker.md) for the full guide, benchmarks, and decision flow.
 - **Config-Driven** — Everything configured via `turbine.toml`, no framework auto-detection magic
 - **Built-in HTTP/1.1 & HTTP/2** — Powered by Hyper (Rust), no external web server needed
 - **Embedded PHP 8.4/8.5** — Native embed SAPI, shared OPcache, JIT compilation
-- **OWASP Security Guards** — SQL injection, code injection, path traversal, and rate limiting built into the request pipeline
+- **OWASP Security Guards** — SQL injection (36 patterns), code injection (36 patterns + 7 obfuscation chains), behaviour analysis (rate limiting, SQLi IP banning) — all in Rust, ~500 ns overhead, no WAF required. POST JSON bodies scanned. See [Security](security.md).
 - **Brotli, Zstd, Gzip Compression** — Automatic response compression with configurable algorithms
 - **Auto-scaling Workers** — Dynamic worker pool that scales up/down based on load
 - **ACME Auto-TLS** — Automatic Let's Encrypt certificate provisioning and renewal
