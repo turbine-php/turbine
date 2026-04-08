@@ -1,5 +1,9 @@
 # Turbine
 
+<p align="center">
+  <img src="assets/logo.png" alt="Turbine" width="200" />
+</p>
+
 High-performance PHP application server written in Rust, powered by the PHP embed SAPI — with a **built-in OWASP security layer** that replaces ModSecurity and external WAFs at ~500 ns overhead.
 
 Turbine replaces the traditional **Nginx + PHP-FPM + OPcache** stack with a single binary that embeds PHP directly, eliminating inter-process communication overhead and reducing latency. Security guards (SQL injection, code injection, path traversal, behaviour analysis) run inside the same process — no extra hop, no extra service.
