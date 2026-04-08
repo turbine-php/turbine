@@ -1,0 +1,15 @@
+[package]
+name = "turbine-worker"
+description = "Worker pool management — fork, CoW, state reset"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+turbine-php-sys = { workspace = true }
+turbine-engine = { workspace = true }
+nix = { workspace = true }
+libc = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }

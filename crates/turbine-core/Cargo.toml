@@ -1,0 +1,57 @@
+[package]
+name = "turbine-core"
+description = "Turbine Runtime — high-performance PHP runtime built in Rust"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "turbine"
+path = "src/main.rs"
+
+[dependencies]
+turbine-engine = { workspace = true }
+turbine-worker = { workspace = true }
+turbine-php-sys = { workspace = true }
+turbine-security = { workspace = true }
+turbine-metrics = { workspace = true }
+turbine-cache = { workspace = true }
+tokio = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+clap = { workspace = true }
+multer = { workspace = true }
+futures-core = { workspace = true }
+flate2 = { workspace = true }
+brotli = { workspace = true }
+zstd = { workspace = true }
+notify = { workspace = true }
+xxhash-rust = { workspace = true }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
+
+# ACME auto-provisioning (optional, behind `acme` feature)
+instant-acme = { workspace = true, optional = true }
+rcgen = { workspace = true, optional = true }
+pem = { workspace = true, optional = true }
+
+[features]
+default = []
+acme = ["dep:instant-acme", "dep:rcgen", "dep:pem"]
+embed = []
+
+[build-dependencies]
+flate2 = "1"
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,42 @@
+# Turbine — REST API Example
+# Configuration optimised for a JSON API
+
+[server]
+workers = 4
+listen = "127.0.0.1:8080"
+request_timeout = 15
+
+[php]
+memory_limit = "128M"
+max_execution_time = 15
+
+[security]
+enabled = true
+sql_guard = true
+code_injection_guard = true
+path_traversal_guard = true
+behaviour_guard = true
+max_requests_per_second = 200
+rate_limit_window = 60
+
+[cors]
+enabled = true
+allow_origins = ["*"]
+allow_methods = ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]
+allow_headers = ["Content-Type", "Authorization", "X-Requested-With"]
+max_age = 86400
+
+[compression]
+enabled = true
+min_size = 256
+level = 6
+algorithms = ["br", "gzip"]
+
+[cache]
+enabled = false
+
+[session]
+enabled = false
+
+[logging]
+level = "info"

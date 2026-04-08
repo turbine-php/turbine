@@ -1,0 +1,13 @@
+/target
+/vendor/php-build
+/vendor/php-embed
+/vendor/php-embed-zts
+**/*.rs.bk
+Cargo.lock
+*.swp
+*.swo
+.DS_Store
+.idea/
+.vscode/
+/dev
+/examples/wordpress/public

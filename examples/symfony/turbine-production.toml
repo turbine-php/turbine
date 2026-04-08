@@ -1,0 +1,88 @@
+# Turbine — Symfony Production Configuration
+
+[server]
+workers = 0
+listen = "0.0.0.0:8080"
+worker_mode = "thread"
+request_timeout = 30
+worker_max_requests = 5000
+auto_scale = true
+min_workers = 2
+max_workers = 32
+scale_down_idle_secs = 10
+
+[server.tls]
+enabled = true
+cert_file = "/etc/ssl/certs/app.pem"
+key_file = "/etc/ssl/private/app.key"
+
+[php]
+memory_limit = "256M"
+max_execution_time = 30
+upload_max_filesize = "32M"
+post_max_size = "32M"
+opcache_memory = 256
+jit_buffer_size = "128M"
+preload_script = "config/preload.php"
+
+[php.ini]
+error_reporting = "E_ALL & ~E_DEPRECATED & ~E_STRICT"
+display_errors = "0"
+log_errors = "1"
+date.timezone = "UTC"
+"realpath_cache_size" = "4096k"
+"realpath_cache_ttl" = "600"
+
+[security]
+enabled = true
+sql_guard = true
+code_injection_guard = true
+path_traversal_guard = true
+behaviour_guard = true
+max_requests_per_second = 60
+rate_limit_window = 60
+
+[sandbox]
+execution_mode = "framework"
+data_directories = ["var/", "public/uploads/"]
+blocked_upload_extensions = [".php", ".phtml", ".phar", ".php7", ".php8", ".inc", ".phps", ".pht", ".pgif"]
+scan_upload_content = true
+disabled_functions = ["exec", "system", "passthru", "shell_exec", "popen", "pcntl_exec", "dl", "putenv"]
+enforce_open_basedir = true
+block_url_include = true
+block_url_fopen = false
+
+[cache]
+enabled = true
+ttl_seconds = 60
+max_entries = 4096
+
+[logging]
+level = "warn"
+
+[compression]
+enabled = true
+min_size = 1024
+level = 6
+algorithms = ["br", "zstd", "gzip"]
+
+[session]
+enabled = true
+save_path = "/tmp/turbine-sessions"
+cookie_name = "PHPSESSID"
+cookie_lifetime = 0
+cookie_httponly = true
+cookie_secure = true
+cookie_samesite = "Lax"
+gc_maxlifetime = 1440
+
+[watcher]
+enabled = false
+
+[early_hints]
+enabled = true
+
+[dashboard]
+enabled = true
+statistics = true
+token = "change-me-in-production"

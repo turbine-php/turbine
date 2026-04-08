@@ -1,0 +1,44 @@
+# Turbine Runtime Configuration
+# https://github.com/turbine-php/turbine
+
+[server]
+# Number of worker processes (0 = auto-detect based on CPU cores)
+workers = 0
+# Address to listen on
+listen = "127.0.0.1:8080"
+
+[php]
+# Path to PHP extensions directory (auto-detected if empty)
+# extension_dir = ""
+# Additional PHP ini directives
+# ini = { "memory_limit" = "256M" }
+
+[security]
+# Enable OWASP Top 10 guards
+enabled = true
+# SQL injection guard
+sql_guard = true
+# Path traversal guard
+path_traversal_guard = true
+# Code injection guard
+code_injection_guard = true
+# Behaviour guard (rate limiting, scanning detection)
+behaviour_guard = true
+
+[sandbox]
+# Enable seccomp BPF syscall filtering (Linux only)
+seccomp = true
+# Execution mode: "strict" (only whitelist) or "framework" (auto-detect entry point)
+execution_mode = "framework"
+
+[logging]
+# Log level: trace, debug, info, warn, error
+level = "info"
+
+[dashboard]
+# Enable the /_/dashboard HTML page
+enabled = true
+# Enable /_/metrics and /_/status endpoints
+statistics = true
+# Bearer token to protect internal endpoints (comment out to disable auth)
+# token = "my-secret-token"

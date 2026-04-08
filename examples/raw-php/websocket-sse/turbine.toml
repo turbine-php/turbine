@@ -1,0 +1,29 @@
+# Turbine — Server-Sent Events Example
+# Long-running connections need a generous timeout
+
+[server]
+workers = 8
+listen = "127.0.0.1:8080"
+# SSE connections are long-lived — set a high timeout
+request_timeout = 600
+
+[php]
+memory_limit = "64M"
+max_execution_time = 600
+
+[security]
+enabled = true
+behaviour_guard = false
+
+[compression]
+# Disable compression for SSE (streaming)
+enabled = false
+
+[cache]
+enabled = false
+
+[session]
+enabled = false
+
+[logging]
+level = "info"

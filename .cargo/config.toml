@@ -1,0 +1,8 @@
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-Wl,-rpath,/Users/denerfernandes/ai/rustphp/vendor/php-embed/lib"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-arg=-Wl,-rpath,/Users/denerfernandes/ai/rustphp/vendor/php-embed/lib"]
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-Wl,-rpath,/Users/denerfernandes/ai/rustphp/vendor/php-embed/lib"]

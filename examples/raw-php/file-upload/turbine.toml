@@ -1,0 +1,26 @@
+# Turbine — File Upload Example
+# Demonstrates sandbox upload protections
+
+[server]
+workers = 4
+listen = "127.0.0.1:8080"
+
+[php]
+memory_limit = "128M"
+upload_max_filesize = "10M"
+post_max_size = "12M"
+upload_tmp_dir = "/tmp/turbine-uploads"
+
+[security]
+enabled = true
+
+[sandbox]
+execution_mode = "framework"
+data_directories = ["uploads/"]
+blocked_upload_extensions = [".php", ".phtml", ".phar", ".php7", ".php8", ".inc", ".phps", ".pht", ".pgif"]
+scan_upload_content = true
+enforce_open_basedir = true
+block_url_include = true
+
+[logging]
+level = "info"

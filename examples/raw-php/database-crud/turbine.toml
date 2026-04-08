@@ -1,0 +1,40 @@
+# Turbine — Database CRUD Example
+# SQLite-based CRUD API configuration
+
+[server]
+workers = 4
+listen = "127.0.0.1:8080"
+request_timeout = 15
+
+[php]
+memory_limit = "128M"
+
+[security]
+enabled = true
+sql_guard = true
+code_injection_guard = true
+
+[sandbox]
+execution_mode = "framework"
+data_directories = ["data/"]
+enforce_open_basedir = true
+
+[cors]
+enabled = true
+allow_origins = ["*"]
+allow_methods = ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
+allow_headers = ["Content-Type"]
+
+[compression]
+enabled = true
+min_size = 256
+algorithms = ["br", "gzip"]
+
+[cache]
+enabled = false
+
+[session]
+enabled = false
+
+[logging]
+level = "info"

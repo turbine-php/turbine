@@ -1,0 +1,32 @@
+# Turbine — Session & Authentication Example
+# Secure session configuration
+
+[server]
+workers = 4
+listen = "127.0.0.1:8080"
+request_timeout = 30
+
+[php]
+memory_limit = "128M"
+
+[security]
+enabled = true
+sql_guard = true
+code_injection_guard = true
+path_traversal_guard = true
+behaviour_guard = true
+max_requests_per_second = 30
+rate_limit_window = 60
+
+[session]
+enabled = true
+save_path = "/tmp/turbine-sessions"
+cookie_name = "PHPSESSID"
+cookie_lifetime = 0
+cookie_httponly = true
+cookie_secure = false
+cookie_samesite = "Lax"
+gc_maxlifetime = 1440
+
+[logging]
+level = "info"

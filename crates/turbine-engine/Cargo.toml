@@ -1,0 +1,13 @@
+[package]
+name = "turbine-engine"
+description = "High-level safe wrapper around the PHP embed SAPI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+turbine-php-sys = { workspace = true }
+libc = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

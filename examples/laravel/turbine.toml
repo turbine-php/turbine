@@ -1,0 +1,107 @@
+# Turbine — Laravel Configuration
+# Optimized for a typical Laravel application
+
+[server]
+workers = 0
+listen = "127.0.0.1:8080"
+worker_mode = "process"
+request_timeout = 30
+worker_max_requests = 10000
+channel_capacity = 64
+auto_scale = false
+
+[server.tls]
+enabled = false
+# cert_file = "/path/to/cert.pem"
+# key_file = "/path/to/key.pem"
+
+[php]
+# extensions = ["redis.so", "imagick.so"]
+memory_limit = "256M"
+max_execution_time = 30
+upload_max_filesize = "64M"
+post_max_size = "64M"
+opcache_memory = 128
+jit_buffer_size = "64M"
+upload_tmp_dir = "/tmp/turbine-uploads"
+# Let Turbine auto-generate an OPcache preload script for Laravel
+# preload_script = "auto"
+
+[php.ini]
+error_reporting = "E_ALL"
+date.timezone = "UTC"
+# Laravel needs these
+"session.auto_start" = "0"
+"short_open_tag" = "0"
+
+[security]
+enabled = true
+sql_guard = true
+code_injection_guard = true
+path_traversal_guard = true
+behaviour_guard = true
+max_requests_per_second = 100
+rate_limit_window = 60
+
+[sandbox]
+execution_mode = "framework"
+data_directories = ["storage/", "bootstrap/cache/", "public/uploads/"]
+blocked_upload_extensions = [".php", ".phtml", ".phar", ".php7", ".php8", ".inc", ".phps", ".pht", ".pgif"]
+scan_upload_content = true
+disabled_functions = ["exec", "system", "passthru", "shell_exec", "proc_open", "popen", "pcntl_exec", "dl", "putenv"]
+enforce_open_basedir = true
+block_url_include = true
+block_url_fopen = false
+
+[cache]
+enabled = true
+ttl_seconds = 30
+max_entries = 2048
+
+[logging]
+level = "info"
+# access_log = "/var/log/turbine/laravel-access.log"
+
+[compression]
+enabled = true
+min_size = 1024
+level = 6
+algorithms = ["br", "zstd", "gzip"]
+
+[session]
+enabled = true
+save_path = "/tmp/turbine-sessions"
+cookie_name = "laravel_session"
+cookie_lifetime = 7200
+cookie_httponly = true
+cookie_secure = false
+cookie_samesite = "Lax"
+gc_maxlifetime = 7200
+
+[cors]
+# Let Laravel handle CORS via its middleware, or enable here
+enabled = false
+
+[error_pages]
+# Use Laravel's error pages
+# not_found = "resources/views/errors/404.html"
+# server_error = "resources/views/errors/500.html"
+
+[watcher]
+# Enable for development — auto-restarts workers on file changes
+enabled = false
+paths = ["app/", "config/", "routes/", "resources/views/", "database/"]
+extensions = ["php", "env"]
+debounce_ms = 500
+
+[early_hints]
+enabled = true
+
+[structured_logging]
+enabled = true
+output = "stderr"
+
+[dashboard]
+enabled = true
+statistics = true
+# token = "my-secret-token"

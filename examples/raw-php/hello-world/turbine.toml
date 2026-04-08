@@ -1,0 +1,15 @@
+# Turbine — Hello World
+# Minimal configuration for a simple PHP app
+
+[server]
+workers = 2
+listen = "127.0.0.1:8080"
+
+[php]
+memory_limit = "64M"
+
+[security]
+enabled = false
+
+[logging]
+level = "info"

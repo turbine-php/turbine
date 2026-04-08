@@ -1,0 +1,14 @@
+[package]
+name = "turbine-security"
+description = "OWASP Top 10 security guards — SQLi, XSS, path traversal, code injection"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+aho-corasick = { workspace = true }
+xxhash-rust = { workspace = true }
+dashmap = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }

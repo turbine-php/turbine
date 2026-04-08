@@ -1,0 +1,8 @@
+[package]
+name = "turbine-metrics"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+dashmap = { workspace = true }
+tracing = { workspace = true }
