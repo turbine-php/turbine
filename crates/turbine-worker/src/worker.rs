@@ -329,3 +329,274 @@ impl Drop for Worker {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn make_pipe() -> (i32, i32) {
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        (fds[0], fds[1])
+    }
+
+    // ── Worker State Machine ────────────────────────────────────────
+
+    #[test]
+    fn worker_starts_idle() {
+        let (cmd_r, cmd_w) = make_pipe();
+        let (resp_r, resp_w) = make_pipe();
+        let worker = Worker::new(nix::unistd::Pid::from_raw(99999), 100, cmd_w, resp_r);
+        assert_eq!(worker.state(), WorkerState::Idle);
+        assert_eq!(worker.requests_handled(), 0);
+        // Clean up fds
+        unsafe { libc::close(cmd_r); libc::close(resp_w); }
+        // Drop will try to close cmd_w and resp_r
+    }
+
+    #[test]
+    fn worker_mark_busy_changes_state() {
+        let (cmd_r, cmd_w) = make_pipe();
+        let (resp_r, resp_w) = make_pipe();
+        let mut worker = Worker::new(nix::unistd::Pid::from_raw(99999), 100, cmd_w, resp_r);
+        worker.mark_busy();
+        assert_eq!(worker.state(), WorkerState::Busy);
+        unsafe { libc::close(cmd_r); libc::close(resp_w); }
+    }
+
+    #[test]
+    fn worker_mark_idle_increments_counter() {
+        let (cmd_r, cmd_w) = make_pipe();
+        let (resp_r, resp_w) = make_pipe();
+        let mut worker = Worker::new(nix::unistd::Pid::from_raw(99999), 100, cmd_w, resp_r);
+
+        worker.mark_busy();
+        let should_recycle = worker.mark_idle();
+        assert!(!should_recycle);
+        assert_eq!(worker.requests_handled(), 1);
+        assert_eq!(worker.state(), WorkerState::Idle);
+
+        unsafe { libc::close(cmd_r); libc::close(resp_w); }
+    }
+
+    #[test]
+    fn worker_recycle_at_max_requests() {
+        let (cmd_r, cmd_w) = make_pipe();
+        let (resp_r, resp_w) = make_pipe();
+        let mut worker = Worker::new(nix::unistd::Pid::from_raw(99999), 3, cmd_w, resp_r);
+
+        assert!(!worker.mark_idle()); // 1
+        assert!(!worker.mark_idle()); // 2
+        assert!(worker.mark_idle());  // 3 -- should recycle
+
+        assert_eq!(worker.requests_handled(), 3);
+        unsafe { libc::close(cmd_r); libc::close(resp_w); }
+    }
+
+    #[test]
+    fn worker_no_recycle_when_max_is_zero() {
+        let (cmd_r, cmd_w) = make_pipe();
+        let (resp_r, resp_w) = make_pipe();
+        let mut worker = Worker::new(nix::unistd::Pid::from_raw(99999), 0, cmd_w, resp_r);
+
+        for _ in 0..100 {
+            assert!(!worker.mark_idle());
+        }
+        assert_eq!(worker.requests_handled(), 100);
+        unsafe { libc::close(cmd_r); libc::close(resp_w); }
+    }
+
+    // ── WorkerKind ──────────────────────────────────────────────────
+
+    #[test]
+    fn worker_process_kind() {
+        let (cmd_r, cmd_w) = make_pipe();
+        let (resp_r, resp_w) = make_pipe();
+        let worker = Worker::new(nix::unistd::Pid::from_raw(12345), 100, cmd_w, resp_r);
+        assert!(!worker.is_thread());
+        assert_eq!(worker.pid().as_raw(), 12345);
+        unsafe { libc::close(cmd_r); libc::close(resp_w); }
+    }
+
+    #[test]
+    fn worker_thread_kind() {
+        let (cmd_r, cmd_w) = make_pipe();
+        let (resp_r, resp_w) = make_pipe();
+        let alive = Arc::new(AtomicBool::new(true));
+        let worker = Worker::new_thread(alive.clone(), 42, 100, cmd_w, resp_r);
+        assert!(worker.is_thread());
+        assert_eq!(worker.pid().as_raw(), 0); // thread has no PID
+        unsafe { libc::close(cmd_r); libc::close(resp_w); }
+    }
+
+    #[test]
+    fn worker_thread_alive_flag() {
+        let (cmd_r, cmd_w) = make_pipe();
+        let (resp_r, resp_w) = make_pipe();
+        let alive = Arc::new(AtomicBool::new(true));
+        let mut worker = Worker::new_thread(alive.clone(), 1, 100, cmd_w, resp_r);
+
+        assert!(worker.is_alive());
+
+        // Simulate thread exit
+        alive.store(false, Ordering::Release);
+        assert!(!worker.is_alive());
+        assert_eq!(worker.state(), WorkerState::Exited(0));
+
+        unsafe { libc::close(cmd_r); libc::close(resp_w); }
+    }
+
+    // ── Pipe Communication ──────────────────────────────────────────
+
+    #[test]
+    fn worker_send_execute_and_read_response() {
+        let (cmd_r, cmd_w) = make_pipe();
+        let (resp_r, resp_w) = make_pipe();
+        let worker = Worker::new(nix::unistd::Pid::from_raw(99999), 100, cmd_w, resp_r);
+
+        // Send PHP code
+        worker.send_execute("echo 'hello';").unwrap();
+
+        // Verify what was written to the pipe
+        let mut cmd_buf = [0u8; 1];
+        unsafe {
+            assert!(libc::read(cmd_r, cmd_buf.as_mut_ptr() as *mut _, 1) > 0);
+        }
+        assert_eq!(cmd_buf[0], crate::pool::WorkerCmd::Execute as u8);
+
+        let mut len_buf = [0u8; 4];
+        unsafe {
+            assert!(libc::read(cmd_r, len_buf.as_mut_ptr() as *mut _, 4) > 0);
+        }
+        let code_len = u32::from_le_bytes(len_buf) as usize;
+        assert_eq!(code_len, "echo 'hello';".len());
+
+        let mut code_buf = vec![0u8; code_len];
+        unsafe {
+            assert!(libc::read(cmd_r, code_buf.as_mut_ptr() as *mut _, code_len) > 0);
+        }
+        assert_eq!(&code_buf, "echo 'hello';".as_bytes());
+
+        // Simulate a worker response
+        let mut resp = Vec::new();
+        resp.push(WorkerResp::Ok as u8);
+        let payload = b"hello";
+        resp.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        resp.extend_from_slice(payload);
+        unsafe {
+            libc::write(resp_w, resp.as_ptr() as *const _, resp.len());
+        }
+
+        let (success, output) = worker.read_response().unwrap();
+        assert!(success);
+        assert_eq!(output, b"hello");
+
+        unsafe { libc::close(cmd_r); libc::close(resp_w); }
+    }
+
+    #[test]
+    fn worker_send_shutdown() {
+        let (cmd_r, cmd_w) = make_pipe();
+        let (resp_r, resp_w) = make_pipe();
+        let worker = Worker::new(nix::unistd::Pid::from_raw(99999), 100, cmd_w, resp_r);
+
+        worker.send_shutdown().unwrap();
+
+        let mut buf = [0u8; 1];
+        unsafe {
+            assert!(libc::read(cmd_r, buf.as_mut_ptr() as *mut _, 1) > 0);
+        }
+        assert_eq!(buf[0], crate::pool::WorkerCmd::Shutdown as u8);
+
+        unsafe { libc::close(cmd_r); libc::close(resp_w); }
+    }
+
+    #[test]
+    fn worker_send_request_binary() {
+        let (cmd_r, cmd_w) = make_pipe();
+        let (resp_r, resp_w) = make_pipe();
+        let worker = Worker::new(nix::unistd::Pid::from_raw(99999), 100, cmd_w, resp_r);
+
+        let data = vec![0x01, 0x02, 0x03, 0x04, 0x05];
+        worker.send_request(&data).unwrap();
+
+        let mut read_buf = [0u8; 5];
+        unsafe {
+            assert_eq!(libc::read(cmd_r, read_buf.as_mut_ptr() as *mut _, 5), 5);
+        }
+        assert_eq!(&read_buf, &[0x01, 0x02, 0x03, 0x04, 0x05]);
+
+        unsafe { libc::close(cmd_r); libc::close(resp_w); }
+    }
+
+    // ── Response status interpretation ──────────────────────────────
+
+    #[test]
+    fn read_response_ok_is_success() {
+        let (_cmd_r, cmd_w) = make_pipe();
+        let (resp_r, resp_w) = make_pipe();
+        let worker = Worker::new(nix::unistd::Pid::from_raw(99999), 100, cmd_w, resp_r);
+
+        let mut resp = Vec::new();
+        resp.push(WorkerResp::Ok as u8);
+        resp.extend_from_slice(&0u32.to_le_bytes());
+        unsafe { libc::write(resp_w, resp.as_ptr() as *const _, resp.len()); }
+
+        let (success, payload) = worker.read_response().unwrap();
+        assert!(success);
+        assert!(payload.is_empty());
+
+        unsafe { libc::close(_cmd_r); libc::close(resp_w); }
+    }
+
+    #[test]
+    fn read_response_ready_is_success() {
+        let (_cmd_r, cmd_w) = make_pipe();
+        let (resp_r, resp_w) = make_pipe();
+        let worker = Worker::new(nix::unistd::Pid::from_raw(99999), 100, cmd_w, resp_r);
+
+        let mut resp = Vec::new();
+        resp.push(WorkerResp::Ready as u8);
+        resp.extend_from_slice(&0u32.to_le_bytes());
+        unsafe { libc::write(resp_w, resp.as_ptr() as *const _, resp.len()); }
+
+        let (success, _) = worker.read_response().unwrap();
+        assert!(success);
+
+        unsafe { libc::close(_cmd_r); libc::close(resp_w); }
+    }
+
+    #[test]
+    fn read_response_error_is_failure() {
+        let (_cmd_r, cmd_w) = make_pipe();
+        let (resp_r, resp_w) = make_pipe();
+        let worker = Worker::new(nix::unistd::Pid::from_raw(99999), 100, cmd_w, resp_r);
+
+        let mut resp = Vec::new();
+        resp.push(WorkerResp::Error as u8);
+        let payload = b"Fatal error";
+        resp.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        resp.extend_from_slice(payload);
+        unsafe { libc::write(resp_w, resp.as_ptr() as *const _, resp.len()); }
+
+        let (success, output) = worker.read_response().unwrap();
+        assert!(!success);
+        assert_eq!(output, b"Fatal error");
+
+        unsafe { libc::close(_cmd_r); libc::close(resp_w); }
+    }
+
+    // ── WorkerState enum ────────────────────────────────────────────
+
+    #[test]
+    fn worker_state_equality() {
+        assert_eq!(WorkerState::Idle, WorkerState::Idle);
+        assert_eq!(WorkerState::Busy, WorkerState::Busy);
+        assert_eq!(WorkerState::Stopping, WorkerState::Stopping);
+        assert_eq!(WorkerState::Exited(0), WorkerState::Exited(0));
+        assert_ne!(WorkerState::Exited(0), WorkerState::Exited(1));
+        assert_ne!(WorkerState::Idle, WorkerState::Busy);
+    }
+}

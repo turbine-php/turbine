@@ -1391,3 +1391,326 @@ fn write_response(
     writer.write_all(payload)?;
     writer.flush()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── safe_cstring ────────────────────────────────────────────────
+
+    #[test]
+    fn safe_cstring_normal_string() {
+        let c = safe_cstring(b"hello world");
+        assert_eq!(c.to_str().unwrap(), "hello world");
+    }
+
+    #[test]
+    fn safe_cstring_strips_null_bytes() {
+        let c = safe_cstring(b"hel\0lo\0");
+        assert_eq!(c.to_str().unwrap(), "hello");
+    }
+
+    #[test]
+    fn safe_cstring_empty() {
+        let c = safe_cstring(b"");
+        assert_eq!(c.to_str().unwrap(), "");
+    }
+
+    #[test]
+    fn safe_cstring_only_nulls() {
+        let c = safe_cstring(b"\0\0\0");
+        assert_eq!(c.to_str().unwrap(), "");
+    }
+
+    #[test]
+    fn safe_cstring_utf8() {
+        let c = safe_cstring("café".as_bytes());
+        assert_eq!(c.to_str().unwrap(), "café");
+    }
+
+    #[test]
+    fn safe_cstring_with_embedded_nulls_preserves_rest() {
+        let c = safe_cstring(b"/var/www\0/index.php");
+        assert_eq!(c.to_str().unwrap(), "/var/www/index.php");
+    }
+
+    // ── WorkerMode ──────────────────────────────────────────────────
+
+    #[test]
+    fn worker_mode_from_str_process() {
+        assert_eq!(WorkerMode::from_str("process"), WorkerMode::Process);
+        assert_eq!(WorkerMode::from_str("Process"), WorkerMode::Process);
+        assert_eq!(WorkerMode::from_str("PROCESS"), WorkerMode::Process);
+    }
+
+    #[test]
+    fn worker_mode_from_str_thread() {
+        assert_eq!(WorkerMode::from_str("thread"), WorkerMode::Thread);
+        assert_eq!(WorkerMode::from_str("Thread"), WorkerMode::Thread);
+        assert_eq!(WorkerMode::from_str("THREAD"), WorkerMode::Thread);
+        assert_eq!(WorkerMode::from_str("threads"), WorkerMode::Thread);
+    }
+
+    #[test]
+    fn worker_mode_unknown_defaults_to_process() {
+        assert_eq!(WorkerMode::from_str(""), WorkerMode::Process);
+        assert_eq!(WorkerMode::from_str("fork"), WorkerMode::Process);
+        assert_eq!(WorkerMode::from_str("unknown"), WorkerMode::Process);
+    }
+
+    #[test]
+    fn worker_mode_display() {
+        assert_eq!(format!("{}", WorkerMode::Process), "process");
+        assert_eq!(format!("{}", WorkerMode::Thread), "thread");
+    }
+
+    // ── PoolConfig ──────────────────────────────────────────────────
+
+    #[test]
+    fn pool_config_default() {
+        let config = PoolConfig::default();
+        assert!(config.workers > 0);
+        assert_eq!(config.max_requests, 10_000);
+        assert_eq!(config.mode, WorkerMode::Process);
+    }
+
+    #[test]
+    fn pool_config_custom() {
+        let config = PoolConfig {
+            workers: 16,
+            max_requests: 50_000,
+            mode: WorkerMode::Thread,
+        };
+        assert_eq!(config.workers, 16);
+        assert_eq!(config.max_requests, 50_000);
+        assert_eq!(config.mode, WorkerMode::Thread);
+    }
+
+    // ── WorkerPool ──────────────────────────────────────────────────
+
+    #[test]
+    fn worker_pool_new() {
+        let pool = WorkerPool::new(PoolConfig {
+            workers: 4,
+            max_requests: 1000,
+            mode: WorkerMode::Process,
+        });
+        assert_eq!(pool.config().workers, 4);
+        assert_eq!(pool.config().max_requests, 1000);
+        assert_eq!(pool.worker_count(), 0); // no workers spawned yet
+    }
+
+    // ── WorkerCmd/WorkerResp enum values ────────────────────────────
+
+    #[test]
+    fn worker_cmd_values() {
+        assert_eq!(WorkerCmd::Execute as u8, 1);
+        assert_eq!(WorkerCmd::Shutdown as u8, 2);
+        assert_eq!(WorkerCmd::ExecuteNative as u8, 3);
+    }
+
+    #[test]
+    fn worker_resp_values() {
+        assert_eq!(WorkerResp::Ok as u8, 1);
+        assert_eq!(WorkerResp::Error as u8, 2);
+        assert_eq!(WorkerResp::Ready as u8, 3);
+    }
+
+    // ── NativeRequest encode / decode round-trip ────────────────────
+
+    #[test]
+    fn native_request_roundtrip_basic() {
+        let encoded = encode_native_request(
+            "/var/www/index.php",
+            "GET",
+            "/",
+            "",
+            "",
+            -1,
+            "",
+            "/var/www",
+            "127.0.0.1",
+            0,
+            8080,
+            false,
+            "/",
+            "/index.php",
+            &[],
+            &[],
+        );
+
+        // Skip cmd byte (1) + length (4)
+        assert_eq!(encoded[0], WorkerCmd::ExecuteNative as u8);
+        let total_len = u32::from_le_bytes([encoded[1], encoded[2], encoded[3], encoded[4]]) as usize;
+        let payload = &encoded[5..5 + total_len];
+
+        let decoded = NativeRequest::decode(payload).expect("decode failed");
+        assert_eq!(decoded.script_path, "/var/www/index.php");
+        assert_eq!(decoded.method, "GET");
+        assert_eq!(decoded.uri, "/");
+        assert_eq!(decoded.query_string, "");
+        assert_eq!(decoded.document_root, "/var/www");
+        assert_eq!(decoded.remote_addr, "127.0.0.1");
+        assert_eq!(decoded.server_port, 8080);
+        assert!(!decoded.is_https);
+        assert_eq!(decoded.path_info, "/");
+        assert_eq!(decoded.script_name, "/index.php");
+        assert!(decoded.body.is_empty());
+        assert!(decoded.headers.is_empty());
+    }
+
+    #[test]
+    fn native_request_roundtrip_full() {
+        let body = b"name=test&value=hello";
+        let headers = [
+            ("Content-Type", "application/x-www-form-urlencoded"),
+            ("Host", "example.com"),
+            ("Accept", "text/html"),
+        ];
+        let encoded = encode_native_request(
+            "/app/public/index.php",
+            "POST",
+            "/api/submit?debug=1",
+            "debug=1",
+            "application/x-www-form-urlencoded",
+            body.len() as i32,
+            "session=abc123; lang=en",
+            "/app/public",
+            "10.0.0.1",
+            54321,
+            443,
+            true,
+            "/api/submit",
+            "/index.php",
+            body,
+            &headers,
+        );
+
+        let total_len = u32::from_le_bytes([encoded[1], encoded[2], encoded[3], encoded[4]]) as usize;
+        let payload = &encoded[5..5 + total_len];
+
+        let decoded = NativeRequest::decode(payload).expect("decode failed");
+        assert_eq!(decoded.script_path, "/app/public/index.php");
+        assert_eq!(decoded.method, "POST");
+        assert_eq!(decoded.uri, "/api/submit?debug=1");
+        assert_eq!(decoded.query_string, "debug=1");
+        assert_eq!(decoded.content_type, "application/x-www-form-urlencoded");
+        assert_eq!(decoded.cookie, "session=abc123; lang=en");
+        assert_eq!(decoded.document_root, "/app/public");
+        assert_eq!(decoded.remote_addr, "10.0.0.1");
+        assert_eq!(decoded.remote_port, 54321);
+        assert_eq!(decoded.server_port, 443);
+        assert!(decoded.is_https);
+        assert_eq!(decoded.path_info, "/api/submit");
+        assert_eq!(decoded.script_name, "/index.php");
+        assert_eq!(decoded.body, body);
+        assert_eq!(decoded.headers.len(), 3);
+        assert_eq!(decoded.headers[0], ("Content-Type".to_string(), "application/x-www-form-urlencoded".to_string()));
+        assert_eq!(decoded.headers[1], ("Host".to_string(), "example.com".to_string()));
+        assert_eq!(decoded.headers[2], ("Accept".to_string(), "text/html".to_string()));
+    }
+
+    #[test]
+    fn native_request_roundtrip_binary_body() {
+        let body: Vec<u8> = (0..=255).collect();
+        let encoded = encode_native_request(
+            "/upload.php", "PUT", "/upload", "", "application/octet-stream",
+            body.len() as i32, "", "/", "::1", 0, 80, false,
+            "/upload", "/upload.php", &body, &[],
+        );
+
+        let total_len = u32::from_le_bytes([encoded[1], encoded[2], encoded[3], encoded[4]]) as usize;
+        let payload = &encoded[5..5 + total_len];
+
+        let decoded = NativeRequest::decode(payload).expect("decode failed");
+        assert_eq!(decoded.body.len(), 256);
+        assert_eq!(decoded.body[0], 0);
+        assert_eq!(decoded.body[255], 255);
+    }
+
+    #[test]
+    fn native_request_decode_truncated_returns_none() {
+        // Truncated data should return None
+        let result = NativeRequest::decode(&[0x00, 0x01]);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn native_request_decode_empty_returns_none() {
+        let result = NativeRequest::decode(&[]);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn native_request_roundtrip_many_headers() {
+        let headers: Vec<(&str, &str)> = (0..20)
+            .map(|i| {
+                // Leak strings for stable references — ok in tests
+                let k: &str = Box::leak(format!("X-Header-{i}").into_boxed_str());
+                let v: &str = Box::leak(format!("value-{i}").into_boxed_str());
+                (k, v)
+            })
+            .collect();
+
+        let encoded = encode_native_request(
+            "/test.php", "GET", "/", "", "", -1, "", "/", "127.0.0.1",
+            0, 80, false, "/", "/test.php", &[], &headers,
+        );
+
+        let total_len = u32::from_le_bytes([encoded[1], encoded[2], encoded[3], encoded[4]]) as usize;
+        let payload = &encoded[5..5 + total_len];
+
+        let decoded = NativeRequest::decode(payload).expect("decode failed");
+        assert_eq!(decoded.headers.len(), 20);
+        assert_eq!(decoded.headers[0].0, "X-Header-0");
+        assert_eq!(decoded.headers[19].0, "X-Header-19");
+    }
+
+    // ── NativeResponse via pipes ────────────────────────────────────
+
+    #[test]
+    fn native_response_roundtrip_via_pipe() {
+        let mut pipe = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        let (resp_read, resp_write) = (pipe[0], pipe[1]);
+
+        // Write a structured native response
+        let mut writer = unsafe { std::fs::File::from_raw_fd(resp_write) };
+        let headers = vec![
+            ("Content-Type".to_string(), "application/json".to_string()),
+        ];
+        write_native_response(&mut writer, WorkerResp::Ok, 200, &headers, b"{\"ok\":true}")
+            .expect("write failed");
+        // Don't close — from_raw_fd owns it
+        std::mem::forget(writer);
+
+        let resp = read_native_response_from_fd(resp_read).expect("read failed");
+        assert!(resp.success);
+        assert_eq!(resp.http_status, 200);
+        assert_eq!(resp.headers.len(), 1);
+        assert_eq!(resp.headers[0].0, "Content-Type");
+        assert_eq!(resp.body, b"{\"ok\":true}");
+
+        unsafe { libc::close(resp_read); libc::close(resp_write); }
+    }
+
+    #[test]
+    fn native_response_error_via_pipe() {
+        let mut pipe = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        let (resp_read, resp_write) = (pipe[0], pipe[1]);
+
+        let mut writer = unsafe { std::fs::File::from_raw_fd(resp_write) };
+        write_native_response(&mut writer, WorkerResp::Error, 500, &[], b"Fatal error")
+            .expect("write failed");
+        std::mem::forget(writer);
+
+        let resp = read_native_response_from_fd(resp_read).expect("read failed");
+        assert!(!resp.success);
+        assert_eq!(resp.http_status, 500);
+        assert!(resp.headers.is_empty());
+        assert_eq!(resp.body, b"Fatal error");
+
+        unsafe { libc::close(resp_read); libc::close(resp_write); }
+    }
+}

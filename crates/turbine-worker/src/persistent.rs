@@ -803,3 +803,445 @@ impl WorkerPool {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Encoding Helpers ────────────────────────────────────────────
+
+    #[test]
+    fn write_u8_appends_byte() {
+        let mut buf = Vec::new();
+        write_u8(&mut buf, 0xAA);
+        assert_eq!(buf, vec![0xAA]);
+    }
+
+    #[test]
+    fn write_u32_le_encodes_correctly() {
+        let mut buf = Vec::new();
+        write_u32_le(&mut buf, 0x01020304);
+        assert_eq!(buf, vec![0x04, 0x03, 0x02, 0x01]);
+    }
+
+    #[test]
+    fn write_u32_le_zero() {
+        let mut buf = Vec::new();
+        write_u32_le(&mut buf, 0);
+        assert_eq!(buf, vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn write_bytes_length_prefixed() {
+        let mut buf = Vec::new();
+        write_bytes(&mut buf, b"hello");
+        // u32 LE length (5) + data
+        assert_eq!(buf.len(), 4 + 5);
+        assert_eq!(&buf[0..4], &5u32.to_le_bytes());
+        assert_eq!(&buf[4..], b"hello");
+    }
+
+    #[test]
+    fn write_bytes_empty() {
+        let mut buf = Vec::new();
+        write_bytes(&mut buf, b"");
+        assert_eq!(buf, vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn write_str_utf8() {
+        let mut buf = Vec::new();
+        write_str(&mut buf, "café");
+        let expected_len = "café".len() as u32; // 5 bytes in UTF-8
+        assert_eq!(&buf[0..4], &expected_len.to_le_bytes());
+        assert_eq!(&buf[4..], "café".as_bytes());
+    }
+
+    // ── Request Encoding ────────────────────────────────────────────
+
+    #[test]
+    fn encode_request_basic() {
+        let req = PersistentRequest {
+            method: "GET",
+            uri: "/index.php",
+            body: &[],
+            client_ip: "127.0.0.1",
+            port: 8080,
+            is_https: false,
+            headers: &[],
+            script_filename: "/app/public/index.php",
+            query_string: "",
+            document_root: "/app/public",
+            content_type: "",
+            cookie: "",
+            path_info: "/",
+            script_name: "/index.php",
+        };
+        let encoded = encode_request(&req);
+        // First byte is command 0x01
+        assert_eq!(encoded[0], 0x01);
+        // Should be non-empty
+        assert!(encoded.len() > 20);
+    }
+
+    #[test]
+    fn encode_request_with_body_and_headers() {
+        let body = b"name=test&value=123";
+        let headers = [("Content-Type", "application/x-www-form-urlencoded"), ("Host", "example.com")];
+        let req = PersistentRequest {
+            method: "POST",
+            uri: "/api/submit?debug=1",
+            body,
+            client_ip: "10.0.0.1",
+            port: 443,
+            is_https: true,
+            headers: &headers,
+            script_filename: "/app/public/index.php",
+            query_string: "debug=1",
+            document_root: "/app/public",
+            content_type: "application/x-www-form-urlencoded",
+            cookie: "session=abc123",
+            path_info: "/api/submit",
+            script_name: "/index.php",
+        };
+        let encoded = encode_request(&req);
+        assert_eq!(encoded[0], 0x01);
+        // Should contain the body bytes somewhere in the encoding
+        assert!(encoded.len() > body.len() + 50);
+    }
+
+    #[test]
+    fn encode_request_empty_strings() {
+        let req = PersistentRequest {
+            method: "",
+            uri: "",
+            body: &[],
+            client_ip: "",
+            port: 0,
+            is_https: false,
+            headers: &[],
+            script_filename: "",
+            query_string: "",
+            document_root: "",
+            content_type: "",
+            cookie: "",
+            path_info: "",
+            script_name: "",
+        };
+        let encoded = encode_request(&req);
+        assert_eq!(encoded[0], 0x01);
+        // Should not panic, should have minimal size
+        assert!(encoded.len() > 1);
+    }
+
+    // ── Round-trip: encode → pipe → decode ──────────────────────────
+
+    fn make_pipe() -> (i32, i32) {
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        (fds[0], fds[1])
+    }
+
+    #[test]
+    fn roundtrip_request_encode_decode() {
+        let (read_fd, write_fd) = make_pipe();
+
+        let headers = [("Host", "localhost"), ("Accept", "text/html")];
+        let body = b"request body data";
+        let req = PersistentRequest {
+            method: "POST",
+            uri: "/test?q=1",
+            body,
+            client_ip: "192.168.1.1",
+            port: 9000,
+            is_https: true,
+            headers: &headers,
+            script_filename: "/var/www/index.php",
+            query_string: "q=1",
+            document_root: "/var/www",
+            content_type: "text/plain",
+            cookie: "sid=xyz",
+            path_info: "/test",
+            script_name: "/index.php",
+        };
+
+        let encoded = encode_request(&req);
+
+        // Write encoded data to pipe (skip cmd byte — decode expects post-cmd)
+        let written = unsafe {
+            libc::write(write_fd, encoded[1..].as_ptr() as *const _, encoded.len() - 1)
+        };
+        assert_eq!(written as usize, encoded.len() - 1);
+
+        // Decode from the read end
+        let decoded = decode_request_from_fd(read_fd).expect("decode failed");
+
+        assert_eq!(decoded.method, "POST");
+        assert_eq!(decoded.uri, "/test?q=1");
+        assert_eq!(decoded.body, b"request body data");
+        assert_eq!(decoded.client_ip, "192.168.1.1");
+        assert_eq!(decoded.port, 9000);
+        assert!(decoded.is_https);
+        assert_eq!(decoded.headers.len(), 2);
+        assert_eq!(decoded.headers[0], ("Host".to_string(), "localhost".to_string()));
+        assert_eq!(decoded.headers[1], ("Accept".to_string(), "text/html".to_string()));
+        assert_eq!(decoded.script_filename, "/var/www/index.php");
+        assert_eq!(decoded.query_string, "q=1");
+        assert_eq!(decoded.document_root, "/var/www");
+        assert_eq!(decoded.content_type, "text/plain");
+        assert_eq!(decoded.cookie, "sid=xyz");
+        assert_eq!(decoded.path_info, "/test");
+        assert_eq!(decoded.script_name, "/index.php");
+
+        unsafe { libc::close(read_fd); libc::close(write_fd); }
+    }
+
+    #[test]
+    fn roundtrip_request_empty_body_no_headers() {
+        let (read_fd, write_fd) = make_pipe();
+
+        let req = PersistentRequest {
+            method: "GET",
+            uri: "/",
+            body: &[],
+            client_ip: "127.0.0.1",
+            port: 80,
+            is_https: false,
+            headers: &[],
+            script_filename: "/index.php",
+            query_string: "",
+            document_root: "/",
+            content_type: "",
+            cookie: "",
+            path_info: "/",
+            script_name: "/index.php",
+        };
+
+        let encoded = encode_request(&req);
+        let written = unsafe {
+            libc::write(write_fd, encoded[1..].as_ptr() as *const _, encoded.len() - 1)
+        };
+        assert_eq!(written as usize, encoded.len() - 1);
+
+        let decoded = decode_request_from_fd(read_fd).expect("decode failed");
+        assert_eq!(decoded.method, "GET");
+        assert_eq!(decoded.uri, "/");
+        assert!(decoded.body.is_empty());
+        assert!(!decoded.is_https);
+        assert!(decoded.headers.is_empty());
+
+        unsafe { libc::close(read_fd); libc::close(write_fd); }
+    }
+
+    // ── Response Encoding / Decoding ────────────────────────────────
+
+    #[test]
+    fn roundtrip_response_ok() {
+        let (read_fd, write_fd) = make_pipe();
+
+        let headers = vec![
+            ("Content-Type".to_string(), "text/html".to_string()),
+            ("X-Custom".to_string(), "value".to_string()),
+        ];
+        let body = b"<h1>Hello</h1>";
+
+        write_response(write_fd, true, 200, &headers, body).expect("write failed");
+
+        let resp = decode_response(read_fd).expect("decode failed");
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.headers.len(), 2);
+        assert_eq!(resp.headers[0], ("Content-Type".to_string(), "text/html".to_string()));
+        assert_eq!(resp.headers[1], ("X-Custom".to_string(), "value".to_string()));
+        assert_eq!(resp.body, b"<h1>Hello</h1>");
+
+        unsafe { libc::close(read_fd); libc::close(write_fd); }
+    }
+
+    #[test]
+    fn roundtrip_response_error() {
+        let (read_fd, write_fd) = make_pipe();
+
+        write_response(write_fd, false, 500, &[], b"Internal Error").expect("write failed");
+
+        let resp = decode_response(read_fd).expect("decode failed");
+        assert_eq!(resp.status, 500);
+        assert!(resp.headers.is_empty());
+        assert_eq!(resp.body, b"Internal Error");
+
+        unsafe { libc::close(read_fd); libc::close(write_fd); }
+    }
+
+    #[test]
+    fn roundtrip_response_empty_body() {
+        let (read_fd, write_fd) = make_pipe();
+
+        write_response(write_fd, true, 204, &[], b"").expect("write failed");
+
+        let resp = decode_response(read_fd).expect("decode failed");
+        assert_eq!(resp.status, 204);
+        assert!(resp.headers.is_empty());
+        assert!(resp.body.is_empty());
+
+        unsafe { libc::close(read_fd); libc::close(write_fd); }
+    }
+
+    #[test]
+    fn roundtrip_response_many_headers() {
+        let (read_fd, write_fd) = make_pipe();
+
+        let headers: Vec<(String, String)> = (0..50)
+            .map(|i| (format!("X-Header-{}", i), format!("value-{}", i)))
+            .collect();
+
+        write_response(write_fd, true, 200, &headers, b"body").expect("write failed");
+
+        let resp = decode_response(read_fd).expect("decode failed");
+        assert_eq!(resp.headers.len(), 50);
+        assert_eq!(resp.headers[0].0, "X-Header-0");
+        assert_eq!(resp.headers[49].0, "X-Header-49");
+
+        unsafe { libc::close(read_fd); libc::close(write_fd); }
+    }
+
+    // ── Ready Signal ────────────────────────────────────────────────
+
+    #[test]
+    fn roundtrip_ready_signal() {
+        let (read_fd, write_fd) = make_pipe();
+
+        write_ready_signal(write_fd).expect("write failed");
+
+        let ready = read_ready_signal(read_fd).expect("read failed");
+        assert!(ready);
+
+        unsafe { libc::close(read_fd); libc::close(write_fd); }
+    }
+
+    // ── Large Body ──────────────────────────────────────────────────
+
+    #[test]
+    fn roundtrip_request_large_body() {
+        let (read_fd, write_fd) = make_pipe();
+
+        // Use a separate thread for writing since pipes have limited buffer
+        let body = vec![0x42u8; 128 * 1024]; // 128 KB
+        let body_clone = body.clone();
+
+        let req = PersistentRequest {
+            method: "PUT",
+            uri: "/upload",
+            body: &body_clone,
+            client_ip: "10.0.0.1",
+            port: 8080,
+            is_https: false,
+            headers: &[],
+            script_filename: "/upload.php",
+            query_string: "",
+            document_root: "/",
+            content_type: "application/octet-stream",
+            cookie: "",
+            path_info: "/upload",
+            script_name: "/upload.php",
+        };
+
+        let encoded = encode_request(&req);
+
+        let writer = std::thread::spawn(move || {
+            write_all_fd(write_fd, &encoded[1..]).expect("write failed");
+            unsafe { libc::close(write_fd); }
+        });
+
+        let decoded = decode_request_from_fd(read_fd).expect("decode failed");
+        assert_eq!(decoded.body.len(), 128 * 1024);
+        assert!(decoded.body.iter().all(|&b| b == 0x42));
+
+        writer.join().unwrap();
+        unsafe { libc::close(read_fd); }
+    }
+
+    #[test]
+    fn roundtrip_response_large_body() {
+        let (read_fd, write_fd) = make_pipe();
+
+        let body = vec![0xBBu8; 64 * 1024]; // 64 KB
+        let body_clone = body.clone();
+
+        let writer = std::thread::spawn(move || {
+            write_response(write_fd, true, 200, &[], &body_clone).expect("write failed");
+            unsafe { libc::close(write_fd); }
+        });
+
+        let resp = decode_response(read_fd).expect("decode failed");
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body.len(), 64 * 1024);
+        assert!(resp.body.iter().all(|&b| b == 0xBB));
+
+        writer.join().unwrap();
+        unsafe { libc::close(read_fd); }
+    }
+
+    // ── decode_response rejects excessive header count ───────────────
+
+    #[test]
+    fn decode_response_rejects_high_header_count() {
+        let (read_fd, write_fd) = make_pipe();
+
+        // Manually write a response with header_count = 300 (> 256 limit)
+        let mut buf = Vec::new();
+        buf.push(0x01); // Ok marker
+        buf.extend_from_slice(&200u16.to_le_bytes()); // status
+        buf.extend_from_slice(&300u32.to_le_bytes()); // header_count > 256
+
+        let written = unsafe {
+            libc::write(write_fd, buf.as_ptr() as *const _, buf.len())
+        };
+        assert_eq!(written as usize, buf.len());
+        unsafe { libc::close(write_fd); }
+
+        let result = decode_response(read_fd);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("invalid header_count"));
+
+        unsafe { libc::close(read_fd); }
+    }
+
+    // ── Unicode in fields ───────────────────────────────────────────
+
+    #[test]
+    fn roundtrip_request_unicode_fields() {
+        let (read_fd, write_fd) = make_pipe();
+
+        let req = PersistentRequest {
+            method: "GET",
+            uri: "/search?q=日本語",
+            body: &[],
+            client_ip: "::1",
+            port: 80,
+            is_https: false,
+            headers: &[("X-Custom", "über-header")],
+            script_filename: "/index.php",
+            query_string: "q=日本語",
+            document_root: "/",
+            content_type: "",
+            cookie: "name=José",
+            path_info: "/search",
+            script_name: "/index.php",
+        };
+
+        let encoded = encode_request(&req);
+        let writer = std::thread::spawn(move || {
+            write_all_fd(write_fd, &encoded[1..]).expect("write failed");
+            unsafe { libc::close(write_fd); }
+        });
+
+        let decoded = decode_request_from_fd(read_fd).expect("decode failed");
+        assert_eq!(decoded.uri, "/search?q=日本語");
+        assert_eq!(decoded.query_string, "q=日本語");
+        assert_eq!(decoded.cookie, "name=José");
+        assert_eq!(decoded.headers[0].1, "über-header");
+
+        writer.join().unwrap();
+        unsafe { libc::close(read_fd); }
+    }
+}

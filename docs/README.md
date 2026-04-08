@@ -72,11 +72,44 @@ DYLD_LIBRARY_PATH="$PWD/vendor/php-embed/lib" ./target/release/turbine serve --r
 
 ```bash
 turbine init                    # Generate default turbine.toml
+turbine check [OPTIONS]         # Validate turbine.toml (errors + warnings)
 turbine serve [OPTIONS]         # Start the server
 turbine config                  # Display current configuration
 turbine info                    # Show PHP engine information
 turbine status [ADDRESS]        # Query running server status
 turbine cache-clear [ADDRESS]   # Clear response cache
+```
+
+### Check Options
+
+| Flag | Description | Example |
+|------|-------------|----------|
+| `--config` | Path to turbine.toml | `--config /etc/turbine.toml` |
+
+`turbine check` validates the configuration file and reports:
+
+- **Errors** (exit code 1): problems that will prevent Turbine from running correctly — invalid `worker_mode`, TLS enabled without certificate files, `strict` mode without whitelist, worker pool `min_workers > max_workers`.
+- **Warnings** (exit code 0): suboptimal settings — persistent workers without recycling, all security guards disabled, compression level out of range, ACME + manual TLS conflict, etc.
+
+Example output:
+
+```
+Turbine Configuration Check
+  File: turbine.toml
+
+Settings:
+  workers          = 4
+  worker_mode      = process
+  persistent       = true
+  listen           = 127.0.0.1:8080
+  request_timeout  = 30s
+  max_requests     = 10000
+  security         = true
+  compression      = true
+  cache            = false
+  tls              = false
+
+✓ Configuration is valid. No errors or warnings.
 ```
 
 ### Serve Options

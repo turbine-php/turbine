@@ -76,4 +76,11 @@ pub enum Command {
 
     /// Initialize a new turbine.toml in the current directory
     Init,
+
+    /// Validate turbine.toml configuration (check for errors and warnings)
+    Check {
+        /// Path to turbine.toml configuration file
+        #[arg(short, long)]
+        config: Option<String>,
+    },
 }

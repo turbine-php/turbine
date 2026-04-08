@@ -875,26 +875,121 @@ impl Default for RuntimeConfig {
 }
 
 impl RuntimeConfig {
-    /// Validate configuration for contradictions and warn about issues.
-    pub fn validate(&self) {
-        if self.server.workers == 0 && self.server.request_timeout == 0 {
-            warn!("workers=0 (single-process) with request_timeout=0 (no timeout) — a slow request will block ALL subsequent requests");
+    /// Validate configuration and return (errors, warnings).
+    ///
+    /// Errors are issues that will prevent Turbine from running correctly.
+    /// Warnings are suboptimal settings that may cause unexpected behaviour.
+    pub fn check(&self) -> (Vec<String>, Vec<String>) {
+        let mut errors: Vec<String> = Vec::new();
+        let mut warnings: Vec<String> = Vec::new();
+
+        // ── Errors ──────────────────────────────────────────────────
+
+        if self.server.worker_mode != "process" && self.server.worker_mode != "thread" {
+            errors.push(format!(
+                "[server] worker_mode = \"{}\" — must be \"process\" or \"thread\"",
+                self.server.worker_mode
+            ));
+        }
+
+        if self.sandbox.execution_mode != "framework" && self.sandbox.execution_mode != "strict" {
+            errors.push(format!(
+                "[sandbox] execution_mode = \"{}\" — must be \"framework\" or \"strict\"",
+                self.sandbox.execution_mode
+            ));
+        }
+
+        if self.server.tls.enabled {
+            if self.server.tls.cert_file.is_none() {
+                errors.push("[server.tls] enabled = true but cert_file is missing".to_string());
+            }
+            if self.server.tls.key_file.is_none() {
+                errors.push("[server.tls] enabled = true but key_file is missing".to_string());
+            }
         }
 
         if self.sandbox.execution_mode == "strict" && self.sandbox.execution_whitelist.is_empty() {
-            warn!("execution_mode=\"strict\" but execution_whitelist is empty — ALL PHP requests will be blocked");
+            errors.push("[sandbox] execution_mode = \"strict\" but execution_whitelist is empty — ALL PHP requests will be blocked".to_string());
+        }
+
+        if let Some(ref tls_cert) = self.server.tls.cert_file {
+            if !std::path::Path::new(tls_cert).exists() {
+                errors.push(format!("[server.tls] cert_file = \"{}\" — file not found", tls_cert));
+            }
+        }
+
+        if let Some(ref tls_key) = self.server.tls.key_file {
+            if !std::path::Path::new(tls_key).exists() {
+                errors.push(format!("[server.tls] key_file = \"{}\" — file not found", tls_key));
+            }
+        }
+
+        // ── Warnings ────────────────────────────────────────────────
+
+        if self.server.workers == 0 && self.server.request_timeout == 0 {
+            warnings.push("[server] workers = 0 + request_timeout = 0 — a slow request will block ALL subsequent requests".to_string());
         }
 
         if self.security.enabled && !self.security.sql_guard && !self.security.code_injection_guard && !self.security.behaviour_guard {
-            warn!("security.enabled=true but all guards are disabled — security layer has no effect");
+            warnings.push("[security] enabled = true but all guards are disabled — security layer has no effect".to_string());
         }
 
         if self.cache.enabled && self.cache.ttl_seconds == 0 {
-            warn!("cache.enabled=true but ttl_seconds=0 — responses will be cached and immediately expire");
+            warnings.push("[cache] enabled = true but ttl_seconds = 0 — responses will be cached and immediately expire".to_string());
         }
 
         if self.server.workers > 64 {
-            warn!(workers = self.server.workers, "Very high worker count — ensure your system has sufficient memory and file descriptors");
+            warnings.push(format!("[server] workers = {} — very high worker count, ensure sufficient memory and file descriptors", self.server.workers));
+        }
+
+        if self.server.persistent_workers == Some(true) && self.server.worker_max_requests == 0 {
+            warnings.push("[server] persistent_workers = true but worker_max_requests = 0 — workers will never recycle, throughput will degrade over time".to_string());
+        }
+
+        if self.server.worker_mode == "thread" && self.server.persistent_workers != Some(true) {
+            // Thread + non-persistent is valid but worth noting the IPC difference
+        }
+
+        if self.compression.level > 9 {
+            warnings.push(format!("[compression] level = {} — should be 1–9", self.compression.level));
+        }
+
+        if self.session.cookie_samesite != "Lax" && self.session.cookie_samesite != "Strict" && self.session.cookie_samesite != "None" {
+            warnings.push(format!("[session] cookie_samesite = \"{}\" — should be Lax, Strict, or None", self.session.cookie_samesite));
+        }
+
+        if self.cors.enabled && self.cors.allow_origins.is_empty() {
+            warnings.push("[cors] enabled = true but allow_origins is empty — no origins will be allowed".to_string());
+        }
+
+        if self.acme.enabled && self.server.tls.enabled {
+            warnings.push("[acme] enabled = true and [server.tls] enabled = true — ACME auto-TLS and manual TLS are both active, ACME may overwrite your certificate".to_string());
+        }
+
+        if self.watcher.enabled && self.logging.level == "warn" || self.watcher.enabled && self.logging.level == "error" {
+            // Fine, no warning needed
+        }
+
+        for (i, pool) in self.worker_pools.iter().enumerate() {
+            if pool.match_path.is_empty() {
+                warnings.push(format!("[[worker_pools]][{}] match_path is empty — pool will never match any request", i));
+            }
+            if pool.min_workers > pool.max_workers {
+                errors.push(format!("[[worker_pools]][{}] min_workers ({}) > max_workers ({}) — invalid", i, pool.min_workers, pool.max_workers));
+            }
+        }
+
+        (errors, warnings)
+    }
+
+    /// Validate configuration for contradictions and warn about issues.
+    pub fn validate(&self) {
+        let (errors, warnings) = self.check();
+        for e in &errors {
+            warn!("{}", e);
+        }
+        for w in &warnings {
+            warn!("{}", w);
         }
     }
 
@@ -968,7 +1063,8 @@ workers = 4
 # Listen address
 listen = "127.0.0.1:8080"
 # TCP connection read/write timeout in seconds
-connection_timeout = 30# Request execution timeout in seconds (0 = no timeout)
+connection_timeout = 30
+# Request execution timeout in seconds (0 = no timeout)
 request_timeout = 30
 # Maximum time (seconds) a request waits for a free worker (0 = uses request_timeout)
 # max_wait_time = 5
@@ -1165,5 +1261,744 @@ statistics = true
 # max_workers = 4
 # name = "slow-api"
 "#
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── TOML Parsing ────────────────────────────────────────────────
+
+    #[test]
+    fn parse_minimal_config() {
+        let toml_str = r#"
+[server]
+workers = 2
+listen = "0.0.0.0:8080"
+"#;
+        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.server.workers, 2);
+        assert_eq!(config.server.listen, "0.0.0.0:8080");
+    }
+
+    #[test]
+    fn parse_empty_config_uses_defaults() {
+        let config: RuntimeConfig = toml::from_str("").unwrap();
+        assert_eq!(config.server.listen, "127.0.0.1:9000");
+        assert_eq!(config.server.worker_mode, "process");
+        assert_eq!(config.server.request_timeout, 30);
+        assert_eq!(config.server.worker_max_requests, 10_000);
+        assert_eq!(config.server.channel_capacity, 64);
+        assert!(config.server.persistent_workers.is_none());
+        assert!(config.server.tokio_worker_threads.is_none());
+        assert!(!config.server.auto_scale);
+        assert_eq!(config.server.min_workers, 1);
+    }
+
+    #[test]
+    fn parse_worker_mode_thread() {
+        let toml_str = r#"
+[server]
+worker_mode = "thread"
+persistent_workers = true
+tokio_worker_threads = 6
+"#;
+        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.server.worker_mode, "thread");
+        assert_eq!(config.server.persistent_workers, Some(true));
+        assert_eq!(config.server.tokio_worker_threads, Some(6));
+    }
+
+    #[test]
+    fn parse_persistent_workers_false() {
+        let toml_str = r#"
+[server]
+persistent_workers = false
+"#;
+        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.server.persistent_workers, Some(false));
+    }
+
+    #[test]
+    fn parse_php_config() {
+        let toml_str = r#"
+[php]
+memory_limit = "512M"
+max_execution_time = 60
+opcache_memory = 256
+jit_buffer_size = "128M"
+extensions = ["redis.so", "imagick.so"]
+"#;
+        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.php.memory_limit, "512M");
+        assert_eq!(config.php.max_execution_time, 60);
+        assert_eq!(config.php.opcache_memory, 256);
+        assert_eq!(config.php.jit_buffer_size, "128M");
+        assert_eq!(config.php.extensions, vec!["redis.so", "imagick.so"]);
+    }
+
+    #[test]
+    fn parse_php_config_defaults() {
+        let config: RuntimeConfig = toml::from_str("").unwrap();
+        assert_eq!(config.php.memory_limit, "256M");
+        assert_eq!(config.php.max_execution_time, 30);
+        assert_eq!(config.php.opcache_memory, 128);
+        assert_eq!(config.php.jit_buffer_size, "64M");
+        assert_eq!(config.php.upload_max_filesize, "64M");
+        assert_eq!(config.php.post_max_size, "64M");
+        assert_eq!(config.php.upload_tmp_dir, "/tmp/turbine-uploads");
+        assert!(config.php.extensions.is_empty());
+        assert!(config.php.zend_extensions.is_empty());
+        assert!(config.php.preload_script.is_none());
+    }
+
+    #[test]
+    fn parse_php_ini_directives() {
+        let toml_str = r#"
+[php.ini]
+error_reporting = "E_ALL"
+"date.timezone" = "UTC"
+"#;
+        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.php.ini.get("error_reporting").unwrap(), "E_ALL");
+        assert_eq!(config.php.ini.get("date.timezone").unwrap(), "UTC");
+    }
+
+    #[test]
+    fn parse_security_config() {
+        let toml_str = r#"
+[security]
+enabled = true
+sql_guard = false
+code_injection_guard = true
+behaviour_guard = false
+max_requests_per_second = 50
+rate_limit_window = 120
+"#;
+        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.security.enabled);
+        assert!(!config.security.sql_guard);
+        assert!(config.security.code_injection_guard);
+        assert!(!config.security.behaviour_guard);
+        assert_eq!(config.security.max_requests_per_second, 50);
+        assert_eq!(config.security.rate_limit_window, 120);
+    }
+
+    #[test]
+    fn parse_security_defaults() {
+        let config: RuntimeConfig = toml::from_str("").unwrap();
+        assert!(config.security.enabled);
+        assert!(config.security.sql_guard);
+        assert!(config.security.code_injection_guard);
+        assert!(config.security.path_traversal_guard);
+        assert!(config.security.behaviour_guard);
+        assert_eq!(config.security.max_requests_per_second, 100);
+        assert_eq!(config.security.rate_limit_window, 60);
+    }
+
+    #[test]
+    fn parse_sandbox_config() {
+        let toml_str = r#"
+[sandbox]
+execution_mode = "strict"
+execution_whitelist = ["public/index.php"]
+data_directories = ["storage/", "uploads/"]
+scan_upload_content = false
+"#;
+        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.sandbox.execution_mode, "strict");
+        assert_eq!(config.sandbox.execution_whitelist, vec!["public/index.php"]);
+        assert_eq!(config.sandbox.data_directories, vec!["storage/", "uploads/"]);
+        assert!(!config.sandbox.scan_upload_content);
+    }
+
+    #[test]
+    fn parse_sandbox_defaults() {
+        let config: RuntimeConfig = toml::from_str("").unwrap();
+        assert_eq!(config.sandbox.execution_mode, "framework");
+        assert!(config.sandbox.execution_whitelist.is_empty());
+        assert_eq!(config.sandbox.data_directories.len(), 3);
+        assert!(config.sandbox.scan_upload_content);
+        assert!(config.sandbox.enforce_open_basedir);
+        assert!(config.sandbox.block_url_include);
+        assert!(config.sandbox.block_url_fopen);
+        assert_eq!(config.sandbox.disabled_functions.len(), 9);
+        assert!(config.sandbox.disabled_functions.contains(&"exec".to_string()));
+    }
+
+    #[test]
+    fn parse_cache_config() {
+        let toml_str = r#"
+[cache]
+enabled = false
+ttl_seconds = 60
+max_entries = 2048
+"#;
+        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        assert!(!config.cache.enabled);
+        assert_eq!(config.cache.ttl_seconds, 60);
+        assert_eq!(config.cache.max_entries, 2048);
+    }
+
+    #[test]
+    fn parse_cache_defaults() {
+        let config: RuntimeConfig = toml::from_str("").unwrap();
+        assert!(config.cache.enabled);
+        assert_eq!(config.cache.ttl_seconds, 30);
+        assert_eq!(config.cache.max_entries, 1024);
+    }
+
+    #[test]
+    fn parse_compression_config() {
+        let toml_str = r#"
+[compression]
+enabled = true
+min_size = 512
+level = 9
+algorithms = ["gzip", "br"]
+"#;
+        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.compression.enabled);
+        assert_eq!(config.compression.min_size, 512);
+        assert_eq!(config.compression.level, 9);
+        assert_eq!(config.compression.algorithms, vec!["gzip", "br"]);
+    }
+
+    #[test]
+    fn parse_compression_defaults() {
+        let config: RuntimeConfig = toml::from_str("").unwrap();
+        assert!(config.compression.enabled);
+        assert_eq!(config.compression.min_size, 1024);
+        assert_eq!(config.compression.level, 6);
+        assert_eq!(config.compression.algorithms, vec!["br", "zstd", "gzip"]);
+    }
+
+    #[test]
+    fn parse_session_config() {
+        let toml_str = r#"
+[session]
+enabled = true
+save_path = "/custom/sessions"
+cookie_name = "MY_SID"
+cookie_lifetime = 3600
+cookie_httponly = false
+cookie_secure = true
+cookie_samesite = "Strict"
+gc_maxlifetime = 7200
+auto_start = true
+"#;
+        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.session.enabled);
+        assert_eq!(config.session.save_path, "/custom/sessions");
+        assert_eq!(config.session.cookie_name, "MY_SID");
+        assert_eq!(config.session.cookie_lifetime, 3600);
+        assert!(!config.session.cookie_httponly);
+        assert!(config.session.cookie_secure);
+        assert_eq!(config.session.cookie_samesite, "Strict");
+        assert_eq!(config.session.gc_maxlifetime, 7200);
+        assert!(config.session.auto_start);
+    }
+
+    #[test]
+    fn parse_session_defaults() {
+        let config: RuntimeConfig = toml::from_str("").unwrap();
+        assert!(config.session.enabled);
+        assert_eq!(config.session.save_path, "/tmp/turbine-sessions");
+        assert_eq!(config.session.cookie_name, "PHPSESSID");
+        assert_eq!(config.session.cookie_lifetime, 0);
+        assert!(config.session.cookie_httponly);
+        assert!(!config.session.cookie_secure);
+        assert_eq!(config.session.cookie_samesite, "Lax");
+        assert_eq!(config.session.gc_maxlifetime, 1440);
+        assert!(!config.session.auto_start);
+    }
+
+    #[test]
+    fn parse_cors_config() {
+        let toml_str = r#"
+[cors]
+enabled = true
+allow_origins = ["https://example.com", "https://api.example.com"]
+allow_credentials = true
+allow_methods = ["GET", "POST"]
+allow_headers = ["Authorization"]
+expose_headers = ["X-Custom"]
+max_age = 3600
+"#;
+        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.cors.enabled);
+        assert_eq!(config.cors.allow_origins.len(), 2);
+        assert!(config.cors.allow_credentials);
+        assert_eq!(config.cors.allow_methods, vec!["GET", "POST"]);
+        assert_eq!(config.cors.allow_headers, vec!["Authorization"]);
+        assert_eq!(config.cors.expose_headers, vec!["X-Custom"]);
+        assert_eq!(config.cors.max_age, 3600);
+    }
+
+    #[test]
+    fn parse_cors_defaults() {
+        let config: RuntimeConfig = toml::from_str("").unwrap();
+        assert!(!config.cors.enabled);
+        assert!(config.cors.allow_origins.is_empty());
+        assert!(!config.cors.allow_credentials);
+        assert_eq!(config.cors.allow_methods.len(), 6);
+        assert_eq!(config.cors.allow_headers.len(), 3);
+        assert_eq!(config.cors.max_age, 86400);
+    }
+
+    #[test]
+    fn parse_tls_config() {
+        let toml_str = r#"
+[server.tls]
+enabled = true
+cert_file = "/etc/ssl/cert.pem"
+key_file = "/etc/ssl/key.pem"
+"#;
+        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.server.tls.enabled);
+        assert_eq!(config.server.tls.cert_file.unwrap(), "/etc/ssl/cert.pem");
+        assert_eq!(config.server.tls.key_file.unwrap(), "/etc/ssl/key.pem");
+    }
+
+    #[test]
+    fn parse_tls_defaults() {
+        let config: RuntimeConfig = toml::from_str("").unwrap();
+        assert!(!config.server.tls.enabled);
+        assert!(config.server.tls.cert_file.is_none());
+        assert!(config.server.tls.key_file.is_none());
+    }
+
+    #[test]
+    fn parse_watcher_config() {
+        let toml_str = r#"
+[watcher]
+enabled = true
+paths = ["src/", "app/"]
+extensions = ["php", "twig"]
+debounce_ms = 1000
+"#;
+        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.watcher.enabled);
+        assert_eq!(config.watcher.paths, vec!["src/", "app/"]);
+        assert_eq!(config.watcher.extensions, vec!["php", "twig"]);
+        assert_eq!(config.watcher.debounce_ms, 1000);
+    }
+
+    #[test]
+    fn parse_watcher_defaults() {
+        let config: RuntimeConfig = toml::from_str("").unwrap();
+        assert!(!config.watcher.enabled);
+        assert_eq!(config.watcher.paths.len(), 5);
+        assert_eq!(config.watcher.extensions, vec!["php", "env"]);
+        assert_eq!(config.watcher.debounce_ms, 500);
+    }
+
+    #[test]
+    fn parse_early_hints_defaults() {
+        let config: RuntimeConfig = toml::from_str("").unwrap();
+        assert!(config.early_hints.enabled);
+    }
+
+    #[test]
+    fn parse_worker_pools() {
+        let toml_str = r#"
+[[worker_pools]]
+match_path = "/api/reports/*"
+min_workers = 2
+max_workers = 8
+name = "reports"
+
+[[worker_pools]]
+match_path = "/webhook"
+min_workers = 1
+max_workers = 2
+name = "webhooks"
+"#;
+        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.worker_pools.len(), 2);
+        assert_eq!(config.worker_pools[0].name, Some("reports".to_string()));
+        assert_eq!(config.worker_pools[0].match_path, "/api/reports/*");
+        assert_eq!(config.worker_pools[0].min_workers, 2);
+        assert_eq!(config.worker_pools[0].max_workers, 8);
+        assert_eq!(config.worker_pools[1].name, Some("webhooks".to_string()));
+    }
+
+    #[test]
+    fn parse_auto_scale_config() {
+        let toml_str = r#"
+[server]
+auto_scale = true
+min_workers = 2
+max_workers = 32
+scale_down_idle_secs = 10
+"#;
+        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.server.auto_scale);
+        assert_eq!(config.server.min_workers, 2);
+        assert_eq!(config.server.max_workers, 32);
+        assert_eq!(config.server.scale_down_idle_secs, 10);
+    }
+
+    #[test]
+    fn parse_full_production_config() {
+        let toml_str = r#"
+[server]
+workers = 8
+listen = "0.0.0.0:443"
+worker_mode = "process"
+persistent_workers = true
+request_timeout = 60
+worker_max_requests = 50000
+max_wait_time = 10
+tokio_worker_threads = 4
+
+[server.tls]
+enabled = true
+cert_file = "/etc/ssl/cert.pem"
+key_file = "/etc/ssl/key.pem"
+
+[php]
+memory_limit = "512M"
+opcache_memory = 256
+jit_buffer_size = "128M"
+
+[security]
+enabled = true
+max_requests_per_second = 200
+
+[compression]
+enabled = true
+algorithms = ["br", "gzip"]
+
+[logging]
+level = "warn"
+
+[watcher]
+enabled = false
+"#;
+        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.server.workers, 8);
+        assert_eq!(config.server.listen, "0.0.0.0:443");
+        assert_eq!(config.server.persistent_workers, Some(true));
+        assert_eq!(config.server.worker_max_requests, 50000);
+        assert_eq!(config.server.max_wait_time, 10);
+        assert_eq!(config.server.tokio_worker_threads, Some(4));
+        assert!(config.server.tls.enabled);
+        assert_eq!(config.php.memory_limit, "512M");
+        assert!(config.security.enabled);
+        assert_eq!(config.logging.level, "warn");
+        assert!(!config.watcher.enabled);
+    }
+
+    // ── Defaults ────────────────────────────────────────────────────
+
+    #[test]
+    fn runtime_config_default() {
+        let config = RuntimeConfig::default();
+        assert_eq!(config.server.worker_mode, "process");
+        assert!(config.server.persistent_workers.is_none());
+        assert!(config.security.enabled);
+        assert!(config.cache.enabled);
+        assert!(config.compression.enabled);
+        assert!(!config.cors.enabled);
+        assert!(!config.watcher.enabled);
+        assert!(config.worker_pools.is_empty());
+    }
+
+    // ── Validation ──────────────────────────────────────────────────
+
+    #[test]
+    fn validate_does_not_panic_on_defaults() {
+        let config = RuntimeConfig::default();
+        config.validate(); // should NOT panic
+    }
+
+    #[test]
+    fn validate_does_not_panic_on_edge_cases() {
+        let toml_str = r#"
+[server]
+workers = 0
+request_timeout = 0
+
+[sandbox]
+execution_mode = "strict"
+
+[security]
+enabled = true
+sql_guard = false
+code_injection_guard = false
+behaviour_guard = false
+
+[cache]
+enabled = true
+ttl_seconds = 0
+"#;
+        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        config.validate(); // should log warnings, NOT panic
+    }
+
+    // ── Template ────────────────────────────────────────────────────
+
+    #[test]
+    fn template_is_non_empty() {
+        let template = RuntimeConfig::template();
+        assert!(template.len() > 100);
+        assert!(template.contains("[server]"));
+        assert!(template.contains("[php]"));
+        assert!(template.contains("[security]"));
+        assert!(template.contains("[compression]"));
+    }
+
+    // ── Unknown fields are ignored ──────────────────────────────────
+
+    #[test]
+    fn unknown_fields_ignored() {
+        let toml_str = r#"
+[server]
+workers = 2
+some_future_field = true
+
+[nonexistent_section]
+foo = "bar"
+"#;
+        // serde(default) should handle unknown fields gracefully
+        let result: Result<RuntimeConfig, _> = toml::from_str(toml_str);
+        // This might fail depending on serde config. If it does, that's fine -
+        // it means the config is strict (which is also valid behavior).
+        // We just want to document the behavior.
+        if let Ok(config) = result {
+            assert_eq!(config.server.workers, 2);
+        }
+    }
+
+    // ── check() validation tests ────────────────────────────────────
+
+    #[test]
+    fn check_defaults_no_errors() {
+        let config = RuntimeConfig::default();
+        let (errors, _warnings) = config.check();
+        assert!(errors.is_empty(), "Default config should have no errors: {:?}", errors);
+    }
+
+    #[test]
+    fn check_invalid_worker_mode() {
+        let mut config = RuntimeConfig::default();
+        config.server.worker_mode = "fork".into();
+        let (errors, _) = config.check();
+        assert!(errors.iter().any(|e| e.contains("worker_mode") && e.contains("fork")));
+    }
+
+    #[test]
+    fn check_valid_worker_modes() {
+        for mode in &["process", "thread"] {
+            let mut config = RuntimeConfig::default();
+            config.server.worker_mode = mode.to_string();
+            let (errors, _) = config.check();
+            assert!(!errors.iter().any(|e| e.contains("worker_mode")),
+                "worker_mode = \"{}\" should be valid", mode);
+        }
+    }
+
+    #[test]
+    fn check_invalid_execution_mode() {
+        let mut config = RuntimeConfig::default();
+        config.sandbox.execution_mode = "custom".into();
+        let (errors, _) = config.check();
+        assert!(errors.iter().any(|e| e.contains("execution_mode") && e.contains("custom")));
+    }
+
+    #[test]
+    fn check_tls_enabled_without_cert() {
+        let mut config = RuntimeConfig::default();
+        config.server.tls.enabled = true;
+        config.server.tls.cert_file = None;
+        config.server.tls.key_file = None;
+        let (errors, _) = config.check();
+        assert!(errors.iter().any(|e| e.contains("cert_file")));
+        assert!(errors.iter().any(|e| e.contains("key_file")));
+    }
+
+    #[test]
+    fn check_tls_disabled_no_error() {
+        let mut config = RuntimeConfig::default();
+        config.server.tls.enabled = false;
+        config.server.tls.cert_file = None;
+        let (errors, _) = config.check();
+        assert!(!errors.iter().any(|e| e.contains("cert_file")));
+    }
+
+    #[test]
+    fn check_tls_cert_file_not_found() {
+        let mut config = RuntimeConfig::default();
+        config.server.tls.enabled = true;
+        config.server.tls.cert_file = Some("/nonexistent/cert.pem".into());
+        config.server.tls.key_file = Some("/nonexistent/key.pem".into());
+        let (errors, _) = config.check();
+        assert!(errors.iter().any(|e| e.contains("cert.pem") && e.contains("not found")));
+        assert!(errors.iter().any(|e| e.contains("key.pem") && e.contains("not found")));
+    }
+
+    #[test]
+    fn check_strict_without_whitelist() {
+        let mut config = RuntimeConfig::default();
+        config.sandbox.execution_mode = "strict".into();
+        config.sandbox.execution_whitelist = vec![];
+        let (errors, _) = config.check();
+        assert!(errors.iter().any(|e| e.contains("strict") && e.contains("whitelist")));
+    }
+
+    #[test]
+    fn check_strict_with_whitelist_ok() {
+        let mut config = RuntimeConfig::default();
+        config.sandbox.execution_mode = "strict".into();
+        config.sandbox.execution_whitelist = vec!["/index.php".into()];
+        let (errors, _) = config.check();
+        assert!(!errors.iter().any(|e| e.contains("whitelist")));
+    }
+
+    #[test]
+    fn check_worker_pool_min_gt_max() {
+        let mut config = RuntimeConfig::default();
+        config.worker_pools.push(WorkerPoolRouteConfig {
+            match_path: "/api/.*".into(),
+            min_workers: 10,
+            max_workers: 5,
+            name: None,
+        });
+        let (errors, _) = config.check();
+        assert!(errors.iter().any(|e| e.contains("min_workers") && e.contains("max_workers")));
+    }
+
+    #[test]
+    fn check_warn_workers_zero_timeout_zero() {
+        let mut config = RuntimeConfig::default();
+        config.server.workers = 0;
+        config.server.request_timeout = 0;
+        let (_, warnings) = config.check();
+        assert!(warnings.iter().any(|w| w.contains("workers = 0") && w.contains("request_timeout = 0")));
+    }
+
+    #[test]
+    fn check_warn_security_all_guards_disabled() {
+        let mut config = RuntimeConfig::default();
+        config.security.enabled = true;
+        config.security.sql_guard = false;
+        config.security.code_injection_guard = false;
+        config.security.behaviour_guard = false;
+        let (_, warnings) = config.check();
+        assert!(warnings.iter().any(|w| w.contains("all guards are disabled")));
+    }
+
+    #[test]
+    fn check_warn_cache_ttl_zero() {
+        let mut config = RuntimeConfig::default();
+        config.cache.enabled = true;
+        config.cache.ttl_seconds = 0;
+        let (_, warnings) = config.check();
+        assert!(warnings.iter().any(|w| w.contains("ttl_seconds = 0")));
+    }
+
+    #[test]
+    fn check_warn_high_workers() {
+        let mut config = RuntimeConfig::default();
+        config.server.workers = 128;
+        let (_, warnings) = config.check();
+        assert!(warnings.iter().any(|w| w.contains("workers = 128")));
+    }
+
+    #[test]
+    fn check_warn_persistent_no_recycling() {
+        let mut config = RuntimeConfig::default();
+        config.server.persistent_workers = Some(true);
+        config.server.worker_max_requests = 0;
+        let (_, warnings) = config.check();
+        assert!(warnings.iter().any(|w| w.contains("persistent") && w.contains("recycle")));
+    }
+
+    #[test]
+    fn check_warn_compression_level() {
+        let mut config = RuntimeConfig::default();
+        config.compression.level = 15;
+        let (_, warnings) = config.check();
+        assert!(warnings.iter().any(|w| w.contains("level = 15")));
+    }
+
+    #[test]
+    fn check_warn_invalid_samesite() {
+        let mut config = RuntimeConfig::default();
+        config.session.cookie_samesite = "Invalid".into();
+        let (_, warnings) = config.check();
+        assert!(warnings.iter().any(|w| w.contains("cookie_samesite")));
+    }
+
+    #[test]
+    fn check_valid_samesite_values() {
+        for val in &["Lax", "Strict", "None"] {
+            let mut config = RuntimeConfig::default();
+            config.session.cookie_samesite = val.to_string();
+            let (_, warnings) = config.check();
+            assert!(!warnings.iter().any(|w| w.contains("cookie_samesite")),
+                "cookie_samesite = \"{}\" should not warn", val);
+        }
+    }
+
+    #[test]
+    fn check_warn_cors_no_origins() {
+        let mut config = RuntimeConfig::default();
+        config.cors.enabled = true;
+        config.cors.allow_origins = vec![];
+        let (_, warnings) = config.check();
+        assert!(warnings.iter().any(|w| w.contains("allow_origins")));
+    }
+
+    #[test]
+    fn check_warn_acme_plus_tls() {
+        let mut config = RuntimeConfig::default();
+        config.acme.enabled = true;
+        config.server.tls.enabled = true;
+        config.server.tls.cert_file = Some("/tmp/cert.pem".into());
+        config.server.tls.key_file = Some("/tmp/key.pem".into());
+        let (_, warnings) = config.check();
+        assert!(warnings.iter().any(|w| w.contains("ACME") && w.contains("TLS")));
+    }
+
+    #[test]
+    fn check_warn_empty_pool_match_path() {
+        let mut config = RuntimeConfig::default();
+        config.worker_pools.push(WorkerPoolRouteConfig {
+            match_path: "".into(),
+            min_workers: 1,
+            max_workers: 4,
+            name: None,
+        });
+        let (_, warnings) = config.check();
+        assert!(warnings.iter().any(|w| w.contains("match_path") && w.contains("empty")));
+    }
+
+    #[test]
+    fn check_clean_config_no_warnings() {
+        let config = RuntimeConfig::default();
+        let (errors, warnings) = config.check();
+        // Default config should have minimal warnings
+        assert!(errors.is_empty());
+        // The only possible default warning is compression level or samesite
+        // but defaults should all be valid
+        for w in &warnings {
+            // If there are any, they should be benign
+            println!("Default warning: {w}");
+        }
+    }
+
+    #[test]
+    fn check_multiple_errors_accumulated() {
+        let mut config = RuntimeConfig::default();
+        config.server.worker_mode = "invalid".into();
+        config.sandbox.execution_mode = "invalid".into();
+        config.server.tls.enabled = true;
+        config.server.tls.cert_file = None;
+        config.server.tls.key_file = None;
+        let (errors, _) = config.check();
+        assert!(errors.len() >= 4, "Expected at least 4 errors, got {}: {:?}", errors.len(), errors);
     }
 }

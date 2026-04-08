@@ -8,6 +8,13 @@ Generate a default configuration:
 turbine init
 ```
 
+Validate an existing configuration:
+
+```bash
+turbine check
+turbine check --config /path/to/turbine.toml
+```
+
 ## Complete Configuration
 
 ```toml
