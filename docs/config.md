@@ -190,7 +190,10 @@ enabled = true
 output = "stderr"
 
 [acme]
-# Enable automatic Let's Encrypt certificates
+# Enable automatic Let's Encrypt certificates.
+# When [[virtual_hosts]] are configured, their domains are auto-collected —
+# you do NOT need to list them here. Use 'domains' only for single-site setups
+# without virtual hosting.
 enabled = false
 # domains = ["example.com", "www.example.com"]
 # email = "admin@example.com"
@@ -217,6 +220,15 @@ statistics = true
 # min_workers = 1
 # max_workers = 4
 # name = "slow-api"
+
+# Virtual hosting: serve different PHP apps on different domains
+# [[virtual_hosts]]
+# domain = "xpto.com"
+# root = "/var/www/xpto"
+# aliases = ["www.xpto.com"]
+# # entry_point = "index.php"
+# # tls_cert = "/etc/ssl/xpto.com.pem"
+# # tls_key = "/etc/ssl/xpto.com-key.pem"
 ```
 
 ## Section Reference
@@ -354,6 +366,20 @@ date.timezone = "America/Sao_Paulo"
 
 When `token` is set, all `/_/*` endpoints require authentication via `Authorization: Bearer <token>` header or `?token=<token>` query parameter.
 
+### `[acme]`
+
+Automatic TLS certificates via Let's Encrypt. See [TLS & ACME](tls.md) for the full guide.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `false` | Enable ACME auto-TLS |
+| `domains` | string[] | `[]` | Domain names (**not needed with `[[virtual_hosts]]`** — domains are auto-collected) |
+| `email` | string | none | Contact email for Let's Encrypt notifications |
+| `cache_dir` | string | `"/var/lib/turbine/acme"` | Certificate cache directory |
+| `staging` | bool | `false` | Use Let's Encrypt staging server (for testing) |
+
+> **With virtual hosting:** Do not set `domains` — Turbine auto-collects `domain` + `aliases` from every `[[virtual_hosts]]` entry. Virtual hosts with their own `tls_cert`/`tls_key` are excluded from ACME.
+
 ### `[[worker_pools]]`
 
 Named worker pools route specific URL patterns to dedicated worker groups:
@@ -378,6 +404,32 @@ name = "webhooks"
 | `min_workers` | integer | `1` | Minimum pool workers |
 | `max_workers` | integer | `4` | Maximum pool workers |
 | `name` | string | none | Pool name for logging |
+
+### `[[virtual_hosts]]`
+
+Serve different PHP applications on different domains from a single Turbine instance. See [Virtual Hosting](virtual-hosts.md) for the full guide.
+
+```toml
+[[virtual_hosts]]
+domain = "xpto.com"
+root = "/var/www/xpto"
+aliases = ["www.xpto.com"]
+
+[[virtual_hosts]]
+domain = "outro.com"
+root = "/var/www/outro"
+tls_cert = "/etc/ssl/outro.com.pem"
+tls_key = "/etc/ssl/outro.com-key.pem"
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `domain` | string | required | Primary domain name (matched against `Host` header) |
+| `root` | string | required | Application root directory |
+| `aliases` | string[] | `[]` | Additional domains that route to this vhost |
+| `entry_point` | string | auto-detected | PHP entry point file |
+| `tls_cert` | string | none | PEM certificate (per-host SNI) |
+| `tls_key` | string | none | PEM private key (per-host SNI) |
 
 ## Environment Variables
 

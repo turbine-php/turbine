@@ -129,6 +129,17 @@ fn cmd_check(config_path: Option<String>) {
     println!("  compression      = {}", config.compression.enabled);
     println!("  cache            = {}", config.cache.enabled);
     println!("  tls              = {}", config.server.tls.enabled);
+    if !config.virtual_hosts.is_empty() {
+        println!("  virtual_hosts    = {}", config.virtual_hosts.len());
+        for vhost in &config.virtual_hosts {
+            let aliases = if vhost.aliases.is_empty() {
+                String::new()
+            } else {
+                format!(" (+ {})", vhost.aliases.join(", "))
+            };
+            println!("    {} → {}{}", vhost.domain, vhost.root, aliases);
+        }
+    }
     println!();
 
     let mut has_issues = false;
@@ -570,6 +581,18 @@ struct ServerState {
     dashboard_enabled: bool,
     statistics_enabled: bool,
     dashboard_token: Option<String>,
+    /// Virtual host map: lowercase domain → resolved vhost with pre-computed AppStructure.
+    /// Empty = no virtual hosting (use global app_structure).
+    virtual_hosts: std::collections::HashMap<String, Arc<VhostResolved>>,
+}
+
+/// Resolved virtual host — pre-computed at startup for zero-cost per-request lookup.
+struct VhostResolved {
+    /// Primary domain name (for logging).
+    #[allow(dead_code)]
+    domain: String,
+    /// Pre-computed AppStructure (document_root + entry_point + resolve_path logic).
+    app_structure: AppStructure,
 }
 
 /// A named worker pool for route-based thread pool splitting.
@@ -783,6 +806,15 @@ fn cmd_serve(
             let abs = app_root.join(data_dir);
             paths.push(abs.display().to_string());
         }
+        // Add virtual host roots so PHP can access them
+        for vhost in &config.virtual_hosts {
+            let vhost_root = std::path::Path::new(&vhost.root);
+            if vhost_root.is_absolute() {
+                paths.push(vhost.root.clone());
+            } else {
+                paths.push(app_root.join(&vhost.root).display().to_string());
+            }
+        }
         // Deduplicate paths
         paths.sort();
         paths.dedup();
@@ -865,6 +897,49 @@ fn cmd_serve(
     if config.structured_logging.enabled {
         php_bootstrap = format!("{}{}", features::php_turbine_log_function(), php_bootstrap);
         info!("PHP turbine_log() function injected into bootstrap");
+    }
+
+    // --- Virtual hosting ---
+    let mut virtual_hosts: std::collections::HashMap<String, Arc<VhostResolved>> = std::collections::HashMap::new();
+    for vhost_cfg in &config.virtual_hosts {
+        let vhost_root = std::path::Path::new(&vhost_cfg.root);
+        let vhost_root = if vhost_root.is_absolute() {
+            vhost_root.to_path_buf()
+        } else {
+            app_root.join(vhost_root)
+        };
+        if !vhost_root.exists() {
+            warn!(domain = %vhost_cfg.domain, root = %vhost_cfg.root, "Virtual host root directory not found — skipping");
+            continue;
+        }
+        let mut vhost_app = AppDetector::detect(&vhost_root);
+        // Override entry_point if specified in config
+        if let Some(ref ep) = vhost_cfg.entry_point {
+            vhost_app.entry_point = ep.clone();
+        }
+        info!(
+            domain = %vhost_cfg.domain,
+            document_root = %vhost_app.document_root.display(),
+            entry = %vhost_app.entry_point,
+            "Virtual host configured"
+        );
+        let resolved = Arc::new(VhostResolved {
+            domain: vhost_cfg.domain.clone(),
+            app_structure: vhost_app,
+        });
+        // Map domain (lowercase)
+        virtual_hosts.insert(vhost_cfg.domain.to_lowercase(), resolved.clone());
+        // Map aliases
+        for alias in &vhost_cfg.aliases {
+            virtual_hosts.insert(alias.to_lowercase(), resolved.clone());
+        }
+    }
+    if !virtual_hosts.is_empty() {
+        info!(
+            count = config.virtual_hosts.len(),
+            domains = virtual_hosts.len(),
+            "Virtual hosts loaded"
+        );
     }
 
     // --- RequestGuard ---
@@ -1061,6 +1136,27 @@ fn cmd_serve(
     }
 
     // --- ACME auto-TLS ---
+    // Auto-collect virtual host domains into ACME if not already present
+    if config.acme.enabled && !config.virtual_hosts.is_empty() {
+        for vhost_cfg in &config.virtual_hosts {
+            // Skip vhosts with their own per-host TLS certificates
+            if vhost_cfg.tls_cert.is_some() {
+                continue;
+            }
+            let domain = vhost_cfg.domain.to_lowercase();
+            if !config.acme.domains.iter().any(|d| d.to_lowercase() == domain) {
+                info!(domain = %vhost_cfg.domain, "Adding virtual host domain to ACME");
+                config.acme.domains.push(vhost_cfg.domain.clone());
+            }
+            for alias in &vhost_cfg.aliases {
+                let alias_lower = alias.to_lowercase();
+                if !config.acme.domains.iter().any(|d| d.to_lowercase() == alias_lower) {
+                    info!(domain = %alias, "Adding virtual host alias to ACME");
+                    config.acme.domains.push(alias.clone());
+                }
+            }
+        }
+    }
     let acme_challenge_tokens = acme::new_challenge_store();
     if config.acme.enabled {
         if config.acme.domains.is_empty() {
@@ -1169,7 +1265,27 @@ fn cmd_serve(
             error!("TLS enabled but key_file not set");
             std::process::exit(1);
         });
-        Some(build_tls_acceptor(cert_path, key_path))
+        // Collect per-vhost TLS certs for SNI
+        let vhost_certs: Vec<(String, String, String)> = config.virtual_hosts.iter()
+            .filter_map(|v| {
+                match (&v.tls_cert, &v.tls_key) {
+                    (Some(cert), Some(key)) => {
+                        let mut domains = vec![(v.domain.to_lowercase(), cert.clone(), key.clone())];
+                        for alias in &v.aliases {
+                            domains.push((alias.to_lowercase(), cert.clone(), key.clone()));
+                        }
+                        Some(domains)
+                    }
+                    _ => None,
+                }
+            })
+            .flatten()
+            .collect();
+        if vhost_certs.is_empty() {
+            Some(build_tls_acceptor(cert_path, key_path))
+        } else {
+            Some(build_tls_acceptor_with_sni(cert_path, key_path, &vhost_certs))
+        }
     } else {
         None
     };
@@ -1394,6 +1510,7 @@ fn cmd_serve(
             dashboard_enabled: config.dashboard.enabled,
             statistics_enabled: config.dashboard.statistics,
             dashboard_token: config.dashboard.token.clone(),
+            virtual_hosts: virtual_hosts.clone(),
         });
 
         // Spawn ACME renewal task if ACME is enabled
@@ -1466,6 +1583,7 @@ fn cmd_serve(
             dashboard_enabled: config.dashboard.enabled,
             statistics_enabled: config.dashboard.statistics,
             dashboard_token: config.dashboard.token.clone(),
+            virtual_hosts: virtual_hosts.clone(),
         });
 
         let mut rt_builder = tokio::runtime::Builder::new_multi_thread();
@@ -1532,48 +1650,136 @@ fn php_executor_loop(
 }
 
 fn build_tls_acceptor(cert_path: &str, key_path: &str) -> TlsAcceptor {
+    build_tls_acceptor_with_sni(cert_path, key_path, &[])
+}
+
+/// Build a TLS acceptor with optional SNI-based per-host certificates.
+/// The default cert/key is used for connections that don't match any SNI name.
+fn build_tls_acceptor_with_sni(
+    cert_path: &str,
+    key_path: &str,
+    vhost_certs: &[(String, String, String)], // (domain, cert_path, key_path)
+) -> TlsAcceptor {
     use rustls::ServerConfig as RustlsConfig;
     use std::io::BufReader;
 
-    let cert_file = std::fs::File::open(cert_path).unwrap_or_else(|e| {
-        error!(path = cert_path, "Failed to open certificate file: {e}");
-        std::process::exit(1);
-    });
-    let key_file = std::fs::File::open(key_path).unwrap_or_else(|e| {
-        error!(path = key_path, "Failed to open key file: {e}");
-        std::process::exit(1);
-    });
+    // Helper: load cert+key pair
+    fn load_cert_key(cert_path: &str, key_path: &str) -> (Vec<rustls::pki_types::CertificateDer<'static>>, rustls::pki_types::PrivateKeyDer<'static>) {
+        let cert_file = std::fs::File::open(cert_path).unwrap_or_else(|e| {
+            error!(path = cert_path, "Failed to open certificate file: {e}");
+            std::process::exit(1);
+        });
+        let key_file = std::fs::File::open(key_path).unwrap_or_else(|e| {
+            error!(path = key_path, "Failed to open key file: {e}");
+            std::process::exit(1);
+        });
 
-    let certs: Vec<_> = rustls_pemfile::certs(&mut BufReader::new(cert_file))
-        .filter_map(|r| r.ok())
-        .collect();
-    if certs.is_empty() {
-        error!(path = cert_path, "No certificates found in file");
-        std::process::exit(1);
+        let certs: Vec<_> = rustls_pemfile::certs(&mut BufReader::new(cert_file))
+            .filter_map(|r| r.ok())
+            .collect();
+        if certs.is_empty() {
+            error!(path = cert_path, "No certificates found in file");
+            std::process::exit(1);
+        }
+
+        let key = rustls_pemfile::private_key(&mut BufReader::new(key_file))
+            .unwrap_or_else(|e| {
+                error!(path = key_path, "Failed to parse private key: {e}");
+                std::process::exit(1);
+            })
+            .unwrap_or_else(|| {
+                error!(path = key_path, "No private key found in file");
+                std::process::exit(1);
+            });
+
+        (certs, key)
     }
 
-    let key = rustls_pemfile::private_key(&mut BufReader::new(key_file))
-        .unwrap_or_else(|e| {
-            error!(path = key_path, "Failed to parse private key: {e}");
-            std::process::exit(1);
-        })
-        .unwrap_or_else(|| {
-            error!(path = key_path, "No private key found in file");
-            std::process::exit(1);
+    let tls_config = if vhost_certs.is_empty() {
+        // Simple path: single certificate
+        let (certs, key) = load_cert_key(cert_path, key_path);
+        let mut cfg = RustlsConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .unwrap_or_else(|e| {
+                error!("Invalid TLS certificate/key pair: {e}");
+                std::process::exit(1);
+            });
+        cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        info!("TLS configured (single cert, ALPN: h2, http/1.1)");
+        cfg
+    } else {
+        // SNI path: multiple certificates per domain
+        use rustls::server::ResolvesServerCertUsingSni;
+        use rustls::sign::CertifiedKey;
+
+        let mut resolver = ResolvesServerCertUsingSni::new();
+
+        for (domain, vcert_path, vkey_path) in vhost_certs {
+            let (certs, key) = load_cert_key(vcert_path, vkey_path);
+            let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
+                .unwrap_or_else(|e| {
+                    error!(domain = %domain, "Failed to load signing key: {e}");
+                    std::process::exit(1);
+                });
+            let certified = CertifiedKey::new(certs, signing_key);
+            resolver.add(domain, certified).unwrap_or_else(|e| {
+                error!(domain = %domain, "Failed to add SNI cert: {e}");
+                std::process::exit(1);
+            });
+            info!(domain = %domain, "SNI certificate loaded");
+        }
+
+        // Also add the default cert to the SNI resolver as fallback
+        let (default_certs, default_key) = load_cert_key(cert_path, key_path);
+        let default_signing = rustls::crypto::ring::sign::any_supported_type(&default_key)
+            .unwrap_or_else(|e| {
+                error!("Failed to load default signing key: {e}");
+                std::process::exit(1);
+            });
+        let default_certified = Arc::new(CertifiedKey::new(default_certs, default_signing));
+
+        // Build config with SNI resolver + default fallback
+        use rustls::server::ResolvesServerCert;
+        use std::fmt;
+        struct SniWithFallback {
+            sni: ResolvesServerCertUsingSni,
+            fallback: Arc<CertifiedKey>,
+        }
+        impl fmt::Debug for SniWithFallback {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.debug_struct("SniWithFallback").finish()
+            }
+        }
+        impl ResolvesServerCert for SniWithFallback {
+            fn resolve(&self, client_hello: rustls::server::ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+                // Try SNI lookup first — if the domain has a cert, use it.
+                // ResolvesServerCertUsingSni already checks server_name() internally.
+                if client_hello.server_name().is_some() {
+                    // Clone the server name to avoid borrow conflict
+                    let sni_result = self.sni.resolve(client_hello);
+                    if sni_result.is_some() {
+                        return sni_result;
+                    }
+                    // SNI name didn't match — fall through to default
+                }
+                Some(self.fallback.clone())
+            }
+        }
+
+        let sni_fallback = Arc::new(SniWithFallback {
+            sni: resolver,
+            fallback: default_certified,
         });
 
-    let mut tls_config = RustlsConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .unwrap_or_else(|e| {
-            error!("Invalid TLS certificate/key pair: {e}");
-            std::process::exit(1);
-        });
+        let mut cfg = RustlsConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(sni_fallback);
+        cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        info!(vhosts = vhost_certs.len(), "TLS configured with SNI (ALPN: h2, http/1.1)");
+        cfg
+    };
 
-    // ALPN: advertise h2 and http/1.1 so clients can negotiate HTTP/2
-    tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-
-    info!("TLS configured (ALPN: h2, http/1.1)");
     TlsAcceptor::from(Arc::new(tls_config))
 }
 
@@ -2077,11 +2283,27 @@ async fn handle_request_inner(
         return Ok(build_response(404, "text/plain", b"ACME challenge token not found".to_vec(), &[]));
     }
 
+    // --- Virtual host resolution (O(1) HashMap lookup) ---
+    let vhost = if !state.virtual_hosts.is_empty() {
+        req.headers()
+            .get("host")
+            .and_then(|v| v.to_str().ok())
+            .map(|h| {
+                // Strip port from Host header (e.g. "xpto.com:443" → "xpto.com")
+                let domain = h.split(':').next().unwrap_or(h);
+                domain.to_lowercase()
+            })
+            .and_then(|domain| state.virtual_hosts.get(&domain).cloned())
+    } else {
+        None
+    };
+    let app = vhost.as_ref().map(|v| &v.app_structure).unwrap_or(&state.app_structure);
+
     let if_none_match = req.headers()
         .get("if-none-match")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
-    if let Some(resp) = try_serve_static(&state.app_structure.document_root, &uri_path, &req_method, &state.metrics, request_start, if_none_match.as_deref()) {
+    if let Some(resp) = try_serve_static(&app.document_root, &uri_path, &req_method, &state.metrics, request_start, if_none_match.as_deref()) {
         return Ok(resp);
     }
 
@@ -2098,7 +2320,7 @@ async fn handle_request_inner(
     let query_params = request.get_params();
     let param_refs: Vec<(&str, &str)> = query_params.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 
-    let php_path = state.app_structure.resolve_path(&request.path);
+    let php_path = app.resolve_path(&request.path);
 
     // --- Camada 1: Execution Whitelist (Fortress) ---
     // Only files in the whitelist can be executed via HTTP.
@@ -2183,8 +2405,8 @@ async fn handle_request_inner(
                 .find(|(k, _)| k.eq_ignore_ascii_case("Cookie"))
                 .map(|(_, v)| v.as_str())
                 .unwrap_or("");
-            let document_root = state.app_structure.document_root.display().to_string();
-            let script_filename = state.app_structure.document_root.join(&php_path).display().to_string();
+            let document_root = app.document_root.display().to_string();
+            let script_filename = app.document_root.join(&php_path).display().to_string();
             let script_name = format!("/{}", &php_path);
             let per = PersistentRequest {
                 method: &request.method,
@@ -2288,8 +2510,8 @@ async fn handle_request_inner(
                 .find(|(k, _)| k.eq_ignore_ascii_case("Cookie"))
                 .map(|(_, v)| v.as_str())
                 .unwrap_or("");
-            let document_root = state.app_structure.document_root.display().to_string();
-            let script_filename = state.app_structure.document_root.join(&php_path).display().to_string();
+            let document_root = app.document_root.display().to_string();
+            let script_filename = app.document_root.join(&php_path).display().to_string();
             let script_name = format!("/{}", &php_path);
             let per = PersistentRequest {
                 method: &request.method,
@@ -2447,7 +2669,7 @@ async fn handle_request_inner(
     let app_root = std::env::current_dir().unwrap_or_default();
     let server_port = state.listen.split(':').last().and_then(|p| p.parse::<u16>().ok()).unwrap_or(8080);
     let superglobals = request.php_superglobals_code(&app_root, &php_path, &client_ip.to_string(), server_port, state.is_tls);
-    let abs_php_path = state.app_structure.document_root.join(&php_path);
+    let abs_php_path = app.document_root.join(&php_path);
     let include_path = abs_php_path.display().to_string().replace('\'', "\\'");
     let session_code = if state.session_auto_start {
         "session_start(); "
@@ -2576,7 +2798,7 @@ async fn handle_request_inner(
             .map(|(_, v)| v.as_str())
             .unwrap_or("");
         let content_length: i32 = if request.body.is_empty() { -1 } else { request.body.len() as i32 };
-        let document_root = state.app_structure.document_root.display().to_string();
+        let document_root = app.document_root.display().to_string();
         let script_path_native = abs_php_path.display().to_string();
         let script_name = format!("/{}", &php_path);
 
@@ -2739,7 +2961,7 @@ async fn handle_request_inner(
                         .find(|(k, _)| k.eq_ignore_ascii_case("Cookie"))
                         .map(|(_, v)| v.as_str())
                         .unwrap_or("");
-                    let document_root = state.app_structure.document_root.display().to_string();
+                    let document_root = app.document_root.display().to_string();
                     let script_filename = abs_php_path.display().to_string();
                     let script_name = format!("/{}", &php_path);
                     let per = PersistentRequest {
@@ -2779,7 +3001,7 @@ async fn handle_request_inner(
                         .map(|(_, v)| v.as_str())
                         .unwrap_or("");
                     let content_length: i32 = if request.body.is_empty() { -1 } else { request.body.len() as i32 };
-                    let document_root = state.app_structure.document_root.display().to_string();
+                    let document_root = app.document_root.display().to_string();
                     let script_path_native = abs_php_path.display().to_string();
                     let script_name = format!("/{}", &php_path);
 

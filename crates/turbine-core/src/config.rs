@@ -40,6 +40,8 @@ pub struct RuntimeConfig {
     pub dashboard: DashboardConfig,
     #[serde(default)]
     pub worker_pools: Vec<WorkerPoolRouteConfig>,
+    #[serde(default)]
+    pub virtual_hosts: Vec<VirtualHostConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -389,6 +391,27 @@ pub struct WorkerPoolRouteConfig {
 
 fn default_pool_max_workers() -> usize {
     4
+}
+
+/// Virtual host configuration — serve different PHP applications on different domains.
+#[derive(Debug, Deserialize, Clone)]
+pub struct VirtualHostConfig {
+    /// Primary domain name (e.g. "xpto.com").
+    pub domain: String,
+    /// Application root directory for this domain.
+    pub root: String,
+    /// Alternative domain names that should also match (e.g. ["www.xpto.com"]).
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    /// Entry point PHP file (default: auto-detected).
+    #[serde(default)]
+    pub entry_point: Option<String>,
+    /// Per-host TLS certificate file (overrides global TLS).
+    #[serde(default)]
+    pub tls_cert: Option<String>,
+    /// Per-host TLS key file (overrides global TLS).
+    #[serde(default)]
+    pub tls_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -870,6 +893,7 @@ impl Default for RuntimeConfig {
             embed: EmbedConfig::default(),
             dashboard: DashboardConfig::default(),
             worker_pools: Vec::new(),
+            virtual_hosts: Vec::new(),
         }
     }
 }
@@ -966,6 +990,10 @@ impl RuntimeConfig {
             warnings.push("[acme] enabled = true and [server.tls] enabled = true — ACME auto-TLS and manual TLS are both active, ACME may overwrite your certificate".to_string());
         }
 
+        if self.acme.enabled && !self.acme.domains.is_empty() && !self.virtual_hosts.is_empty() {
+            warnings.push("[acme] domains is set but [[virtual_hosts]] are configured — vhost domains are auto-collected into ACME, 'domains' is redundant".to_string());
+        }
+
         if self.watcher.enabled && self.logging.level == "warn" || self.watcher.enabled && self.logging.level == "error" {
             // Fine, no warning needed
         }
@@ -977,6 +1005,48 @@ impl RuntimeConfig {
             if pool.min_workers > pool.max_workers {
                 errors.push(format!("[[worker_pools]][{}] min_workers ({}) > max_workers ({}) — invalid", i, pool.min_workers, pool.max_workers));
             }
+        }
+
+        // ── Virtual hosts ───────────────────────────────────────────
+
+        let mut seen_domains: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (i, vhost) in self.virtual_hosts.iter().enumerate() {
+            if vhost.domain.is_empty() {
+                errors.push(format!("[[virtual_hosts]][{}] domain is empty", i));
+            } else {
+                let lower = vhost.domain.to_lowercase();
+                if !seen_domains.insert(lower.clone()) {
+                    errors.push(format!("[[virtual_hosts]][{}] duplicate domain \"{}\"", i, vhost.domain));
+                }
+            }
+            if vhost.root.is_empty() {
+                errors.push(format!("[[virtual_hosts]][{}] root is empty for domain \"{}\"", i, vhost.domain));
+            } else if !std::path::Path::new(&vhost.root).exists() {
+                errors.push(format!("[[virtual_hosts]][{}] root = \"{}\" — directory not found for domain \"{}\"", i, vhost.root, vhost.domain));
+            }
+            for alias in &vhost.aliases {
+                let lower = alias.to_lowercase();
+                if !seen_domains.insert(lower.clone()) {
+                    errors.push(format!("[[virtual_hosts]][{}] duplicate alias \"{}\" (already defined as domain or alias)", i, alias));
+                }
+            }
+            if let Some(ref cert) = vhost.tls_cert {
+                if !std::path::Path::new(cert).exists() {
+                    errors.push(format!("[[virtual_hosts]][{}] tls_cert = \"{}\" — file not found for domain \"{}\"", i, cert, vhost.domain));
+                }
+            }
+            if let Some(ref key) = vhost.tls_key {
+                if !std::path::Path::new(key).exists() {
+                    errors.push(format!("[[virtual_hosts]][{}] tls_key = \"{}\" — file not found for domain \"{}\"", i, key, vhost.domain));
+                }
+            }
+            if vhost.tls_cert.is_some() != vhost.tls_key.is_some() {
+                errors.push(format!("[[virtual_hosts]][{}] domain \"{}\" — tls_cert and tls_key must both be set or both omitted", i, vhost.domain));
+            }
+        }
+
+        if !self.virtual_hosts.is_empty() && self.server.listen.starts_with("127.0.0.1") {
+            warnings.push("[virtual_hosts] configured but server listens on 127.0.0.1 — external domains won't be reachable".to_string());
         }
 
         (errors, warnings)
@@ -1230,9 +1300,12 @@ enabled = true
 output = "stderr"
 
 [acme]
-# Enable automatic TLS via ACME (Let's Encrypt)
+# Enable automatic TLS via ACME (Let's Encrypt).
+# When [[virtual_hosts]] are configured, their domains are auto-collected —
+# you do NOT need to list them in 'domains'. Use 'domains' only for
+# single-site setups without virtual hosting.
 enabled = false
-# Domain names for the certificate
+# Domain names for the certificate (only needed without [[virtual_hosts]])
 # domains = ["example.com", "www.example.com"]
 # Contact email for Let's Encrypt notifications
 # email = "admin@example.com"
@@ -1260,6 +1333,23 @@ statistics = true
 # min_workers = 1
 # max_workers = 4
 # name = "slow-api"
+
+# Virtual hosting: serve different PHP applications on different domains.
+# All virtual hosts share the same worker pool (no memory overhead).
+# Requests whose Host header does not match any virtual host use the global root.
+#
+# [[virtual_hosts]]
+# domain = "xpto.com"
+# root = "/var/www/xpto"
+# aliases = ["www.xpto.com"]
+# # entry_point = "index.php"   # optional, auto-detected
+# # tls_cert = "/etc/ssl/xpto.com.pem"   # optional, per-host TLS
+# # tls_key = "/etc/ssl/xpto.com-key.pem"
+#
+# [[virtual_hosts]]
+# domain = "outro.com"
+# root = "/var/www/outro"
+# aliases = ["www.outro.com"]
 "#
     }
 }
@@ -2000,5 +2090,197 @@ foo = "bar"
         config.server.tls.key_file = None;
         let (errors, _) = config.check();
         assert!(errors.len() >= 4, "Expected at least 4 errors, got {}: {:?}", errors.len(), errors);
+    }
+
+    // ── Virtual host config tests ───────────────────────────────────
+
+    #[test]
+    fn parse_virtual_hosts() {
+        let toml_str = r#"
+[[virtual_hosts]]
+domain = "xpto.com"
+root = "/var/www/xpto"
+aliases = ["www.xpto.com"]
+entry_point = "index.php"
+
+[[virtual_hosts]]
+domain = "outro.com"
+root = "/var/www/outro"
+"#;
+        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.virtual_hosts.len(), 2);
+        assert_eq!(config.virtual_hosts[0].domain, "xpto.com");
+        assert_eq!(config.virtual_hosts[0].root, "/var/www/xpto");
+        assert_eq!(config.virtual_hosts[0].aliases, vec!["www.xpto.com"]);
+        assert_eq!(config.virtual_hosts[0].entry_point, Some("index.php".into()));
+        assert_eq!(config.virtual_hosts[1].domain, "outro.com");
+        assert_eq!(config.virtual_hosts[1].root, "/var/www/outro");
+        assert!(config.virtual_hosts[1].aliases.is_empty());
+        assert!(config.virtual_hosts[1].entry_point.is_none());
+    }
+
+    #[test]
+    fn parse_virtual_hosts_with_tls() {
+        let toml_str = r#"
+[[virtual_hosts]]
+domain = "secure.com"
+root = "/var/www/secure"
+tls_cert = "/etc/ssl/secure.pem"
+tls_key = "/etc/ssl/secure-key.pem"
+"#;
+        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.virtual_hosts[0].tls_cert, Some("/etc/ssl/secure.pem".into()));
+        assert_eq!(config.virtual_hosts[0].tls_key, Some("/etc/ssl/secure-key.pem".into()));
+    }
+
+    #[test]
+    fn parse_no_virtual_hosts() {
+        let toml_str = r#"
+[server]
+workers = 4
+"#;
+        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.virtual_hosts.is_empty());
+    }
+
+    #[test]
+    fn check_vhost_empty_domain() {
+        let mut config = RuntimeConfig::default();
+        config.virtual_hosts.push(VirtualHostConfig {
+            domain: "".into(),
+            root: "/var/www/test".into(),
+            aliases: vec![],
+            entry_point: None,
+            tls_cert: None,
+            tls_key: None,
+        });
+        let (errors, _) = config.check();
+        assert!(errors.iter().any(|e| e.contains("domain is empty")));
+    }
+
+    #[test]
+    fn check_vhost_empty_root() {
+        let mut config = RuntimeConfig::default();
+        config.virtual_hosts.push(VirtualHostConfig {
+            domain: "xpto.com".into(),
+            root: "".into(),
+            aliases: vec![],
+            entry_point: None,
+            tls_cert: None,
+            tls_key: None,
+        });
+        let (errors, _) = config.check();
+        assert!(errors.iter().any(|e| e.contains("root is empty")));
+    }
+
+    #[test]
+    fn check_vhost_root_not_found() {
+        let mut config = RuntimeConfig::default();
+        config.virtual_hosts.push(VirtualHostConfig {
+            domain: "xpto.com".into(),
+            root: "/nonexistent/path".into(),
+            aliases: vec![],
+            entry_point: None,
+            tls_cert: None,
+            tls_key: None,
+        });
+        let (errors, _) = config.check();
+        assert!(errors.iter().any(|e| e.contains("directory not found")));
+    }
+
+    #[test]
+    fn check_vhost_duplicate_domain() {
+        let mut config = RuntimeConfig::default();
+        let vhost = VirtualHostConfig {
+            domain: "xpto.com".into(),
+            root: "/tmp".into(),
+            aliases: vec![],
+            entry_point: None,
+            tls_cert: None,
+            tls_key: None,
+        };
+        config.virtual_hosts.push(vhost.clone());
+        config.virtual_hosts.push(vhost);
+        let (errors, _) = config.check();
+        assert!(errors.iter().any(|e| e.contains("duplicate domain")));
+    }
+
+    #[test]
+    fn check_vhost_duplicate_alias() {
+        let mut config = RuntimeConfig::default();
+        config.virtual_hosts.push(VirtualHostConfig {
+            domain: "xpto.com".into(),
+            root: "/tmp".into(),
+            aliases: vec!["www.xpto.com".into()],
+            entry_point: None,
+            tls_cert: None,
+            tls_key: None,
+        });
+        config.virtual_hosts.push(VirtualHostConfig {
+            domain: "outro.com".into(),
+            root: "/tmp".into(),
+            aliases: vec!["www.xpto.com".into()],
+            entry_point: None,
+            tls_cert: None,
+            tls_key: None,
+        });
+        let (errors, _) = config.check();
+        assert!(errors.iter().any(|e| e.contains("duplicate alias")));
+    }
+
+    #[test]
+    fn check_vhost_tls_cert_without_key() {
+        let mut config = RuntimeConfig::default();
+        config.virtual_hosts.push(VirtualHostConfig {
+            domain: "xpto.com".into(),
+            root: "/tmp".into(),
+            aliases: vec![],
+            entry_point: None,
+            tls_cert: Some("/tmp/cert.pem".into()),
+            tls_key: None,
+        });
+        let (errors, _) = config.check();
+        assert!(errors.iter().any(|e| e.contains("tls_cert and tls_key must both be set")));
+    }
+
+    #[test]
+    fn check_vhost_listen_localhost_warning() {
+        let mut config = RuntimeConfig::default();
+        config.server.listen = "127.0.0.1:8080".into();
+        config.virtual_hosts.push(VirtualHostConfig {
+            domain: "xpto.com".into(),
+            root: "/tmp".into(),
+            aliases: vec![],
+            entry_point: None,
+            tls_cert: None,
+            tls_key: None,
+        });
+        let (_, warnings) = config.check();
+        assert!(warnings.iter().any(|w| w.contains("127.0.0.1")));
+    }
+
+    #[test]
+    fn check_vhost_valid_no_errors() {
+        let mut config = RuntimeConfig::default();
+        config.server.listen = "0.0.0.0:80".into();
+        config.virtual_hosts.push(VirtualHostConfig {
+            domain: "xpto.com".into(),
+            root: "/tmp".into(),
+            aliases: vec!["www.xpto.com".into()],
+            entry_point: None,
+            tls_cert: None,
+            tls_key: None,
+        });
+        let (errors, _) = config.check();
+        let vhost_errors: Vec<_> = errors.iter().filter(|e| e.contains("virtual_hosts")).collect();
+        assert!(vhost_errors.is_empty(), "Valid vhost should have no vhost errors: {:?}", vhost_errors);
+    }
+
+    #[test]
+    fn template_contains_virtual_hosts() {
+        let template = RuntimeConfig::template();
+        assert!(template.contains("[[virtual_hosts]]"));
+        assert!(template.contains("domain"));
+        assert!(template.contains("aliases"));
     }
 }

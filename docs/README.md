@@ -144,6 +144,7 @@ Settings:
 | [Compression](compression.md) | Brotli, Zstd, Gzip configuration |
 | [Hot Reload](hot-reload.md) | File watching for development |
 | [TLS & ACME](tls.md) | HTTPS, Let's Encrypt auto-provisioning |
+| [**Virtual Hosting**](virtual-hosts.md) | **Multiple domains on one server, SNI, ACME auto-TLS** |
 | [Embed](embed.md) | Pack PHP app into Turbine binary |
 | [CORS](cors.md) | Cross-Origin Resource Sharing |
 | [Migrate from PHP-FPM](migrate.md) | Migration guide from traditional stacks |

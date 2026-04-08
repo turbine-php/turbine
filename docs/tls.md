@@ -28,7 +28,11 @@ Turbine uses **rustls** (a pure-Rust TLS implementation) — no OpenSSL dependen
 
 ## ACME Auto-TLS (Let's Encrypt)
 
-Turbine can automatically provision and renew TLS certificates from Let's Encrypt:
+Turbine can automatically provision and renew TLS certificates from Let's Encrypt.
+
+### Single-site setup
+
+For a server hosting one application, list your domains in `[acme].domains`:
 
 ```toml
 [acme]
@@ -36,9 +40,33 @@ enabled = true
 domains = ["example.com", "www.example.com"]
 email = "admin@example.com"
 cache_dir = "/var/lib/turbine/acme"
-# Use staging server for testing (avoids rate limits)
-staging = false
 ```
+
+### With virtual hosting
+
+When using `[[virtual_hosts]]`, you do **not** need `[acme].domains`. Turbine auto-collects `domain` + `aliases` from every virtual host:
+
+```toml
+[acme]
+enabled = true
+email = "admin@example.com"
+# No 'domains' needed — auto-collected from [[virtual_hosts]]
+
+[[virtual_hosts]]
+domain = "xpto.com"
+root = "/var/www/xpto"
+aliases = ["www.xpto.com"]
+
+[[virtual_hosts]]
+domain = "outro.com"
+root = "/var/www/outro"
+```
+
+This requests a single certificate covering `xpto.com`, `www.xpto.com`, and `outro.com`.
+
+> **Rule of thumb:** Use `[acme].domains` for single-site. Use `[[virtual_hosts]]` for multi-site — domains are auto-collected, no duplication needed. If you set both, `turbine check` will warn about redundancy.
+
+Virtual hosts with their own `tls_cert`/`tls_key` are **excluded** from ACME — their manual certificates take priority. See [Virtual Hosting](virtual-hosts.md) for per-host SNI configuration.
 
 > **Note:** Requires the `acme` feature flag: `cargo build --release --features acme`
 
@@ -97,3 +125,32 @@ HTTP/2 is automatically available when TLS is enabled. No additional configurati
 - Multiplexed requests over a single connection
 - Header compression (HPACK)
 - True Early Hints (103 informational frame)
+
+## Per-Domain Certificates (SNI)
+
+When using [virtual hosting](virtual-hosts.md), each domain can have its own TLS certificate. Turbine uses SNI (Server Name Indication) to serve the correct certificate based on the client's hostname:
+
+```toml
+[server.tls]
+enabled = true
+cert_file = "/etc/ssl/default.pem"    # fallback
+key_file = "/etc/ssl/default-key.pem"
+
+[[virtual_hosts]]
+domain = "xpto.com"
+root = "/var/www/xpto"
+tls_cert = "/etc/ssl/xpto.com.pem"
+tls_key = "/etc/ssl/xpto.com-key.pem"
+```
+
+See [Virtual Hosting — TLS with Virtual Hosts](virtual-hosts.md#tls-with-virtual-hosts) for full examples.
+
+## TLS Decision Matrix
+
+| Scenario | Config needed |
+|----------|--------------|
+| Single site, manual cert | `[server.tls]` with `cert_file` + `key_file` |
+| Single site, auto cert | `[acme]` with `domains` |
+| Multi-site, shared cert | `[server.tls]` + `[[virtual_hosts]]` (no per-host certs) |
+| Multi-site, per-site certs | `[server.tls]` + `[[virtual_hosts]]` with `tls_cert`/`tls_key` (SNI) |
+| Multi-site, auto certs | `[acme]` + `[[virtual_hosts]]` (domains auto-collected) |

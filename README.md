@@ -11,6 +11,7 @@ Turbine replaces the traditional **Nginx + PHP-FPM + OPcache** stack with a sing
 - **Zero-copy IPC** — in-memory channels for thread mode (ZTS)
 - **OWASP security guards** — SQL injection, XSS, path traversal, code injection
 - **ACME auto-TLS** — automatic Let's Encrypt certificates
+- **Virtual hosting** — multiple domains on one server, SNI per-host TLS
 - **OPcache preload** — scripts compiled once, shared across workers
 - **Hot reload** — file watcher for development
 - **Framework auto-detection** — Laravel, Symfony, Phalcon, WordPress
@@ -216,6 +217,7 @@ See [docs/tls.md](docs/tls.md) for ACME auto-TLS setup.
 | Performance | [docs/performance.md](docs/performance.md) |
 | Laravel integration | [docs/laravel.md](docs/laravel.md) |
 | TLS & ACME | [docs/tls.md](docs/tls.md) |
+| **Virtual hosting** | [**docs/virtual-hosts.md**](docs/virtual-hosts.md) — multiple domains, SNI, ACME |
 | PHP extensions | [docs/extensions.md](docs/extensions.md) |
 | Migration from Nginx | [docs/migrate.md](docs/migrate.md) |
 
