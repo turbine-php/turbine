@@ -92,6 +92,8 @@ behaviour_guard = true
 max_requests_per_second = 100
 # Rate limit time window in seconds
 rate_limit_window = 60
+# Block IP permanently after this many SQL injection attempts (resets after block expires)
+sqli_block_threshold = 3
 
 [sandbox]
 # Execution mode: "framework" (detect entry point) or "strict" (whitelist only)
@@ -298,6 +300,7 @@ date.timezone = "America/Sao_Paulo"
 | `behaviour_guard` | bool | `true` | Rate limiting & scanning detection |
 | `max_requests_per_second` | integer | `100` | Rate limit per IP |
 | `rate_limit_window` | integer | `60` | Rate limit window (seconds) |
+| `sqli_block_threshold` | integer | `3` | SQLi attempts before permanent IP block |
 
 ### `[sandbox]`
 

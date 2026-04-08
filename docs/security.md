@@ -18,7 +18,7 @@ The demo page lets you pick any attack from a dropdown (SQL injection, code inje
 
 ## Architecture: The Fortress Model
 
-Turbine's security operates in 6 layers (called "Camadas"):
+Turbine's security operates in 5 layers (called "Camadas"):
 
 ```
 Request → [Layer 1: Execution Whitelist]
