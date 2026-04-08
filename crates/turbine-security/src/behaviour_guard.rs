@@ -204,6 +204,42 @@ impl BehaviourGuard {
     pub fn total_blocked(&self) -> u64 {
         self.total_blocked.load(Ordering::Relaxed)
     }
+
+    /// Manually unblock an IP address, clearing its block state and SQLi counter.
+    /// Returns `true` if the IP was found and unblocked, `false` if it was not tracked.
+    pub fn unblock_ip(&self, ip: IpAddr) -> bool {
+        if let Some(mut profile) = self.profiles.get_mut(&ip) {
+            profile.blocked = false;
+            profile.block_until = None;
+            profile.sqli_attempts = 0;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Returns the list of currently blocked IPs with their block expiry time as
+    /// seconds from now (None = block has no expiry / already expired).
+    pub fn blocked_ips(&self) -> Vec<(IpAddr, Option<u64>)> {
+        let now = Instant::now();
+        self.profiles
+            .iter()
+            .filter_map(|entry| {
+                let profile = entry.value();
+                if !profile.blocked {
+                    return None;
+                }
+                let secs_remaining = profile.block_until.and_then(|until| {
+                    if until > now {
+                        Some(until.duration_since(now).as_secs())
+                    } else {
+                        None
+                    }
+                });
+                Some((*entry.key(), secs_remaining))
+            })
+            .collect()
+    }
 }
 
 impl Default for BehaviourGuard {
@@ -511,5 +547,82 @@ mod tests {
             guard.record_request(ip, false);
         }
         assert_eq!(guard.check_request(ip), Verdict::Allow);
+    }
+
+    #[test]
+    fn unblock_ip_clears_block() {
+        let config = BehaviourConfig {
+            sqli_block_threshold: 1,
+            ..Default::default()
+        };
+        let guard = BehaviourGuard::with_config(config);
+        let ip = localhost();
+
+        guard.check_request(ip);
+        guard.record_sqli_attempt(ip); // triggers block
+
+        assert!(guard.check_request(ip).is_blocked(), "should be blocked before unblock");
+
+        let found = guard.unblock_ip(ip);
+        assert!(found, "unblock_ip should return true for a known IP");
+        assert_eq!(guard.check_request(ip), Verdict::Allow, "should be allowed after unblock");
+    }
+
+    #[test]
+    fn unblock_ip_returns_false_for_unknown_ip() {
+        let guard = BehaviourGuard::new();
+        let unknown: IpAddr = "9.9.9.9".parse().unwrap();
+        assert!(!guard.unblock_ip(unknown));
+    }
+
+    #[test]
+    fn blocked_ips_lists_blocked_ip() {
+        let config = BehaviourConfig {
+            sqli_block_threshold: 1,
+            ..Default::default()
+        };
+        let guard = BehaviourGuard::with_config(config);
+        let ip = localhost();
+
+        guard.check_request(ip);
+        guard.record_sqli_attempt(ip);
+
+        let blocked = guard.blocked_ips();
+        let ips: Vec<IpAddr> = blocked.iter().map(|(ip, _)| *ip).collect();
+        assert!(ips.contains(&ip), "blocked list should contain the blocked IP");
+    }
+
+    #[test]
+    fn blocked_ips_empty_after_unblock() {
+        let config = BehaviourConfig {
+            sqli_block_threshold: 1,
+            ..Default::default()
+        };
+        let guard = BehaviourGuard::with_config(config);
+        let ip = localhost();
+
+        guard.check_request(ip);
+        guard.record_sqli_attempt(ip);
+        guard.unblock_ip(ip);
+
+        assert!(guard.blocked_ips().is_empty(), "blocked list should be empty after unblock");
+    }
+
+    #[test]
+    fn blocked_ips_expiry_seconds_present() {
+        let config = BehaviourConfig {
+            sqli_block_threshold: 1,
+            ..Default::default()
+        };
+        let guard = BehaviourGuard::with_config(config);
+        let ip = localhost();
+
+        guard.check_request(ip);
+        guard.record_sqli_attempt(ip);
+
+        let blocked = guard.blocked_ips();
+        let entry = blocked.iter().find(|(i, _)| *i == ip).expect("IP should be in list");
+        assert!(entry.1.is_some(), "expiry seconds should be Some for a fresh block");
+        assert!(entry.1.unwrap() > 0, "expiry should be > 0 seconds");
     }
 }

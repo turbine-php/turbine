@@ -2244,11 +2244,7 @@ async fn handle_request_inner(
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.strip_prefix("Bearer "))
                 .map(|t| t == expected_token.as_str())
-                .unwrap_or(false)
-                || req.uri().query()
-                    .and_then(|q| q.split('&').find_map(|p| p.strip_prefix("token=")))
-                    .map(|t| t == expected_token.as_str())
-                    .unwrap_or(false);
+                .unwrap_or(false);
             if !authorized {
                 return Ok(build_response(401, "application/json", b"{\"error\": \"Unauthorized\"}".to_vec(), &[]));
             }
@@ -2263,7 +2259,7 @@ async fn handle_request_inner(
             return Ok(build_response(200, "application/json", body.into_bytes(), &[]));
         }
         if clean_path == "/_/dashboard" && state.dashboard_enabled {
-            let body = dashboard::dashboard_html(&state.listen);
+            let body = dashboard::dashboard_html(&state.listen, state.dashboard_token.as_deref());
             return Ok(build_response(200, "text/html; charset=utf-8", body.into_bytes(), &[]));
         }
         if clean_path == "/_/cache/clear" {
@@ -2271,6 +2267,53 @@ async fn handle_request_inner(
             state.cache.clear();
             let body = format!("{{\"cleared\": {cleared}}}");
             return Ok(build_response(200, "application/json", body.into_bytes(), &[]));
+        }
+
+        // GET /_/security/blocked — list currently blocked IPs
+        if clean_path == "/_/security/blocked" && req_method == "GET" {
+            let blocked = state.security.blocked_ips();
+            let entries: Vec<String> = blocked
+                .iter()
+                .map(|(ip, secs)| match secs {
+                    Some(s) => format!("{{\"ip\":\"{ip}\",\"expires_in_secs\":{s}}}"),
+                    None    => format!("{{\"ip\":\"{ip}\",\"expires_in_secs\":null}}"),
+                })
+                .collect();
+            let body = format!("{{\"blocked\":[{}],\"count\":{}}}", entries.join(","), blocked.len());
+            return Ok(build_response(200, "application/json", body.into_bytes(), &[]));
+        }
+
+        // POST /_/security/unblock  body: {"ip":"1.2.3.4"}
+        if clean_path == "/_/security/unblock" && req_method == "POST" {
+            let (inner_req, _) = match FullHttpRequest::from_hyper(req, remote_addr, &state.upload_tmp_dir, &state.upload_security).await {
+                Some(pair) => pair,
+                None => return Ok(build_response(400, "application/json", b"{\"error\":\"invalid request\"}".to_vec(), &[])),
+            };
+            let body_str = String::from_utf8_lossy(&inner_req.body);
+            // Parse {"ip":"x.x.x.x"} — minimal JSON extraction without a dep
+            let ip_str = body_str
+                .split('"')
+                .skip_while(|s| *s != "ip")
+                .nth(2)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            match ip_str.parse::<std::net::IpAddr>() {
+                Ok(ip) => {
+                    let found = state.security.unblock_ip(ip);
+                    if found {
+                        warn!(ip = %ip, "IP manually unblocked via admin API");
+                        let body = format!("{{\"unblocked\":true,\"ip\":\"{ip}\"}}");
+                        return Ok(build_response(200, "application/json", body.into_bytes(), &[]));
+                    } else {
+                        let body = format!("{{\"unblocked\":false,\"ip\":\"{ip}\",\"note\":\"IP was not blocked\"}}");
+                        return Ok(build_response(200, "application/json", body.into_bytes(), &[]));
+                    }
+                }
+                Err(_) => {
+                    return Ok(build_response(400, "application/json", b"{\"error\":\"invalid IP address\"}".to_vec(), &[]));
+                }
+            }
         }
 
         return Ok(build_response(404, "text/plain", b"Not found".to_vec(), &[]));

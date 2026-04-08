@@ -142,6 +142,16 @@ impl SecurityLayer {
     pub fn record_request(&self, ip: IpAddr, was_error: bool) {
         self.behaviour_guard.record_request(ip, was_error);
     }
+
+    /// Manually unblock an IP. Returns `true` if the IP was found and unblocked.
+    pub fn unblock_ip(&self, ip: IpAddr) -> bool {
+        self.behaviour_guard.unblock_ip(ip)
+    }
+
+    /// Returns the list of currently blocked IPs and their remaining block time in seconds.
+    pub fn blocked_ips(&self) -> Vec<(IpAddr, Option<u64>)> {
+        self.behaviour_guard.blocked_ips()
+    }
 }
 
 impl Default for SecurityLayer {

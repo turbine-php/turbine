@@ -367,7 +367,7 @@ date.timezone = "America/Sao_Paulo"
 | `statistics` | bool | `true` | Enable `/_/metrics` and `/_/status` endpoints |
 | `token` | string | none | Bearer token to protect internal endpoints |
 
-When `token` is set, all `/_/*` endpoints require authentication via `Authorization: Bearer <token>` header or `?token=<token>` query parameter.
+When `token` is set, all `/_/*` endpoints require `Authorization: Bearer <token>`. See [Dashboard & Internal API](dashboard.md) for the full reference.
 
 ### `[acme]`
 

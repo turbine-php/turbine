@@ -133,6 +133,7 @@ Settings:
 | [**Worker Mode**](worker.md) | **Process vs Thread — the most important choice. Persistent workers, auto-scaling, named pools, Tokio tuning** |
 | [PHP Extensions](extensions.md) | Adding static and dynamic PHP extensions |
 | [Security](security.md) | OWASP guards, sandbox, rate limiting |
+| [**Dashboard & Internal API**](dashboard.md) | **HTML dashboard, blocked IPs panel, Prometheus, cache clear, Bearer auth** |
 | [Phalcon](phalcon.md) | Phalcon native support with persistent workers |
 | [WordPress](wordpress.md) | WordPress native support with auto-security |
 | [Laravel](laravel.md) | Laravel integration and Octane comparison |

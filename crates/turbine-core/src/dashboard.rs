@@ -4,7 +4,11 @@
 //! Auto-refreshes metrics from `/_/status` every 2 seconds.
 
 /// Returns the full HTML dashboard page as a static string.
-pub fn dashboard_html(listen: &str) -> String {
+pub fn dashboard_html(listen: &str, token: Option<&str>) -> String {
+    let token_js = match token {
+        Some(t) => format!("'{}'", t.replace('\\', "\\\\").replace('\'', "\\'")),
+        None => "null".to_string(),
+    };
     format!(r##"<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -43,6 +47,9 @@ pub fn dashboard_html(listen: &str) -> String {
   .pill.s4 {{ background: #f9731622; color: #f97316; }}
   .pill.s5 {{ background: #ef444422; color: #ef4444; }}
   #error-banner {{ display: none; background: #ef444422; color: #ef4444; padding: 10px 16px; border-radius: 8px; margin-bottom: 16px; font-size: 14px; }}
+  .btn-unblock {{ padding: 4px 12px; border-radius: 6px; border: none; background: #ef444422; color: #ef4444; font-size: 12px; cursor: pointer; font-weight: 600; }}
+  .btn-unblock:hover {{ background: #ef444444; }}
+  .empty-state {{ color: #64748b; font-size: 14px; padding: 8px 0; }}
 </style>
 </head>
 <body>
@@ -99,15 +106,27 @@ pub fn dashboard_html(listen: &str) -> String {
     <span class="pill s5" id="pill-5xx">5xx: -</span>
   </div>
 </div>
+<div class="section">
+  <h2>Blocked IPs</h2>
+  <div id="blocked-content"><div class="empty-state">Loading...</div></div>
+</div>
 <script>
 const STATUS_URL = 'http://{listen}/_/status';
+const BLOCKED_URL = 'http://{listen}/_/security/blocked';
+const UNBLOCK_URL = 'http://{listen}/_/security/unblock';
+const TOKEN = {token};
+function authHeaders(extra) {{
+  const h = Object.assign({{}}, extra);
+  if (TOKEN) h['Authorization'] = 'Bearer ' + TOKEN;
+  return h;
+}}
 function fmt(n) {{ if (n >= 1e6) return (n/1e6).toFixed(1)+'M'; if (n >= 1e3) return (n/1e3).toFixed(1)+'K'; return n.toString(); }}
 function fmtBytes(b) {{ if (b >= 1073741824) return (b/1073741824).toFixed(1)+' GB'; if (b >= 1048576) return (b/1048576).toFixed(1)+' MB'; if (b >= 1024) return (b/1024).toFixed(1)+' KB'; return b+' B'; }}
 function fmtUptime(s) {{ const h=Math.floor(s/3600), m=Math.floor((s%3600)/60), sec=s%60; return (h?h+'h ':'')+(m?m+'m ':'')+(sec+'s'); }}
 
 async function refresh() {{
   try {{
-    const r = await fetch(STATUS_URL);
+    const r = await fetch(STATUS_URL, {{headers: authHeaders({{}})}});
     const d = await r.json();
     document.getElementById('error-banner').style.display = 'none';
     document.getElementById('version').textContent = 'Runtime';
@@ -145,9 +164,45 @@ async function refresh() {{
     document.getElementById('error-banner').textContent = 'Cannot connect to server: ' + e.message;
   }}
 }}
+
+async function refreshBlocked() {{
+  const el = document.getElementById('blocked-content');
+  try {{
+    const r = await fetch(BLOCKED_URL, {{headers: authHeaders({{}})}});
+    if (!r.ok) {{ el.innerHTML = '<div class="empty-state">Security data unavailable (' + r.status + ')</div>'; return; }}
+    const d = await r.json();
+    if (!d.blocked || d.blocked.length === 0) {{
+      el.innerHTML = '<div class="empty-state">No blocked IPs</div>';
+    }} else {{
+      el.innerHTML = '<table><thead><tr><th>IP Address</th><th>Expires In</th><th>Action</th></tr></thead><tbody>' +
+        d.blocked.map(b => '<tr>' +
+          '<td style="font-family:monospace">' + b.ip + '</td>' +
+          '<td style="color:#ef4444">' + (b.expires_in_secs != null ? b.expires_in_secs + 's' : 'permanent') + '</td>' +
+          '<td><button class="btn-unblock" onclick="unblockIp(\'' + b.ip + '\')">Unblock</button></td>' +
+          '</tr>'
+        ).join('') + '</tbody></table>';
+    }}
+  }} catch (e) {{
+    el.innerHTML = '<div class="empty-state">Error loading blocked IPs</div>';
+  }}
+}}
+
+async function unblockIp(ip) {{
+  try {{
+    await fetch(UNBLOCK_URL, {{
+      method: 'POST',
+      headers: authHeaders({{'Content-Type': 'application/json'}}),
+      body: JSON.stringify({{ip}})
+    }});
+  }} catch (_) {{}}
+  refreshBlocked();
+}}
+
 refresh();
+refreshBlocked();
 setInterval(refresh, 2000);
+setInterval(refreshBlocked, 5000);
 </script>
 </body>
-</html>"##, listen = listen)
+</html>"##, listen = listen, token = token_js)
 }

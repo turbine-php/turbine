@@ -203,7 +203,7 @@ level = "info"             # trace, debug, info, warn, error
 [dashboard]
 enabled = true             # /_/dashboard HTML page
 statistics = true          # /_/metrics and /_/status endpoints
-# token = "my-secret"     # protect internal endpoints with Bearer token
+# token = "my-secret"     # Bearer token for all /_/* endpoints (header only)
 ```
 
 See [docs/config.md](docs/config.md) for the full configuration reference.
@@ -254,6 +254,7 @@ See [docs/tls.md](docs/tls.md) for ACME auto-TLS setup.
 | Configuration reference | [docs/config.md](docs/config.md) |
 | Building from source | [docs/compile.md](docs/compile.md) |
 | **Security model** | [**docs/security.md**](docs/security.md) — OWASP guards, sandbox, PHP hardening |
+| **Dashboard & Internal API** | [**docs/dashboard.md**](docs/dashboard.md) — UI panels, blocked IPs, Prometheus, cache clear |
 | Performance | [docs/performance.md](docs/performance.md) |
 | Laravel integration | [docs/laravel.md](docs/laravel.md) |
 | TLS & ACME | [docs/tls.md](docs/tls.md) |
