@@ -18,7 +18,7 @@ memory_limit = "256M"
 extensions = ["phalcon"]      # if using dynamic Phalcon extension
 ```
 
-Turbine detects the `public/index.php` front controller pattern and routes all requests through it:
+If your Phalcon app uses `public/index.php` as a front controller, Turbine detects that pattern automatically:
 
 ```
 $ turbine serve --root /path/to/phalcon-app
@@ -27,40 +27,26 @@ $ turbine serve --root /path/to/phalcon-app
 
 ## Persistent Workers
 
-Phalcon apps run in **persistent worker mode** when `persistent_workers = true` — the DI container and Application are bootstrapped once per worker and reused across requests. This eliminates the overhead of re-creating the DI, loading services, and connecting to databases on every request.
+Phalcon apps run in **persistent worker mode** when `persistent_workers = true`. You provide a `turbine-worker.php` bootstrap file in your project root; Turbine executes it once per worker at startup and then calls the returned application handler for each request.
 
 ### How It Works
 
 1. **Bootstrap (once per worker)**:
-   - Loads `vendor/autoload.php`
-   - Creates `\Phalcon\Di\FactoryDefault`
-   - Loads config, services, loader, and routes from standard paths
-   - Creates `\Phalcon\Mvc\Application` with registered modules
+   - Turbine loads `vendor/autoload.php` (Composer autoloader, if present)
+   - Turbine executes `turbine-worker.php` and keeps the returned application in memory
 2. **Per request**:
    - Superglobals (`$_SERVER`, `$_GET`, `$_POST`, etc.) are rebuilt from the HTTP request
-   - `$application->handle($uri)` is called
-   - Response (status, headers, body) is extracted and sent back
+   - The application processes the request and returns the response
 
-### Auto-Bootstrap Config Paths
+There is **no automatic Phalcon-specific bootstrap**. Turbine does not scan for `config/services.php`, `config/routes.php`, or any other Phalcon config paths. All bootstrapping is done inside your `turbine-worker.php`.
 
-Turbine scans standard Phalcon directory layouts:
+## Bootstrap File
 
-| File | Purpose |
-|------|---------|
-| `config/config.php` or `app/config/config.php` | Application config (`\Phalcon\Config\Config`) |
-| `config/services.php` or `app/config/services.php` | DI service registration |
-| `config/loader.php` or `app/config/loader.php` | Autoloader / namespace registration |
-| `config/routes.php` or `app/config/routes.php` | Route definitions |
-| `config/modules.php` or `app/config/modules.php` | Module registration (multi-module apps) |
-
-## Custom Bootstrap
-
-If your Phalcon app doesn't follow the standard layout, create a `turbine-worker.php` file in your project root:
+Create a `turbine-worker.php` file in your project root. It must set up the Phalcon DI and application and return the application instance:
 
 ```php
 <?php
 // turbine-worker.php
-// Must return a \Phalcon\Mvc\Application or \Phalcon\Mvc\Micro instance
 
 use Phalcon\Di\FactoryDefault;
 use Phalcon\Mvc\Application;
@@ -82,7 +68,6 @@ $di->setShared('db', function () use ($di) {
     ]);
 });
 
-// Register routes, views, etc.
 require __DIR__ . '/config/routes.php';
 require __DIR__ . '/config/services.php';
 
@@ -91,11 +76,7 @@ $application = new Application($di);
 return $application;
 ```
 
-> **Important**: `turbine-worker.php` takes priority over auto-bootstrap when present.
-
-## Phalcon Micro Apps
-
-Phalcon Micro applications are also supported. If your app returns a string instead of a `\Phalcon\Http\ResponseInterface`, Turbine wraps it in a 200 OK response:
+### Phalcon Micro Apps
 
 ```php
 <?php
@@ -135,8 +116,9 @@ my-phalcon-app/
 │   └── index.php          ← front controller
 ├── vendor/
 │   └── autoload.php
-├── composer.json           ← contains "phalcon/*" dependency
-└── turbine.toml            ← optional Turbine config
+├── composer.json
+├── turbine-worker.php     ← Turbine bootstrap (required for persistent workers)
+└── turbine.toml
 ```
 
 ## TOML Configuration
@@ -163,7 +145,7 @@ phalcon.orm.not_null_validations = "1"
 
 - **Phalcon PHP extension** must be installed (compiled into PHP or loaded dynamically)
 - Phalcon v5.x+ recommended
-- PHP 8.1+ (production-v5) or PHP 8.4+ (production-v6)
+- PHP 8.1+
 
 ## Comparison with Traditional Setup
 

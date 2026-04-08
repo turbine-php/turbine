@@ -56,55 +56,49 @@ level = "info"
 
 ## How Persistent Workers Work with Laravel
 
-### Traditional PHP-FPM
+Turbine's persistent workers keep PHP processes alive across requests. Laravel still bootstraps on every request (`public/index.php` runs in full), but because the workers are long-lived processes, **OPcache stays warm** — all PHP files are compiled once and cached in memory. There is no per-request `fork()` overhead, and JIT-compiled code is reused across requests.
 
-Every request:
-1. Load Composer autoloader (~5ms)
-2. Create Application instance (~10ms)
-3. Boot service providers (~15ms)
-4. Load config, routes, middleware (~10ms)
-5. Handle request (~5ms)
-6. **Total: ~45ms**
+### Traditional PHP-FPM (pm = dynamic, cold workers)
+
+Every request on a cold worker:
+1. Parse and compile PHP files from disk
+2. Load Composer autoloader
+3. Create Application instance and boot service providers
+4. Handle request
 
 ### Turbine Persistent Mode
 
-First request only:
-1. Load Composer autoloader (once)
-2. Create Application instance (once)
-3. Boot service providers (once)
-4. Load config, routes, middleware (once)
+Every request (warm worker):
+1. OPcache serves compiled opcodes — no disk reads, no recompilation
+2. Load Composer autoloader (from OPcache)
+3. Create Application instance and boot service providers (from OPcache)
+4. Handle request
 
-Every subsequent request:
-1. Handle request (~5ms)
-2. Reset superglobals
-3. **Total: ~5ms**
-
-This persistent worker model eliminates framework boot overhead from every request, resulting in significantly lower latency.
+The PHP application itself (Application instance, service providers, routes) is **not** persisted across requests. Each request gets a clean PHP state via `php_request_startup`/`php_request_shutdown`. The performance gain comes from OPcache hit rate, warm JIT, and eliminating process fork overhead.
 
 ## Turbine vs Laravel Octane
 
-Laravel Octane is a first-party package that provides persistent worker mode via Swoole or RoadRunner. Turbine achieves the same benefit without requiring Octane:
+Laravel Octane (Swoole/RoadRunner) keeps the Laravel Application instance alive across requests — service providers boot **once** and the DI container is reused per request. This is a fundamentally different model from Turbine.
+
+Turbine runs each request through the full Laravel bootstrap, accelerated by OPcache. No code changes or additional packages are required.
 
 | Feature | Turbine | Octane (Swoole) | Octane (RoadRunner) |
 |---------|---------|-----------------|---------------------|
 | Language | Rust | C (PHP extension) | Go |
 | Requires package | No | Yes | Yes |
 | Code changes | None | Octane-compatible code | Octane-compatible code |
+| App bootstrap | Per request (OPcache) | Once per worker | Once per worker |
 | Security guards | Built-in | None | None |
 | Compression | Built-in (br/zstd/gzip) | Manual | Manual |
 | Auto-TLS | Built-in (ACME) | No | No |
 | Hot reload | Built-in | `--watch` flag | `--watch` flag |
 | Memory management | Auto-respawn | Manual `octane:reload` | Manual |
 
-### Key Difference
-
-With Turbine, you don't need to install any additional packages or modify your Laravel code. Your existing Laravel application works as-is. Turbine handles the persistent worker lifecycle externally.
-
 ## Database Connections
 
-Turbine's persistent workers keep database connections alive between requests. Laravel's connection pooling handles this automatically via the `DB` facade.
+Turbine calls `php_request_shutdown` after every request, which destroys all PHP objects including PDO connection handles. Database connections are **not** kept alive between requests unless you use PHP's native persistent connections (`PDO::ATTR_PERSISTENT = true`).
 
-For optimal performance with persistent workers:
+For standard Laravel configuration, no special changes are needed:
 
 ```env
 # .env
@@ -112,9 +106,6 @@ DB_CONNECTION=mysql
 DB_HOST=127.0.0.1
 DB_PORT=3306
 DB_DATABASE=myapp
-
-# Important for persistent workers:
-DB_POOL_SIZE=5
 ```
 
 ## Static Files
@@ -189,7 +180,7 @@ enabled = false
 
 ## Benchmarks: Laravel
 
-Turbine's persistent worker model eliminates framework boot overhead, resulting in significantly faster response times compared to traditional PHP-FPM setups.
+Turbine's persistent workers eliminate per-request `fork()` overhead and keep OPcache warm, resulting in faster response times compared to cold PHP-FPM setups.
 
 Run your own benchmarks:
 

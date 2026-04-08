@@ -159,4 +159,4 @@ Settings:
 
 ## License
 
-Licensed under the [GNU General Public License v3.0](../LICENSE) (GPL-3.0).
+Turbine is dual-licensed. See [LICENSE](../LICENSE) (AGPL-3.0, free for open-source use) and [LICENSE-COMMERCIAL](../LICENSE-COMMERCIAL) (proprietary/SaaS use). Commercial enquiries: dener.php@gmail.com

@@ -18,18 +18,19 @@ Turbine replaces the traditional **Nginx + PHP-FPM + OPcache** stack with a sing
 
 - **Single binary** — no Nginx, no PHP-FPM, no reverse proxy
 - **Persistent workers** — process and thread modes with automatic scaling
-- **Zero-copy IPC** — in-memory channels for thread mode (ZTS)
+- **Zero-copy IPC** — in-memory channels for thread mode (ZTS), up to **67k req/s** on Apple M1 Pro
 - **OWASP security guards** — SQL injection, code injection, path traversal, behaviour analysis — all in Rust, ~500 ns overhead, zero external WAF needed
 - **ACME auto-TLS** — automatic Let's Encrypt certificates
 - **Virtual hosting** — multiple domains on one server, SNI per-host TLS
-- **OPcache preload** — scripts compiled once, shared across workers
+- **OPcache preload** — bytecode compiled once and kept in memory across all workers (not just per-process OPcache)
 - **Hot reload** — file watcher for development
 - **Framework support** — Laravel, Symfony, Phalcon, WordPress
 - **Structured logging** — JSON output, Datadog/Loki compatible
 - **Compression** — Brotli, Zstd, Gzip
 - **Early Hints** — HTTP 103 support
 - **X-Sendfile** — efficient large file delivery
-- **App embedding** — pack your PHP app into the binary
+- **App embedding** — pack your entire PHP application into a single self-contained binary for distribution
+- **Built-in observability** — Prometheus metrics, live dashboard, per-IP blocked request log
 
 ## Security — Built-in, Zero Overhead
 
@@ -70,6 +71,64 @@ sqli_block_threshold   = 3      # block IP after N SQLi attempts
 > **Try it live:** the [`examples/raw-php/security-demo`](examples/raw-php/security-demo/) example ships an interactive browser UI where you can fire every attack type and watch them blocked in real time.
 
 See [docs/security.md](docs/security.md) for the full reference.
+
+## Quick start
+
+```bash
+# Create a PHP project directory
+mkdir myapp && cd myapp
+
+# Generate default configuration
+turbine init
+
+# Create a test page
+echo '<?php echo "Hello from Turbine!";' > index.php
+
+# Start the server
+turbine serve --root .
+```
+
+Open http://127.0.0.1:8080 in your browser.
+
+### Runtime library path
+
+On macOS, set the library path before running:
+
+```bash
+# NTS
+export DYLD_LIBRARY_PATH="/path/to/vendor/php-embed/lib"
+
+# ZTS
+export DYLD_LIBRARY_PATH="/path/to/vendor/php-embed-zts/lib"
+```
+
+On Linux, use `LD_LIBRARY_PATH` instead.
+
+## Worker Modes
+
+> **The most important choice before deploying Turbine.** Choose at build time — process and thread modes require different PHP builds (NTS vs ZTS).
+
+Turbine has two worker backends:
+
+| Mode | `worker_mode` | PHP Build | Isolation | When to use |
+|------|--------------|-----------|-----------|-------------|
+| **Process** (default) | `"process"` | NTS or ZTS | Each worker = separate OS process | Default. Any extension, full crash isolation |
+| **Thread** | `"thread"` | **ZTS only** | One process, N threads (TSRM) | Maximum throughput, ZTS-safe extensions |
+
+```toml
+[server]
+# Process mode — default, works with any PHP extension
+worker_mode = "process"
+
+# Thread mode — ZTS PHP required, highest throughput
+# worker_mode = "thread"
+```
+
+**Process mode** forks one OS process per worker. A crash in one worker is isolated — others keep running. Works with NTS or ZTS PHP.
+
+**Thread mode** spawns OS threads sharing one address space. Uses in-memory channels (zero `pipe(2)` syscalls) instead of pipes, and workers communicate as Rust structs rather than serialized bytes. Requires PHP compiled with `--enable-zts` (use `./build.sh` → *Thread mode (ZTS)*). A PHP segfault takes down all threads.
+
+See [docs/worker.md](docs/worker.md) for the full guide, ZTS extension compatibility, and benchmarks.
 
 ## Requirements
 
@@ -148,38 +207,6 @@ PHP_CONFIG=$PWD/vendor/php-embed-zts/bin/php-config cargo build --release
 
 The binary is at `target/release/turbine`.
 
-## Quick start
-
-```bash
-# Create a PHP project directory
-mkdir myapp && cd myapp
-
-# Generate default configuration
-turbine init
-
-# Create a test page
-echo '<?php echo "Hello from Turbine!";' > index.php
-
-# Start the server
-turbine serve --root .
-```
-
-Open http://127.0.0.1:8080 in your browser.
-
-### Runtime library path
-
-On macOS, set the library path before running:
-
-```bash
-# NTS
-export DYLD_LIBRARY_PATH="/path/to/vendor/php-embed/lib"
-
-# ZTS
-export DYLD_LIBRARY_PATH="/path/to/vendor/php-embed-zts/lib"
-```
-
-On Linux, use `LD_LIBRARY_PATH` instead.
-
 ## Configuration
 
 Create a `turbine.toml` in your project root:
@@ -218,32 +245,6 @@ statistics = true          # /_/metrics and /_/status endpoints
 
 See [docs/config.md](docs/config.md) for the full configuration reference.
 
-## Worker Modes
-
-> **The most important choice before deploying Turbine.**
-
-Turbine has two worker backends. Choose once at build time — they require different PHP builds.
-
-| Mode | `worker_mode` | PHP Build | Isolation | When to use |
-|------|--------------|-----------|-----------|-------------|
-| **Process** (default) | `"process"` | NTS or ZTS | Each worker = separate OS process | Default. Any extension, full crash isolation |
-| **Thread** | `"thread"` | **ZTS only** | One process, N threads (TSRM) | Maximum throughput, ZTS-safe extensions |
-
-```toml
-[server]
-# Process mode — default, works with any PHP extension
-worker_mode = "process"
-
-# Thread mode — ZTS PHP required, highest throughput
-# worker_mode = "thread"
-```
-
-**Process mode** forks one OS process per worker. A crash in one worker is isolated — others keep running. Works with NTS or ZTS PHP.
-
-**Thread mode** spawns OS threads sharing one address space. Lower memory, no `pipe(2)` overhead between request dispatch and worker. Requires PHP compiled with `--enable-zts` (use `./build.sh` → *Thread mode (ZTS)*). A PHP segfault takes down all threads.
-
-See [docs/worker.md](docs/worker.md) for the full guide, ZTS extension compatibility, and benchmarks.
-
 ## TLS
 
 ```bash
@@ -254,6 +255,21 @@ turbine serve --tls-cert cert.pem --tls-key key.pem
 ```
 
 See [docs/tls.md](docs/tls.md) for ACME auto-TLS setup.
+
+## Benchmarks
+
+> Apple M1 Pro, 10 cores, PHP 8.5.4, `wrk -t4 -c100 -d30s`. Full results in `dev/tideways-bench/results/`.
+
+| Server | Hello World (req/s) | HTML 50 KB (req/s) | HTML 50 KB p99 latency |
+|--------|--------------------:|--------------------|------------------------|
+| **Turbine thread, 8w (ZTS)** | **67,467** | **46,390** | **438 µs** |
+| **Turbine process, 8w (NTS)** | **64,023** | **45,143** | 421 µs |
+| PHP-FPM + nginx | 51,353 | 21,686 | **165 ms** (spikes) |
+| FrankenPHP (worker mode) | 41,123 | 17,714 | 738 µs |
+
+Turbine thread mode peaks at **67k req/s** (Hello World) and **46k req/s** (50 KB HTML). For larger real-world responses, PHP-FPM's p99 latency spikes to hundreds of milliseconds under load; Turbine stays sub-millisecond.
+
+See [docs/performance.md](docs/performance.md) for tuning guidance and persistent worker benchmarks.
 
 ## Documentation
 
@@ -287,4 +303,13 @@ crates/
 
 ## License
 
-Licensed under the [GNU General Public License v3.0](LICENSE) (GPL-3.0).
+Turbine is **dual-licensed**:
+
+| Use case | License |
+|----------|---------|
+| Open-source projects (AGPL-compliant) | [AGPL-3.0](LICENSE) — free |
+| Proprietary / SaaS / no source-disclosure | [Commercial License](LICENSE-COMMERCIAL) — contact for pricing |
+
+If your application is open source and you can comply with the AGPL-3.0 copyleft terms (network use triggers source disclosure), the AGPL license is free. If you are building a proprietary product or SaaS platform where the AGPL is not acceptable, purchase a commercial license.
+
+**Commercial license enquiries:** dener.php@gmail.com

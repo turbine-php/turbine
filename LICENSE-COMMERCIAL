@@ -1,0 +1,122 @@
+TURBINE COMMERCIAL LICENSE AGREEMENT
+=====================================
+
+Copyright (C) 2024-present Dener Fernandes <dener.php@gmail.com>
+
+This Turbine Commercial License Agreement ("Agreement") is between You (the
+entity acquiring the commercial license) and the Turbine copyright holder
+("Licensor").
+
+────────────────────────────────────────────────────────────────────────────────
+PREAMBLE
+────────────────────────────────────────────────────────────────────────────────
+
+Turbine is dual-licensed:
+
+  1. Under the GNU Affero General Public License v3.0 (AGPL-3.0), available at
+     https://www.gnu.org/licenses/agpl-3.0.html — free to use for open-source
+     projects that comply with the AGPL's reciprocal source-disclosure terms.
+
+  2. Under this Commercial License — for organisations that need to use Turbine
+     in proprietary products, SaaS platforms, or any context where the AGPL's
+     copyleft obligations are not acceptable.
+
+If your use case is covered by the AGPL-3.0 and you accept its terms, no
+commercial license is required.
+
+────────────────────────────────────────────────────────────────────────────────
+1. GRANT OF RIGHTS
+────────────────────────────────────────────────────────────────────────────────
+
+Subject to the terms of this Agreement and payment of the applicable license
+fee, Licensor grants You a non-exclusive, worldwide, non-transferable (except as
+set out in Section 5) license to:
+
+  a) Use, copy, and deploy Turbine in Your proprietary applications and services
+     without any obligation to make the source code of those applications
+     available to third parties.
+
+  b) Use Turbine as part of a Software-as-a-Service (SaaS) or cloud offering
+     without triggering the AGPL network-interaction source disclosure
+     requirement.
+
+  c) Receive commercial support as described in the support tier purchased
+     (response times, private issue tracker access, and patch backports where
+     applicable).
+
+────────────────────────────────────────────────────────────────────────────────
+2. RESTRICTIONS
+────────────────────────────────────────────────────────────────────────────────
+
+You may NOT:
+
+  a) Sub-license, resell, or redistribute Turbine itself (source or binary) as a
+     standalone product competing with Turbine without a separate written
+     agreement with the Licensor.
+
+  b) Remove or alter any copyright, trademark, or attribution notices present in
+     Turbine's source code or documentation.
+
+  c) Use Turbine in a manner that violates applicable law.
+
+────────────────────────────────────────────────────────────────────────────────
+3. INTELLECTUAL PROPERTY
+────────────────────────────────────────────────────────────────────────────────
+
+This Agreement does not transfer any ownership of intellectual property.
+Turbine, including all copies and modifications, remains the property of the
+Licensor. You retain ownership of Your own application code.
+
+────────────────────────────────────────────────────────────────────────────────
+4. WARRANTY DISCLAIMER
+────────────────────────────────────────────────────────────────────────────────
+
+TURBINE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE, AND NON-INFRINGEMENT. IN NO EVENT SHALL THE LICENSOR BE
+LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING FROM OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE, EVEN IF THE
+LICENSOR HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
+
+────────────────────────────────────────────────────────────────────────────────
+5. TRANSFER
+────────────────────────────────────────────────────────────────────────────────
+
+You may transfer this license to a successor entity in connection with a merger,
+acquisition, or sale of substantially all of Your assets, provided that the
+successor agrees in writing to be bound by the terms of this Agreement and
+You notify the Licensor within 30 days of the transfer. You may not otherwise
+transfer or assign this license.
+
+────────────────────────────────────────────────────────────────────────────────
+6. TERMINATION
+────────────────────────────────────────────────────────────────────────────────
+
+This Agreement is effective until terminated. It will terminate automatically
+if You fail to comply with any of its terms. Upon termination, You must cease
+all use of Turbine and destroy all copies in Your possession.
+
+────────────────────────────────────────────────────────────────────────────────
+7. OBTAINING A COMMERCIAL LICENSE
+────────────────────────────────────────────────────────────────────────────────
+
+To obtain a commercial license, contact:
+
+  Email:   dener.php@gmail.com
+  Subject: Turbine Commercial License Inquiry
+
+Please describe your intended use case, team size, and approximate deployment
+scale. Pricing depends on the number of production servers and the support tier
+required.
+
+────────────────────────────────────────────────────────────────────────────────
+8. GOVERNING LAW
+────────────────────────────────────────────────────────────────────────────────
+
+This Agreement shall be governed by and construed in accordance with the laws of
+Portugal, without regard to its conflict-of-law principles. Any disputes shall
+be subject to the exclusive jurisdiction of the courts of Portugal.
+
+────────────────────────────────────────────────────────────────────────────────
+
+For the open-source license terms, see: LICENSE (AGPL-3.0)

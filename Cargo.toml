@@ -14,7 +14,8 @@ members = [
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
-license = "GPL-3.0-only"
+license = "AGPL-3.0-only"
+license-file = "LICENSE"
 repository = "https://github.com/turbine-php/turbine"
 
 [workspace.dependencies]
