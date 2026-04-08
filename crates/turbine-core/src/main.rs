@@ -2237,7 +2237,13 @@ async fn handle_request_inner(
 
     // --- Internal endpoints ---
     if clean_path.starts_with("/_/") {
-        // Token authentication for internal endpoints
+        // Dashboard is served without auth — the login screen handles it in-browser.
+        if clean_path == "/_/dashboard" && state.dashboard_enabled {
+            let body = dashboard::dashboard_html(&state.listen, state.dashboard_token.is_some());
+            return Ok(build_response(200, "text/html; charset=utf-8", body.into_bytes(), &[]));
+        }
+
+        // Token authentication for all other internal endpoints
         if let Some(ref expected_token) = state.dashboard_token {
             let authorized = req.headers()
                 .get("authorization")
@@ -2257,10 +2263,6 @@ async fn handle_request_inner(
         if clean_path == "/_/status" && state.statistics_enabled {
             let body = state.metrics.status_json(state.worker_count);
             return Ok(build_response(200, "application/json", body.into_bytes(), &[]));
-        }
-        if clean_path == "/_/dashboard" && state.dashboard_enabled {
-            let body = dashboard::dashboard_html(&state.listen, state.dashboard_token.as_deref());
-            return Ok(build_response(200, "text/html; charset=utf-8", body.into_bytes(), &[]));
         }
         if clean_path == "/_/cache/clear" {
             let cleared = state.cache.len();
