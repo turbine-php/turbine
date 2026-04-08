@@ -4,6 +4,12 @@ High-performance PHP application server written in Rust, powered by the PHP embe
 
 Turbine replaces the traditional **Nginx + PHP-FPM + OPcache** stack with a single binary that embeds PHP directly, eliminating inter-process communication overhead and reducing latency. Security guards (SQL injection, code injection, path traversal, behaviour analysis) run inside the same process — no extra hop, no extra service.
 
+> [!WARNING]
+> **This project is under active development and is not yet ready for production use.**
+> APIs, configuration format, and behaviour may change without notice.
+> You are welcome to try it out using the example projects in [`examples/`](examples/) and [`laravel-test/`](laravel-test/).
+> Bug reports, feedback, and pull requests are very welcome — contributions of any kind are greatly appreciated.
+
 ## Features
 
 - **Single binary** — no Nginx, no PHP-FPM, no reverse proxy
