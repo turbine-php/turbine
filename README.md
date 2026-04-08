@@ -20,7 +20,7 @@ Turbine replaces the traditional **Nginx + PHP-FPM + OPcache** stack with a sing
 - **Virtual hosting** — multiple domains on one server, SNI per-host TLS
 - **OPcache preload** — scripts compiled once, shared across workers
 - **Hot reload** — file watcher for development
-- **Framework auto-detection** — Laravel, Symfony, Phalcon, WordPress
+- **Framework support** — Laravel, Symfony, Phalcon, WordPress
 - **Structured logging** — JSON output, Datadog/Loki compatible
 - **Compression** — Brotli, Zstd, Gzip
 - **Early Hints** — HTTP 103 support
