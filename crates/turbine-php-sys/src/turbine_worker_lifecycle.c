@@ -46,6 +46,12 @@ int turbine_worker_boot(void) {
 /* WITHOUT destroying PHP global variables (symbol table).          */
 /* ───────────────────────────────────────────────────────────────── */
 void turbine_worker_request_shutdown(void) {
+    /* Clear any pending exception so it doesn't leak to the next request. */
+    if (EG(exception)) {
+        zend_try { zend_clear_exception(); }
+        zend_end_try();
+    }
+
     /* Flush and close output buffers (send any remaining echo output). */
     zend_try { php_output_end_all(); }
     zend_end_try();

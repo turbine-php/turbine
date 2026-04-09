@@ -2,6 +2,7 @@
 /vendor/php-build
 /vendor/php-embed
 /vendor/php-embed-zts
+/vendor
 **/*.rs.bk
 Cargo.lock
 *.swp

@@ -7,7 +7,8 @@ set -euo pipefail
 PHP_VERSION="${1:-8.5.4}"
 PHP_MAJOR_MINOR=$(echo "$PHP_VERSION" | cut -d. -f1,2)
 BUILD_DIR="$(cd "$(dirname "$0")/.." && pwd)/vendor/php-build"
-INSTALL_DIR="$(cd "$(dirname "$0")/.." && pwd)/vendor/php-embed"
+# Set INSTALL_SUFFIX to install alongside other builds, e.g. INSTALL_SUFFIX="-84" → vendor/php-embed-84
+INSTALL_DIR="$(cd "$(dirname "$0")/.." && pwd)/vendor/php-embed${INSTALL_SUFFIX:-}"
 NPROC=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
 
 # Set ZTS_BUILD=1 to compile a Thread-Safe (ZTS) build of PHP.

@@ -346,10 +346,16 @@ fn write_all_fd(fd: RawFd, data: &[u8]) -> io::Result<()> {
 
 /// Entry point for persistent worker processes.
 ///
-/// Uses the native SAPI path: `turbine_sapi_set_request` +
-/// `php_request_startup` + `php_execute_script` per request.
-/// Each request gets a clean PHP state; OPcache keeps compiled
-/// opcodes warm across requests for near-zero compilation overhead.
+/// When `persistent_workers = true` and a Laravel-style app is detected
+/// (vendor/autoload.php + bootstrap/app.php), the worker boots the
+/// framework once and reuses the application kernel across requests
+/// using a lightweight per-request lifecycle that skips extension
+/// RINIT/RSHUTDOWN.  This preserves database connections, the autoloader,
+/// and all compiled classes between requests.
+///
+/// For non-Laravel apps (or when detection fails), falls back to the
+/// full php_request_startup/shutdown per request — identical to the
+/// previous behaviour.
 pub fn worker_event_loop_persistent(cmd_fd: RawFd, resp_fd: RawFd, app_root: &str) {
     debug!(pid = std::process::id(), app_root = app_root, "Persistent worker started (native SAPI)");
 
@@ -370,9 +376,35 @@ pub fn worker_event_loop_persistent(cmd_fd: RawFd, resp_fd: RawFd, app_root: &st
         }
     }
 
-    // Install Turbine SAPI hooks and output capture.
+    // Install Turbine SAPI hooks.
     unsafe {
         turbine_php_sys::turbine_sapi_install_hooks();
+    }
+
+    // ── Detect Laravel and attempt lightweight boot ─────────────────
+    let base = std::path::Path::new(app_root);
+    let is_laravel = base.join("vendor/autoload.php").exists()
+        && base.join("bootstrap/app.php").exists()
+        && base.join("artisan").exists();
+
+    let lightweight_mode = if is_laravel {
+        match unsafe { perform_laravel_boot(app_root) } {
+            true => {
+                info!(pid = std::process::id(), "Laravel boot OK — using lightweight lifecycle");
+                true
+            }
+            false => {
+                warn!(pid = std::process::id(), "Laravel boot failed — falling back to full lifecycle");
+                false
+            }
+        }
+    } else {
+        debug!(pid = std::process::id(), "Not a Laravel app — using full lifecycle");
+        false
+    };
+
+    // Install initial output capture (for both modes).
+    unsafe {
         output::install_output_capture();
     }
 
@@ -473,24 +505,51 @@ pub fn worker_event_loop_persistent(cmd_fd: RawFd, resp_fd: RawFd, app_root: &st
                 if val_ptrs.is_empty() { std::ptr::null() } else { val_ptrs.as_ptr() },
             );
 
-            // 2. Full request startup — clean PHP state, OPcache stays warm.
-            turbine_php_sys::php_request_startup();
+            let (result, body, headers, status) = if lightweight_mode {
+                // ── Lightweight path: reuse booted $kernel ──────────
+                turbine_php_sys::turbine_worker_request_startup();
 
-            // 3. Install output capture AFTER startup (startup resets SAPI callbacks).
-            output::install_output_capture();
-            output::clear_output_buffer();
+                output::install_output_capture();
+                output::clear_output_buffer();
 
-            // 4. Execute PHP script — uses OPcache, standard Zend VM path.
-            let result = turbine_php_sys::turbine_execute_script(c_script.as_ptr());
+                let handler = std::ffi::CString::new(
+                    "$request = \\Illuminate\\Http\\Request::capture();\
+                     $response = $GLOBALS['__turbine_kernel']->handle($request);\
+                     $response->send();\
+                     $GLOBALS['__turbine_kernel']->terminate($request, $response);\
+                     gc_collect_cycles();"
+                ).unwrap();
+                let eval_name = safe_cstring(b"turbine_handler");
+                let r = turbine_php_sys::zend_eval_string(
+                    handler.as_ptr(),
+                    std::ptr::null_mut(),
+                    eval_name.as_ptr(),
+                );
 
-            // 5. Capture output, headers, status code BEFORE shutdown.
-            //    php_request_shutdown may reset SAPI state or free globals.
-            let body = output::take_output();
-            let headers = output::take_headers();
-            let status = output::take_response_code();
+                let b = output::take_output();
+                let h = output::take_headers();
+                let s = output::take_response_code();
 
-            // 6. Full request shutdown — resets all PHP state for next request.
-            turbine_php_sys::php_request_shutdown(std::ptr::null_mut());
+                turbine_php_sys::turbine_worker_request_shutdown();
+
+                (r, b, h, s)
+            } else {
+                // ── Full lifecycle path (original behaviour) ────────
+                turbine_php_sys::php_request_startup();
+
+                output::install_output_capture();
+                output::clear_output_buffer();
+
+                let r = turbine_php_sys::turbine_execute_script(c_script.as_ptr());
+
+                let b = output::take_output();
+                let h = output::take_headers();
+                let s = output::take_response_code();
+
+                turbine_php_sys::php_request_shutdown(std::ptr::null_mut());
+
+                (r, b, h, s)
+            };
 
             let ok = result == turbine_php_sys::SUCCESS;
             if let Err(e) = write_response(resp_fd, ok, status, &headers, &body) {
@@ -501,7 +560,68 @@ pub fn worker_event_loop_persistent(cmd_fd: RawFd, resp_fd: RawFd, app_root: &st
     }
 
     // Clean up before exiting.
+    if lightweight_mode {
+        unsafe { turbine_php_sys::turbine_worker_shutdown(); }
+    }
     debug!(pid = std::process::id(), "Persistent worker exited");
+}
+
+/// Boot a Laravel application once (autoloader + kernel).
+///
+/// After this call, `$GLOBALS['__turbine_kernel']` holds a reusable HTTP kernel
+/// and all Composer-autoloaded classes are in the class table.
+///
+/// Returns `true` on success.
+unsafe fn perform_laravel_boot(app_root: &str) -> bool {
+    use crate::pool::safe_cstring;
+    use turbine_engine::output;
+
+    // 1. Full request startup for the boot phase (initializes all extensions).
+    if turbine_php_sys::turbine_worker_boot() != turbine_php_sys::SUCCESS {
+        error!(pid = std::process::id(), "turbine_worker_boot() failed");
+        return false;
+    }
+
+    // 2. Eval bootstrap code: load autoloader, create app + kernel.
+    let base = std::path::Path::new(app_root);
+    let vendor   = base.join("vendor/autoload.php");
+    let bootstrap = base.join("bootstrap/app.php");
+
+    let boot_code = format!(
+        "define('LARAVEL_START', microtime(true));\
+         require '{}';\
+         $GLOBALS['__turbine_app'] = require_once '{}';\
+         $GLOBALS['__turbine_kernel'] = $GLOBALS['__turbine_app']->make(\\Illuminate\\Contracts\\Http\\Kernel::class);",
+        vendor.display(),
+        bootstrap.display(),
+    );
+
+    let c_boot = safe_cstring(boot_code.as_bytes());
+    let c_name = safe_cstring(b"turbine_boot");
+
+    // Capture and discard boot output.
+    output::install_output_capture();
+    output::clear_output_buffer();
+
+    let result = turbine_php_sys::zend_eval_string(
+        c_boot.as_ptr(),
+        std::ptr::null_mut(),
+        c_name.as_ptr(),
+    );
+
+    // Discard any output from boot phase.
+    let _ = output::take_output();
+
+    if result != turbine_php_sys::SUCCESS {
+        error!(pid = std::process::id(), "Laravel bootstrap eval failed");
+        return false;
+    }
+
+    // 3. Lightweight shutdown — preserve $kernel, autoloader, classes.
+    turbine_php_sys::turbine_worker_request_shutdown();
+
+    info!(pid = std::process::id(), "Laravel kernel booted and cached in $GLOBALS['__turbine_kernel']");
+    true
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
