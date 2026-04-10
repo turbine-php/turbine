@@ -458,7 +458,7 @@ for sname, meta in SCENARIO_META.items():
 doc = {
     'version': '${VERSION}',
     'date':    '${BENCH_DATE}',
-    'server':  'Hetzner CPX41 (8 vCPU / 16 GB RAM / NVMe)',
+    'server':  'Hetzner CCX33 (8 vCPU dedicated / 32 GB RAM / NVMe)',
     'tool':    'bombardier v1.2.6',
     'images': {
         'turbine_nts': '${TURBINE_IMAGE_NTS}',

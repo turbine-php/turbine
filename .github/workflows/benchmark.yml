@@ -75,16 +75,22 @@ jobs:
             https://api.hetzner.cloud/v1/ssh_keys)
           echo "id=$(echo "$RESP" | jq -r '.ssh_key.id')" >> "$GITHUB_OUTPUT"
 
-      - name: Create Hetzner CPX41 server
+      - name: Create Hetzner CCX33 server
         id: server
         env:
           HCLOUD_TOKEN: ${{ secrets.HETZNER_API_TOKEN }}
         run: |
-          RESP=$(curl -fsSL -X POST \
+          RESP=$(curl -sSL -X POST \
             -H "Authorization: Bearer $HCLOUD_TOKEN" \
             -H "Content-Type: application/json" \
-            -d "{\"name\":\"bench-${{ github.run_id }}\",\"server_type\":\"cpx41\",\"image\":\"ubuntu-24.04\",\"ssh_keys\":[${{ steps.hkey.outputs.id }}],\"location\":\"nbg1\"}" \
+            -d "{\"name\":\"bench-${{ github.run_id }}\",\"server_type\":\"ccx33\",\"image\":\"ubuntu-24.04\",\"ssh_keys\":[${{ steps.hkey.outputs.id }}],\"location\":\"nbg1\"}" \
             https://api.hetzner.cloud/v1/servers)
+          ERR=$(echo "$RESP" | jq -r '.error.message // empty')
+          if [[ -n "$ERR" ]]; then
+            echo "Hetzner API error: $ERR"
+            echo "Full response: $RESP"
+            exit 1
+          fi
           echo "id=$(echo "$RESP"   | jq -r '.server.id')"                  >> "$GITHUB_OUTPUT"
           echo "ip=$(echo "$RESP"   | jq -r '.server.public_net.ipv4.ip')"  >> "$GITHUB_OUTPUT"
           echo "SERVER_ID=$(echo "$RESP" | jq -r '.server.id')" >> "$GITHUB_ENV"
