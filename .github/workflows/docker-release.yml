@@ -13,6 +13,7 @@ on:
 # Required secrets:
 #   DOCKERHUB_USERNAME — Docker Hub username
 #   DOCKERHUB_TOKEN    — Docker Hub access token (Settings → Security → Access Tokens)
+#   DOCKERHUB_PASSWORD — Docker Hub PAT with Read & Write & Delete scope (needed for README sync)
 
 env:
   REGISTRY: docker.io
@@ -127,9 +128,10 @@ jobs:
     needs: build-and-push
     steps:
       - uses: actions/checkout@v4
-      - uses: peter-evans/dockerhub-description@v4
+      - uses: peter-evans/dockerhub-description@v5
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          password: ${{ secrets.DOCKERHUB_PASSWORD }}
           repository: katisuhara/turbine-php
-          readme-filepath: ./README.md
+          short-description: ${{ github.event.repository.description }}
+          enable-url-completion: true

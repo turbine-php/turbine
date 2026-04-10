@@ -72,7 +72,47 @@ sqli_block_threshold   = 3      # block IP after N SQLi attempts
 
 See [docs/security.md](docs/security.md) for the full reference.
 
-## Quick start
+## Docker
+
+Pre-built images are available on Docker Hub for every release:
+
+```bash
+docker pull katisuhara/turbine-php
+```
+
+### Available Tags
+
+| Tag | PHP | Thread Safety |
+|-----|-----|---------------|
+| `latest` | 8.4 | NTS |
+| `latest-php8.4-nts` | 8.4 | NTS |
+| `latest-php8.4-zts` | 8.4 | ZTS |
+| `latest-php8.5-nts` | 8.5 | NTS |
+| `latest-php8.5-zts` | 8.5 | ZTS |
+| `<version>-php8.4-nts` | 8.4 | NTS |
+| `<version>-php8.4-zts` | 8.4 | ZTS |
+| `<version>-php8.5-nts` | 8.5 | NTS |
+| `<version>-php8.5-zts` | 8.5 | ZTS |
+
+All images include **Phalcon** and **Redis** extensions pre-compiled.
+
+### Quick Run
+
+```bash
+# NTS (default)
+docker run -d -p 8080:8080 -e PORT=8080 \
+  -v ./my-app:/var/www/html \
+  katisuhara/turbine-php
+
+# ZTS (thread mode)
+docker run -d -p 8080:8080 -e PORT=8080 \
+  -v ./my-app:/var/www/html \
+  katisuhara/turbine-php:latest-php8.4-zts
+```
+
+See [docker/README.md](docker/README.md) for Docker Compose examples, configuration, and build customization.
+
+## Quick Start
 
 ```bash
 # Create a PHP project directory
