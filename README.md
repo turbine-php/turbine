@@ -1,6 +1,11 @@
 # Turbine
 
 [![Tests](https://github.com/turbine-php/turbine/actions/workflows/test.yml/badge.svg?branch=master)](https://github.com/turbine-php/turbine/actions/workflows/test.yml)
+[![Docker Release](https://github.com/turbine-php/turbine/actions/workflows/docker-release.yml/badge.svg)](https://github.com/turbine-php/turbine/actions/workflows/docker-release.yml)
+[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/turbine-php/turbine/badge)](https://securityscorecards.dev/viewer/?uri=github.com/turbine-php/turbine)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
+[![Docker Pulls](https://img.shields.io/docker/pulls/katisuhara/turbine-php)](https://hub.docker.com/r/katisuhara/turbine-php)
 
 <p align="center">
   <img src="assets/logo.png" alt="Turbine" width="400" />
