@@ -758,10 +758,11 @@ impl AppStructure {
         let relative = clean.trim_start_matches('/');
 
         // 1. Direct .php file — serve if it exists on disk
-        if clean.ends_with(".php") && !relative.is_empty() {
-            if self.document_root.join(relative).is_file() {
-                return relative.to_string();
-            }
+        if clean.ends_with(".php")
+            && !relative.is_empty()
+            && self.document_root.join(relative).is_file()
+        {
+            return relative.to_string();
         }
 
         // 2. Static (non-PHP) file — serve directly

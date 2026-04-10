@@ -192,13 +192,11 @@ pub fn extract_structured_logs(body: &[u8]) -> (Vec<u8>, Vec<PhpLogEntry>) {
             if let Some(entry) = parse_log_json(json_str.trim()) {
                 entries.push(entry);
             }
-        } else {
-            if !cleaned.is_empty() || !line.is_empty() {
-                if !cleaned.is_empty() {
-                    cleaned.push(b'\n');
-                }
-                cleaned.extend_from_slice(line.as_bytes());
+        } else if !cleaned.is_empty() || !line.is_empty() {
+            if !cleaned.is_empty() {
+                cleaned.push(b'\n');
             }
+            cleaned.extend_from_slice(line.as_bytes());
         }
     }
 

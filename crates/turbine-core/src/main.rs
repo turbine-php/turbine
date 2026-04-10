@@ -714,6 +714,7 @@ struct PhpRequest {
 
 type PhpResult = Result<turbine_engine::PhpResponse, String>;
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_serve(
     listen_override: Option<String>,
     workers_override: Option<usize>,
@@ -2154,15 +2155,14 @@ async fn run_hyper_server(
                                             "Worker threads restarted after file change"
                                         );
                                     }
+                                } else if let Err(e) = pool.spawn_workers(worker_event_loop_native)
+                                {
+                                    error!(error = %e, "Failed to respawn workers after file change");
                                 } else {
-                                    if let Err(e) = pool.spawn_workers(worker_event_loop_native) {
-                                        error!(error = %e, "Failed to respawn workers after file change");
-                                    } else {
-                                        info!(
-                                            workers = pool.worker_count(),
-                                            "Workers restarted after file change"
-                                        );
-                                    }
+                                    info!(
+                                        workers = pool.worker_count(),
+                                        "Workers restarted after file change"
+                                    );
                                 }
                             }
                         }
@@ -2827,7 +2827,7 @@ async fn handle_request_inner(
             let server_port = state
                 .listen
                 .split(':')
-                .last()
+                .next_back()
                 .and_then(|p| p.parse::<u16>().ok())
                 .unwrap_or(8080);
             let full_uri_owned;
@@ -2886,21 +2886,13 @@ async fn handle_request_inner(
             let reader_handle = tokio::spawn(async move {
                 let result = tokio::task::spawn_blocking(move || decode_response(resp_fd))
                     .await
-                    .unwrap_or_else(|e| {
-                        Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            e.to_string(),
-                        ))
-                    });
+                    .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())));
                 result
             });
 
-            let bin_result = reader_handle.await.unwrap_or_else(|e| {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                ))
-            });
+            let bin_result = reader_handle
+                .await
+                .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())));
             drop(guard);
 
             match bin_result {
@@ -3014,7 +3006,7 @@ async fn handle_request_inner(
             let server_port = state
                 .listen
                 .split(':')
-                .last()
+                .next_back()
                 .and_then(|p| p.parse::<u16>().ok())
                 .unwrap_or(8080);
             let full_uri_owned;
@@ -3125,12 +3117,7 @@ async fn handle_request_inner(
                 let _permit_guard = permit; // Hold permit until task completes
                 let result = tokio::task::spawn_blocking(move || decode_response(resp_fd))
                     .await
-                    .unwrap_or_else(|e| {
-                        Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            e.to_string(),
-                        ))
-                    });
+                    .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())));
                 if let Some(ref pool_mutex) = return_state.worker_pool {
                     let mut pool = pool_mutex.lock();
                     if result.is_ok() {
@@ -3155,12 +3142,9 @@ async fn handle_request_inner(
                 result
             });
 
-            let bin_result = reader_handle.await.unwrap_or_else(|e| {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                ))
-            });
+            let bin_result = reader_handle
+                .await
+                .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())));
 
             match bin_result {
                 Ok(resp) => {
@@ -3286,7 +3270,7 @@ async fn handle_request_inner(
     let server_port = state
         .listen
         .split(':')
-        .last()
+        .next_back()
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(8080);
     let superglobals = request.php_superglobals_code(
@@ -3467,7 +3451,7 @@ async fn handle_request_inner(
             )),
         }
     } else if state.thread_dispatch.is_some()
-        && find_pool(&state, &clean_path).map_or(false, |r| r.pool_index.is_none())
+        && find_pool(&state, &clean_path).is_some_and(|r| r.pool_index.is_none())
     {
         // ── Thread-mode classic dispatch (lock-free) ─────────────────
         let td = state.thread_dispatch.as_ref().unwrap();
@@ -3582,23 +3566,13 @@ async fn handle_request_inner(
                 let result =
                     tokio::task::spawn_blocking(move || read_native_response_from_fd(resp_fd))
                         .await
-                        .unwrap_or_else(|e| {
-                            Err(std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                e.to_string(),
-                            ))
-                        });
+                        .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())));
                 result
             });
             // Note: guard (from outer scope) will return_idle when dropped.
             reader_handle
                 .await
-                .unwrap_or_else(|e| {
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        e.to_string(),
-                    ))
-                })
+                .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())))
                 .map_err(|e| e.to_string())
         };
 
@@ -3892,23 +3866,13 @@ async fn handle_request_inner(
                 WorkerResult::Persistent(
                     tokio::task::spawn_blocking(move || decode_response(resp_fd))
                         .await
-                        .unwrap_or_else(|e| {
-                            Err(std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                e.to_string(),
-                            ))
-                        }),
+                        .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string()))),
                 )
             } else {
                 WorkerResult::Native(
                     tokio::task::spawn_blocking(move || read_native_response_from_fd(resp_fd))
                         .await
-                        .unwrap_or_else(|e| {
-                            Err(std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                e.to_string(),
-                            ))
-                        }),
+                        .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string()))),
                 )
             };
             // Always return the worker after reading
@@ -3916,12 +3880,9 @@ async fn handle_request_inner(
             result
         });
 
-        let worker_result = reader_handle.await.unwrap_or_else(|e| {
-            WorkerResult::Native(Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                e.to_string(),
-            )))
-        });
+        let worker_result = reader_handle
+            .await
+            .unwrap_or_else(|e| WorkerResult::Native(Err(std::io::Error::other(e.to_string()))));
 
         match worker_result {
             WorkerResult::Persistent(bin_result) => match bin_result {
@@ -4172,6 +4133,7 @@ fn postprocess_php_response(
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn parse_turbine_response_envelope(body: &[u8]) -> Option<(u16, Vec<(String, String)>, Vec<u8>)> {
     let status_marker = TURBINE_STATUS_MARKER.as_bytes();
     let body_marker = TURBINE_BODY_MARKER.as_bytes();
@@ -4245,8 +4207,10 @@ fn gzip_compress(data: &[u8], level: u32) -> Vec<u8> {
 fn brotli_compress(data: &[u8], level: u32) -> Vec<u8> {
     let mut output = Vec::new();
     let quality = level.min(11);
-    let mut params = brotli::enc::BrotliEncoderParams::default();
-    params.quality = quality as i32;
+    let params = brotli::enc::BrotliEncoderParams {
+        quality: quality as i32,
+        ..Default::default()
+    };
     if brotli::BrotliCompress(&mut &data[..], &mut output, &params).is_err() {
         return data.to_vec();
     }

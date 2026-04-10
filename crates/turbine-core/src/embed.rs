@@ -134,7 +134,7 @@ fn extract_tar_gz(data: &[u8], dest: &std::path::Path) -> Result<usize, String> 
         pos += 512; // Move past header
 
         if name.is_empty() || name == "." {
-            pos += (file_size + 511) / 512 * 512;
+            pos += file_size.div_ceil(512) * 512;
             continue;
         }
 
@@ -158,7 +158,7 @@ fn extract_tar_gz(data: &[u8], dest: &std::path::Path) -> Result<usize, String> 
                     ))
             }) {
                 if !canonical_target.starts_with(&canonical_dest) {
-                    pos += (file_size + 511) / 512 * 512;
+                    pos += file_size.div_ceil(512) * 512;
                     continue; // Skip path traversal attempts
                 }
             }
@@ -186,7 +186,7 @@ fn extract_tar_gz(data: &[u8], dest: &std::path::Path) -> Result<usize, String> 
         }
 
         // Advance past file data (padded to 512-byte boundary)
-        pos += (file_size + 511) / 512 * 512;
+        pos += file_size.div_ceil(512) * 512;
     }
 
     Ok(count)

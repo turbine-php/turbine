@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 pub struct RuntimeConfig {
     #[serde(default)]
     pub server: ServerConfig,
@@ -116,7 +116,7 @@ pub struct ServerConfig {
     pub tokio_worker_threads: Option<usize>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct TlsConfig {
     /// Enable TLS (HTTPS). Requires cert_file and key_file.
     #[serde(default)]
@@ -263,7 +263,7 @@ impl Default for EarlyHintsConfig {
 }
 
 /// X-Sendfile / X-Accel-Redirect configuration — delegate large file serving to Turbine.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct XSendfileConfig {
     /// Enable X-Sendfile support.
     #[serde(default)]
@@ -271,15 +271,6 @@ pub struct XSendfileConfig {
     /// Base directory for X-Accel-Redirect paths (relative to app root).
     #[serde(default)]
     pub root: Option<String>,
-}
-
-impl Default for XSendfileConfig {
-    fn default() -> Self {
-        XSendfileConfig {
-            enabled: false,
-            root: None,
-        }
-    }
 }
 
 /// Structured logging configuration — turbine_log() PHP function.
@@ -346,6 +337,7 @@ impl Default for AcmeConfig {
 /// Embed app configuration — pack PHP files into the binary.
 #[derive(Debug, Deserialize, Clone)]
 #[allow(dead_code)]
+#[derive(Default)]
 pub struct EmbedConfig {
     /// Enable embedded app mode. At build time, set TURBINE_EMBED_DIR env var
     /// to the directory containing the PHP app.
@@ -354,15 +346,6 @@ pub struct EmbedConfig {
     /// Directory to extract embedded files to at runtime (temp if empty).
     #[serde(default)]
     pub extract_dir: Option<String>,
-}
-
-impl Default for EmbedConfig {
-    fn default() -> Self {
-        EmbedConfig {
-            enabled: false,
-            extract_dir: None,
-        }
-    }
 }
 
 /// Dashboard, metrics, and internal endpoints configuration.
@@ -447,7 +430,7 @@ pub struct CompressionConfig {
     pub algorithms: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 pub struct ErrorPagesConfig {
     /// Path to custom 404 HTML page.
     pub not_found: Option<String>,
@@ -691,16 +674,6 @@ fn default_disabled_functions() -> Vec<String> {
     ]
 }
 
-impl Default for TlsConfig {
-    fn default() -> Self {
-        TlsConfig {
-            enabled: false,
-            cert_file: None,
-            key_file: None,
-        }
-    }
-}
-
 impl Default for ServerConfig {
     fn default() -> Self {
         ServerConfig {
@@ -807,15 +780,6 @@ impl Default for CompressionConfig {
     }
 }
 
-impl Default for ErrorPagesConfig {
-    fn default() -> Self {
-        ErrorPagesConfig {
-            not_found: None,
-            server_error: None,
-        }
-    }
-}
-
 impl Default for SessionConfig {
     fn default() -> Self {
         SessionConfig {
@@ -895,32 +859,6 @@ impl Default for WatcherConfig {
             paths: default_watch_paths(),
             extensions: default_watch_extensions(),
             debounce_ms: default_watch_debounce_ms(),
-        }
-    }
-}
-
-impl Default for RuntimeConfig {
-    fn default() -> Self {
-        RuntimeConfig {
-            server: ServerConfig::default(),
-            php: PhpConfig::default(),
-            security: SecurityConfig::default(),
-            sandbox: SandboxConfig::default(),
-            cache: CacheTomlConfig::default(),
-            logging: LoggingConfig::default(),
-            compression: CompressionConfig::default(),
-            error_pages: ErrorPagesConfig::default(),
-            session: SessionConfig::default(),
-            cors: CorsConfig::default(),
-            watcher: WatcherConfig::default(),
-            early_hints: EarlyHintsConfig::default(),
-            x_sendfile: XSendfileConfig::default(),
-            structured_logging: StructuredLoggingConfig::default(),
-            acme: AcmeConfig::default(),
-            embed: EmbedConfig::default(),
-            dashboard: DashboardConfig::default(),
-            worker_pools: Vec::new(),
-            virtual_hosts: Vec::new(),
         }
     }
 }
@@ -1043,9 +981,7 @@ impl RuntimeConfig {
             warnings.push("[acme] domains is set but [[virtual_hosts]] are configured — vhost domains are auto-collected into ACME, 'domains' is redundant".to_string());
         }
 
-        if self.watcher.enabled && self.logging.level == "warn"
-            || self.watcher.enabled && self.logging.level == "error"
-        {
+        if self.watcher.enabled && (self.logging.level == "warn" || self.logging.level == "error") {
             // Fine, no warning needed
         }
 

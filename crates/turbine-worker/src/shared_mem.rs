@@ -104,6 +104,11 @@ impl SharedMemory {
         self.len
     }
 
+    /// Returns `true` if the shared memory segment has zero size.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     /// Write data into the shared memory at the given offset.
     ///
     /// # Panics

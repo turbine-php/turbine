@@ -31,6 +31,7 @@ pub enum WorkerMode {
 
 impl WorkerMode {
     /// Parse from a config string. Returns Process for unknown values.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "thread" | "threads" => WorkerMode::Thread,
@@ -327,7 +328,7 @@ impl WorkerPool {
 
         for idx in to_respawn {
             // The old worker is dead, respawn a replacement
-            let is_master = self.spawn_one(idx, &worker_main)?;
+            let is_master = self.spawn_one(idx, worker_main)?;
             if !is_master {
                 // We're in the new child
                 return Ok(());
@@ -1371,6 +1372,7 @@ impl NativeRequest {
 }
 
 /// Encode a native request for the binary protocol.
+#[allow(clippy::too_many_arguments)]
 pub fn encode_native_request(
     script_path: &str,
     method: &str,
