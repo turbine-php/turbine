@@ -68,24 +68,19 @@ jobs:
         env:
           HCLOUD_TOKEN: ${{ secrets.HETZNER_API_TOKEN }}
         run: |
-          KEY_NAME="bench-${{ github.run_id }}"
+          KEY_NAME="bench-${{ github.run_id }}-${{ github.run_attempt }}"
           RESP=$(curl -sSL -X POST \
             -H "Authorization: Bearer $HCLOUD_TOKEN" \
             -H "Content-Type: application/json" \
             -d "{\"name\":\"${KEY_NAME}\",\"public_key\":\"$(cat /tmp/bench_key.pub)\"}" \
             https://api.hetzner.cloud/v1/ssh_keys)
           ERR_CODE=$(echo "$RESP" | jq -r '.error.code // empty')
-          if [[ "$ERR_CODE" == "uniqueness_error" ]]; then
-            # Key with this name already exists (leftover from a previous run) — fetch its ID
-            RESP=$(curl -sSL \
-              -H "Authorization: Bearer $HCLOUD_TOKEN" \
-              "https://api.hetzner.cloud/v1/ssh_keys?name=${KEY_NAME}")
-          elif [[ -n "$ERR_CODE" ]]; then
-            echo "Hetzner SSH key error: $(echo "$RESP" | jq -r '.error.message')"
+          if [[ -n "$ERR_CODE" ]]; then
+            echo "Hetzner SSH key error (${ERR_CODE}): $(echo "$RESP" | jq -r '.error.message')"
             echo "Full response: $RESP"
             exit 1
           fi
-          KEY_ID=$(echo "$RESP" | jq -r '.ssh_key.id // .ssh_keys[0].id')
+          KEY_ID=$(echo "$RESP" | jq -r '.ssh_key.id')
           echo "id=${KEY_ID}" >> "$GITHUB_OUTPUT"
           echo "KEY_ID=${KEY_ID}" >> "$GITHUB_ENV"
 
@@ -97,7 +92,7 @@ jobs:
           RESP=$(curl -sSL -X POST \
             -H "Authorization: Bearer $HCLOUD_TOKEN" \
             -H "Content-Type: application/json" \
-            -d "{\"name\":\"bench-${{ github.run_id }}\",\"server_type\":\"ccx33\",\"image\":\"ubuntu-24.04\",\"ssh_keys\":[${{ steps.hkey.outputs.id }}],\"location\":\"nbg1\"}" \
+            -d "{\"name\":\"bench-${{ github.run_id }}-${{ github.run_attempt }}\",\"server_type\":\"ccx33\",\"image\":\"ubuntu-24.04\",\"ssh_keys\":[${{ steps.hkey.outputs.id }}],\"location\":\"nbg1\"}" \
             https://api.hetzner.cloud/v1/servers)
           ERR=$(echo "$RESP" | jq -r '.error.message // empty')
           if [[ -n "$ERR" ]]; then
