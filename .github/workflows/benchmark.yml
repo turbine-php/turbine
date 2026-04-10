@@ -1,0 +1,170 @@
+name: Benchmark
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Version label for results (e.g. v0.2.0 or 'dev')."
+        required: false
+        default: "dev"
+      image_tag:
+        description: "Docker image tag to benchmark (e.g. latest-php8.4-nts). Leave blank to use 'latest'."
+        required: false
+        default: "latest"
+      connections:
+        description: "Number of concurrent connections for wrk."
+        required: false
+        default: "100"
+      duration:
+        description: "Benchmark duration in seconds per scenario."
+        required: false
+        default: "30"
+      commit_results:
+        description: "Commit results back to the repository?"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+# Required secrets:
+#   HETZNER_API_TOKEN — Hetzner Cloud API token (Project → API Tokens → Read+Write)
+
+permissions:
+  contents: write   # needed to commit benchmark results back to the repo
+
+jobs:
+  benchmark:
+    name: Run benchmarks on Hetzner CPX41
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set version and date
+        id: meta
+        run: |
+          TAG="${{ github.event.inputs.tag || github.event.release.tag_name || 'dev' }}"
+          IMAGE_TAG="${{ github.event.inputs.image_tag || 'latest' }}"
+          CONNECTIONS="${{ github.event.inputs.connections || '100' }}"
+          DURATION="${{ github.event.inputs.duration || '30' }}"
+          COMMIT="${{ github.event.inputs.commit_results || 'true' }}"
+          echo "tag=${TAG}"                >> "$GITHUB_OUTPUT"
+          echo "image_tag=${IMAGE_TAG}"    >> "$GITHUB_OUTPUT"
+          echo "connections=${CONNECTIONS}" >> "$GITHUB_OUTPUT"
+          echo "duration=${DURATION}"      >> "$GITHUB_OUTPUT"
+          echo "commit=${COMMIT}"          >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
+      - name: Generate SSH keypair
+        run: ssh-keygen -t ed25519 -f /tmp/bench_key -N ""
+
+      - name: Create Hetzner SSH key
+        id: hkey
+        env:
+          HCLOUD_TOKEN: ${{ secrets.HETZNER_API_TOKEN }}
+        run: |
+          RESP=$(curl -fsSL -X POST \
+            -H "Authorization: Bearer $HCLOUD_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"name\":\"bench-${{ github.run_id }}\",\"public_key\":\"$(cat /tmp/bench_key.pub)\"}" \
+            https://api.hetzner.cloud/v1/ssh_keys)
+          echo "id=$(echo "$RESP" | jq -r '.ssh_key.id')" >> "$GITHUB_OUTPUT"
+
+      - name: Create Hetzner CPX41 server
+        id: server
+        env:
+          HCLOUD_TOKEN: ${{ secrets.HETZNER_API_TOKEN }}
+        run: |
+          RESP=$(curl -fsSL -X POST \
+            -H "Authorization: Bearer $HCLOUD_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"name\":\"bench-${{ github.run_id }}\",\"server_type\":\"cpx41\",\"image\":\"ubuntu-24.04\",\"ssh_keys\":[${{ steps.hkey.outputs.id }}],\"location\":\"nbg1\"}" \
+            https://api.hetzner.cloud/v1/servers)
+          echo "id=$(echo "$RESP"   | jq -r '.server.id')"                  >> "$GITHUB_OUTPUT"
+          echo "ip=$(echo "$RESP"   | jq -r '.server.public_net.ipv4.ip')"  >> "$GITHUB_OUTPUT"
+          echo "SERVER_ID=$(echo "$RESP" | jq -r '.server.id')" >> "$GITHUB_ENV"
+          echo "KEY_ID=${{ steps.hkey.outputs.id }}"             >> "$GITHUB_ENV"
+
+      - name: Wait for SSH availability
+        run: |
+          IP="${{ steps.server.outputs.ip }}"
+          echo "Waiting for SSH on ${IP}..."
+          for i in $(seq 1 40); do
+            ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+                -i /tmp/bench_key "root@${IP}" "echo ready" 2>/dev/null && break
+            echo "  Attempt ${i}/40 — retrying in 10s..."
+            sleep 10
+          done
+
+      - name: Upload benchmark scripts
+        run: |
+          scp -o StrictHostKeyChecking=no -i /tmp/bench_key -r \
+            benchmarks/scripts "root@${{ steps.server.outputs.ip }}:/root/bench"
+
+      - name: Set up server
+        run: |
+          ssh -o StrictHostKeyChecking=no -i /tmp/bench_key \
+            "root@${{ steps.server.outputs.ip }}" \
+            "bash /root/bench/setup.sh 2>&1"
+
+      - name: Run benchmarks
+        run: |
+          ssh -o StrictHostKeyChecking=no -i /tmp/bench_key \
+            "root@${{ steps.server.outputs.ip }}" \
+            "bash /root/bench/run.sh \
+              '${{ steps.meta.outputs.tag }}' \
+              '${{ steps.meta.outputs.image_tag }}' \
+              '${{ steps.meta.outputs.connections }}' \
+              '${{ steps.meta.outputs.duration }}'" \
+            > /tmp/bench-results.json
+          echo "--- Results JSON ---"
+          cat /tmp/bench-results.json
+
+      - name: Generate markdown report
+        run: |
+          python3 benchmarks/scripts/report.py \
+            /tmp/bench-results.json \
+            "${{ steps.meta.outputs.tag }}" \
+            "${{ steps.meta.outputs.date }}" \
+            > /tmp/bench-report.md
+          cat /tmp/bench-report.md
+
+      - name: Commit results to repository
+        if: steps.meta.outputs.commit == 'true'
+        run: |
+          TAG="${{ steps.meta.outputs.tag }}"
+          DATE="${{ steps.meta.outputs.date }}"
+          cp /tmp/bench-report.md benchmarks/results/README.md
+          cp /tmp/bench-report.md "benchmarks/results/history/${DATE}-${TAG}.md"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add benchmarks/results/
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "chore(bench): results ${TAG} ${DATE} [skip ci]"
+            git pull --rebase
+            git push
+          fi
+
+      # Always clean up the server, even if a previous step failed
+      - name: Delete Hetzner server and SSH key
+        if: always()
+        env:
+          HCLOUD_TOKEN: ${{ secrets.HETZNER_API_TOKEN }}
+        run: |
+          if [[ -n "${SERVER_ID:-}" ]]; then
+            curl -fsSL -X DELETE \
+              -H "Authorization: Bearer $HCLOUD_TOKEN" \
+              "https://api.hetzner.cloud/v1/servers/${SERVER_ID}" || true
+          fi
+          if [[ -n "${KEY_ID:-}" ]]; then
+            curl -fsSL -X DELETE \
+              -H "Authorization: Bearer $HCLOUD_TOKEN" \
+              "https://api.hetzner.cloud/v1/ssh_keys/${KEY_ID}" || true
+          fi
