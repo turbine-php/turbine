@@ -65,8 +65,9 @@ fn main() {
         c_build.flag(flag);
     }
     // Suppress PHP internal header warnings that are not our concern
-    c_build.flag("-Wno-unused-function")
-           .flag("-Wno-deprecated-declarations");
+    c_build
+        .flag("-Wno-unused-function")
+        .flag("-Wno-deprecated-declarations");
     c_build.compile("turbine_worker_lifecycle");
     println!("cargo:rerun-if-changed=src/turbine_worker_lifecycle.c");
     println!("cargo:rerun-if-changed=src/turbine_sapi_handler.c");

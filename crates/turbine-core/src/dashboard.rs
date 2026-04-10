@@ -10,7 +10,8 @@ const TEMPLATE: &str = include_str!("templates/dashboard.html");
 
 /// Returns the complete dashboard HTML page with runtime values substituted.
 pub fn dashboard_html(listen: &str, auth_required: bool) -> String {
-    TEMPLATE
-        .replace("%%LISTEN%%", listen)
-        .replace("%%AUTH_REQUIRED%%", if auth_required { "true" } else { "false" })
+    TEMPLATE.replace("%%LISTEN%%", listen).replace(
+        "%%AUTH_REQUIRED%%",
+        if auth_required { "true" } else { "false" },
+    )
 }

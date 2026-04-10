@@ -1,7 +1,7 @@
 use std::io::{Read, Write};
 use std::os::unix::io::RawFd;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use nix::sys::signal::{self, Signal};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
@@ -111,7 +111,13 @@ impl Worker {
     }
 
     /// Create a Worker backed by an OS thread (ZTS mode).
-    pub(crate) fn new_thread(alive: Arc<AtomicBool>, thread_id: u64, max_requests: u64, cmd_fd: RawFd, resp_fd: RawFd) -> Self {
+    pub(crate) fn new_thread(
+        alive: Arc<AtomicBool>,
+        thread_id: u64,
+        max_requests: u64,
+        cmd_fd: RawFd,
+        resp_fd: RawFd,
+    ) -> Self {
         info!(thread_id = thread_id, "Worker thread created");
         Worker {
             kind: WorkerKind::Thread { alive, thread_id },
@@ -236,7 +242,9 @@ impl Worker {
             WorkerKind::Thread { thread_id, .. } => {
                 warn!(thread_id = thread_id, "Force-closing worker thread pipe");
                 // Close the command pipe — the thread will see EOF and exit
-                unsafe { libc::close(self.cmd_fd); }
+                unsafe {
+                    libc::close(self.cmd_fd);
+                }
                 // Set cmd_fd to -1 to prevent double-close in Drop
                 self.cmd_fd = -1;
                 Ok(())
@@ -290,8 +298,8 @@ impl Worker {
             file.read_exact(&mut payload)?;
         }
 
-        let success = status_buf[0] == WorkerResp::Ok as u8
-            || status_buf[0] == WorkerResp::Ready as u8;
+        let success =
+            status_buf[0] == WorkerResp::Ok as u8 || status_buf[0] == WorkerResp::Ready as u8;
 
         Ok((success, payload))
     }
@@ -319,8 +327,12 @@ impl Drop for Worker {
         if self.state != WorkerState::Exited(-1) && self.state != WorkerState::Exited(0) {
             // Close pipe fds (skip if already closed, i.e. fd == -1)
             unsafe {
-                if self.cmd_fd >= 0 { libc::close(self.cmd_fd); }
-                if self.resp_fd >= 0 { libc::close(self.resp_fd); }
+                if self.cmd_fd >= 0 {
+                    libc::close(self.cmd_fd);
+                }
+                if self.resp_fd >= 0 {
+                    libc::close(self.resp_fd);
+                }
             }
             // Try graceful then force
             if let WorkerState::Idle | WorkerState::Busy = self.state {
@@ -333,8 +345,8 @@ impl Drop for Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
 
     fn make_pipe() -> (i32, i32) {
         let mut fds = [0i32; 2];
@@ -352,7 +364,10 @@ mod tests {
         assert_eq!(worker.state(), WorkerState::Idle);
         assert_eq!(worker.requests_handled(), 0);
         // Clean up fds
-        unsafe { libc::close(cmd_r); libc::close(resp_w); }
+        unsafe {
+            libc::close(cmd_r);
+            libc::close(resp_w);
+        }
         // Drop will try to close cmd_w and resp_r
     }
 
@@ -363,7 +378,10 @@ mod tests {
         let mut worker = Worker::new(nix::unistd::Pid::from_raw(99999), 100, cmd_w, resp_r);
         worker.mark_busy();
         assert_eq!(worker.state(), WorkerState::Busy);
-        unsafe { libc::close(cmd_r); libc::close(resp_w); }
+        unsafe {
+            libc::close(cmd_r);
+            libc::close(resp_w);
+        }
     }
 
     #[test]
@@ -378,7 +396,10 @@ mod tests {
         assert_eq!(worker.requests_handled(), 1);
         assert_eq!(worker.state(), WorkerState::Idle);
 
-        unsafe { libc::close(cmd_r); libc::close(resp_w); }
+        unsafe {
+            libc::close(cmd_r);
+            libc::close(resp_w);
+        }
     }
 
     #[test]
@@ -389,10 +410,13 @@ mod tests {
 
         assert!(!worker.mark_idle()); // 1
         assert!(!worker.mark_idle()); // 2
-        assert!(worker.mark_idle());  // 3 -- should recycle
+        assert!(worker.mark_idle()); // 3 -- should recycle
 
         assert_eq!(worker.requests_handled(), 3);
-        unsafe { libc::close(cmd_r); libc::close(resp_w); }
+        unsafe {
+            libc::close(cmd_r);
+            libc::close(resp_w);
+        }
     }
 
     #[test]
@@ -405,7 +429,10 @@ mod tests {
             assert!(!worker.mark_idle());
         }
         assert_eq!(worker.requests_handled(), 100);
-        unsafe { libc::close(cmd_r); libc::close(resp_w); }
+        unsafe {
+            libc::close(cmd_r);
+            libc::close(resp_w);
+        }
     }
 
     // ── WorkerKind ──────────────────────────────────────────────────
@@ -417,7 +444,10 @@ mod tests {
         let worker = Worker::new(nix::unistd::Pid::from_raw(12345), 100, cmd_w, resp_r);
         assert!(!worker.is_thread());
         assert_eq!(worker.pid().as_raw(), 12345);
-        unsafe { libc::close(cmd_r); libc::close(resp_w); }
+        unsafe {
+            libc::close(cmd_r);
+            libc::close(resp_w);
+        }
     }
 
     #[test]
@@ -428,7 +458,10 @@ mod tests {
         let worker = Worker::new_thread(alive.clone(), 42, 100, cmd_w, resp_r);
         assert!(worker.is_thread());
         assert_eq!(worker.pid().as_raw(), 0); // thread has no PID
-        unsafe { libc::close(cmd_r); libc::close(resp_w); }
+        unsafe {
+            libc::close(cmd_r);
+            libc::close(resp_w);
+        }
     }
 
     #[test]
@@ -445,7 +478,10 @@ mod tests {
         assert!(!worker.is_alive());
         assert_eq!(worker.state(), WorkerState::Exited(0));
 
-        unsafe { libc::close(cmd_r); libc::close(resp_w); }
+        unsafe {
+            libc::close(cmd_r);
+            libc::close(resp_w);
+        }
     }
 
     // ── Pipe Communication ──────────────────────────────────────────
@@ -493,7 +529,10 @@ mod tests {
         assert!(success);
         assert_eq!(output, b"hello");
 
-        unsafe { libc::close(cmd_r); libc::close(resp_w); }
+        unsafe {
+            libc::close(cmd_r);
+            libc::close(resp_w);
+        }
     }
 
     #[test]
@@ -510,7 +549,10 @@ mod tests {
         }
         assert_eq!(buf[0], crate::pool::WorkerCmd::Shutdown as u8);
 
-        unsafe { libc::close(cmd_r); libc::close(resp_w); }
+        unsafe {
+            libc::close(cmd_r);
+            libc::close(resp_w);
+        }
     }
 
     #[test]
@@ -528,7 +570,10 @@ mod tests {
         }
         assert_eq!(&read_buf, &[0x01, 0x02, 0x03, 0x04, 0x05]);
 
-        unsafe { libc::close(cmd_r); libc::close(resp_w); }
+        unsafe {
+            libc::close(cmd_r);
+            libc::close(resp_w);
+        }
     }
 
     // ── Response status interpretation ──────────────────────────────
@@ -542,13 +587,18 @@ mod tests {
         let mut resp = Vec::new();
         resp.push(WorkerResp::Ok as u8);
         resp.extend_from_slice(&0u32.to_le_bytes());
-        unsafe { libc::write(resp_w, resp.as_ptr() as *const _, resp.len()); }
+        unsafe {
+            libc::write(resp_w, resp.as_ptr() as *const _, resp.len());
+        }
 
         let (success, payload) = worker.read_response().unwrap();
         assert!(success);
         assert!(payload.is_empty());
 
-        unsafe { libc::close(_cmd_r); libc::close(resp_w); }
+        unsafe {
+            libc::close(_cmd_r);
+            libc::close(resp_w);
+        }
     }
 
     #[test]
@@ -560,12 +610,17 @@ mod tests {
         let mut resp = Vec::new();
         resp.push(WorkerResp::Ready as u8);
         resp.extend_from_slice(&0u32.to_le_bytes());
-        unsafe { libc::write(resp_w, resp.as_ptr() as *const _, resp.len()); }
+        unsafe {
+            libc::write(resp_w, resp.as_ptr() as *const _, resp.len());
+        }
 
         let (success, _) = worker.read_response().unwrap();
         assert!(success);
 
-        unsafe { libc::close(_cmd_r); libc::close(resp_w); }
+        unsafe {
+            libc::close(_cmd_r);
+            libc::close(resp_w);
+        }
     }
 
     #[test]
@@ -579,13 +634,18 @@ mod tests {
         let payload = b"Fatal error";
         resp.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         resp.extend_from_slice(payload);
-        unsafe { libc::write(resp_w, resp.as_ptr() as *const _, resp.len()); }
+        unsafe {
+            libc::write(resp_w, resp.as_ptr() as *const _, resp.len());
+        }
 
         let (success, output) = worker.read_response().unwrap();
         assert!(!success);
         assert_eq!(output, b"Fatal error");
 
-        unsafe { libc::close(_cmd_r); libc::close(resp_w); }
+        unsafe {
+            libc::close(_cmd_r);
+            libc::close(resp_w);
+        }
     }
 
     // ── WorkerState enum ────────────────────────────────────────────

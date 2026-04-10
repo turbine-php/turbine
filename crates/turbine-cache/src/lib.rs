@@ -8,4 +8,4 @@
 
 mod store;
 
-pub use store::{ResponseCache, CacheConfig, CachedResponse};
+pub use store::{CacheConfig, CachedResponse, ResponseCache};

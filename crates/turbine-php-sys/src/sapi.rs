@@ -51,7 +51,8 @@ pub struct sapi_module_struct {
 
     pub sapi_error: Option<unsafe extern "C" fn(r#type: c_int, error_msg: *const c_char, ...)>,
 
-    pub header_handler: Option<unsafe extern "C" fn(header: *mut c_void, op: c_int, headers: *mut c_void) -> c_int>,
+    pub header_handler:
+        Option<unsafe extern "C" fn(header: *mut c_void, op: c_int, headers: *mut c_void) -> c_int>,
     pub send_headers: Option<unsafe extern "C" fn(headers: *mut c_void) -> c_int>,
     pub send_header: Option<unsafe extern "C" fn(header: *mut c_void, server_context: *mut c_void)>,
 
@@ -66,7 +67,8 @@ pub struct sapi_module_struct {
     pub php_ini_path_override: *mut c_char,
 
     pub default_post_reader: Option<unsafe extern "C" fn()>,
-    pub treat_data: Option<unsafe extern "C" fn(arg: c_int, str: *mut c_char, dest_array: *mut zval)>,
+    pub treat_data:
+        Option<unsafe extern "C" fn(arg: c_int, str: *mut c_char, dest_array: *mut zval)>,
     pub executable_location: *mut c_char,
 
     pub php_ini_ignore: c_int,
@@ -77,7 +79,15 @@ pub struct sapi_module_struct {
     pub get_target_uid: Option<unsafe extern "C" fn(uid: *mut c_uint) -> c_int>,
     pub get_target_gid: Option<unsafe extern "C" fn(gid: *mut c_uint) -> c_int>,
 
-    pub input_filter: Option<unsafe extern "C" fn(arg: c_int, var: *const c_char, val: *mut *mut c_char, val_len: size_t, new_val_len: *mut size_t) -> c_uint>,
+    pub input_filter: Option<
+        unsafe extern "C" fn(
+            arg: c_int,
+            var: *const c_char,
+            val: *mut *mut c_char,
+            val_len: size_t,
+            new_val_len: *mut size_t,
+        ) -> c_uint,
+    >,
     pub ini_defaults: Option<unsafe extern "C" fn(configuration_hash: *mut c_void)>,
     pub phpinfo_as_text: c_int,
 

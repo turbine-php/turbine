@@ -44,8 +44,7 @@ pub struct CachedResponse {
 impl CachedResponse {
     /// Check if this entry is still valid.
     pub fn is_valid(&self, current_source_hash: u64) -> bool {
-        self.source_hash == current_source_hash
-            && self.created_at.elapsed() < self.ttl
+        self.source_hash == current_source_hash && self.created_at.elapsed() < self.ttl
     }
 
     /// Remaining TTL in seconds.

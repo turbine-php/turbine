@@ -26,7 +26,11 @@ impl SharedMemory {
     ///
     /// The segment is initially read-write. Call `seal()` after populating it.
     pub fn new(size: usize) -> Result<Self, WorkerError> {
-        info!(size_bytes = size, size_mb = size / (1024 * 1024), "Creating shared memory segment");
+        info!(
+            size_bytes = size,
+            size_mb = size / (1024 * 1024),
+            "Creating shared memory segment"
+        );
 
         let ptr = unsafe {
             mmap_anonymous(
@@ -88,7 +92,10 @@ impl SharedMemory {
     /// # Safety
     /// Only valid before `seal()` is called. Writing after seal causes SIGBUS.
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
-        assert!(!self.sealed, "Cannot get mutable pointer to sealed shared memory");
+        assert!(
+            !self.sealed,
+            "Cannot get mutable pointer to sealed shared memory"
+        );
         self.ptr
     }
 

@@ -21,9 +21,15 @@ impl Default for UploadSecurityConfig {
     fn default() -> Self {
         UploadSecurityConfig {
             blocked_extensions: vec![
-                ".php".to_string(), ".phtml".to_string(), ".phar".to_string(),
-                ".php7".to_string(), ".php8".to_string(), ".inc".to_string(),
-                ".phps".to_string(), ".pht".to_string(), ".pgif".to_string(),
+                ".php".to_string(),
+                ".phtml".to_string(),
+                ".phar".to_string(),
+                ".php7".to_string(),
+                ".php8".to_string(),
+                ".inc".to_string(),
+                ".phps".to_string(),
+                ".pht".to_string(),
+                ".pgif".to_string(),
             ],
             scan_content: true,
         }
@@ -106,10 +112,7 @@ impl FullHttpRequest {
         let mut headers = HashMap::new();
         for line in lines {
             if let Some((key, value)) = line.split_once(':') {
-                headers.insert(
-                    key.trim().to_lowercase(),
-                    value.trim().to_string(),
-                );
+                headers.insert(key.trim().to_lowercase(), value.trim().to_string());
             }
         }
 
@@ -286,10 +289,7 @@ impl FullHttpRequest {
             env!("CARGO_PKG_VERSION")
         ));
         code.push_str("$_SERVER['SERVER_PROTOCOL'] = 'HTTP/1.1'; ");
-        code.push_str(&format!(
-            "$_SERVER['SERVER_PORT'] = '{}'; ",
-            server_port
-        ));
+        code.push_str(&format!("$_SERVER['SERVER_PORT'] = '{}'; ", server_port));
         code.push_str("$_SERVER['SERVER_NAME'] = 'localhost'; ");
         if is_tls {
             code.push_str("$_SERVER['HTTPS'] = 'on'; ");
@@ -309,10 +309,7 @@ impl FullHttpRequest {
 
         // HTTP headers → $_SERVER['HTTP_*']
         for (key, value) in &self.headers {
-            let server_key = format!(
-                "HTTP_{}",
-                key.replace('-', "_").to_uppercase()
-            );
+            let server_key = format!("HTTP_{}", key.replace('-', "_").to_uppercase());
             code.push_str(&format!(
                 "$_SERVER['{}'] = '{}'; ",
                 escape_php(&server_key),
@@ -328,10 +325,7 @@ impl FullHttpRequest {
         }
 
         if let Some(cl) = self.content_length {
-            code.push_str(&format!(
-                "$_SERVER['CONTENT_LENGTH'] = '{}'; ",
-                cl
-            ));
+            code.push_str(&format!("$_SERVER['CONTENT_LENGTH'] = '{}'; ", cl));
         }
 
         // --- $_GET ---
@@ -339,11 +333,7 @@ impl FullHttpRequest {
         if !get_params.is_empty() {
             code.push_str("$_GET = [");
             for (k, v) in &get_params {
-                code.push_str(&format!(
-                    "'{}' => '{}', ",
-                    escape_php(k),
-                    escape_php(v)
-                ));
+                code.push_str(&format!("'{}' => '{}', ", escape_php(k), escape_php(v)));
             }
             code.push_str("]; ");
         } else {
@@ -355,11 +345,7 @@ impl FullHttpRequest {
         if !post_params.is_empty() {
             code.push_str("$_POST = [");
             for (k, v) in &post_params {
-                code.push_str(&format!(
-                    "'{}' => '{}', ",
-                    escape_php(k),
-                    escape_php(v)
-                ));
+                code.push_str(&format!("'{}' => '{}', ", escape_php(k), escape_php(v)));
             }
             code.push_str("]; ");
         } else {
@@ -370,11 +356,7 @@ impl FullHttpRequest {
         if !self.cookies.is_empty() {
             code.push_str("$_COOKIE = [");
             for (k, v) in &self.cookies {
-                code.push_str(&format!(
-                    "'{}' => '{}', ",
-                    escape_php(k),
-                    escape_php(v)
-                ));
+                code.push_str(&format!("'{}' => '{}', ", escape_php(k), escape_php(v)));
             }
             code.push_str("]; ");
         } else {
@@ -459,7 +441,12 @@ impl FullHttpRequest {
 ///
 /// Files are written to temp files so PHP can access them via `$_FILES['tmp_name']`.
 /// Text fields are returned as key-value pairs for `$_POST`.
-fn parse_multipart(content_type: &str, body: &[u8], upload_tmp_dir: &str, upload_security: &UploadSecurityConfig) -> (Vec<UploadedFile>, Vec<(String, String)>) {
+fn parse_multipart(
+    content_type: &str,
+    body: &[u8],
+    upload_tmp_dir: &str,
+    upload_security: &UploadSecurityConfig,
+) -> (Vec<UploadedFile>, Vec<(String, String)>) {
     let boundary = match multer::parse_boundary(content_type) {
         Ok(b) => b,
         Err(e) => {
@@ -482,7 +469,10 @@ fn parse_multipart(content_type: &str, body: &[u8], upload_tmp_dir: &str, upload
                 Ok(Some(field)) => {
                     let field_name = field.name().unwrap_or("").to_string();
                     let file_name = field.file_name().map(|s| s.to_string());
-                    let ct = field.content_type().map(|m| m.to_string()).unwrap_or_default();
+                    let ct = field
+                        .content_type()
+                        .map(|m| m.to_string())
+                        .unwrap_or_default();
                     let data = match field.bytes().await {
                         Ok(b) => b.to_vec(),
                         Err(_) => continue,
@@ -521,11 +511,16 @@ fn parse_multipart(content_type: &str, body: &[u8], upload_tmp_dir: &str, upload
 
                         // Scan content for PHP code signatures
                         if upload_security.scan_content {
-                            let content_lower: Vec<u8> = data.iter().map(|b| b.to_ascii_lowercase()).collect();
+                            let content_lower: Vec<u8> =
+                                data.iter().map(|b| b.to_ascii_lowercase()).collect();
                             let mut php_detected = false;
                             for sig in PHP_SIGNATURES {
-                                let sig_lower: Vec<u8> = sig.iter().map(|b| b.to_ascii_lowercase()).collect();
-                                if content_lower.windows(sig_lower.len()).any(|w| w == sig_lower.as_slice()) {
+                                let sig_lower: Vec<u8> =
+                                    sig.iter().map(|b| b.to_ascii_lowercase()).collect();
+                                if content_lower
+                                    .windows(sig_lower.len())
+                                    .any(|w| w == sig_lower.as_slice())
+                                {
                                     php_detected = true;
                                     break;
                                 }
@@ -552,7 +547,11 @@ fn parse_multipart(content_type: &str, body: &[u8], upload_tmp_dir: &str, upload
                         files.push(UploadedFile {
                             field_name,
                             file_name: fname,
-                            content_type: if ct.is_empty() { "application/octet-stream".to_string() } else { ct },
+                            content_type: if ct.is_empty() {
+                                "application/octet-stream".to_string()
+                            } else {
+                                ct
+                            },
                             data,
                             tmp_path,
                         });
@@ -594,9 +593,7 @@ fn futures_stream_once(
 fn futures_core_once_stream(
     data: bytes::Bytes,
 ) -> impl futures_core::Stream<Item = Result<bytes::Bytes, std::io::Error>> {
-    OnceStream {
-        data: Some(data),
-    }
+    OnceStream { data: Some(data) }
 }
 
 /// A stream that yields exactly one item.
@@ -897,7 +894,8 @@ mod tests {
 
     #[test]
     fn parse_json_request() {
-        let raw = b"POST /api HTTP/1.1\r\nContent-Type: application/json\r\n\r\n{\"key\":\"value\"}";
+        let raw =
+            b"POST /api HTTP/1.1\r\nContent-Type: application/json\r\n\r\n{\"key\":\"value\"}";
         let req = FullHttpRequest::parse(raw).unwrap();
         assert!(req.is_json());
         assert!(req.post_params().is_empty()); // JSON body isn't form-decoded
@@ -933,13 +931,8 @@ mod tests {
     fn superglobals_code_contains_expected_vars() {
         let raw = b"GET /test?x=1 HTTP/1.1\r\nHost: localhost\r\nCookie: sid=abc\r\n\r\n";
         let req = FullHttpRequest::parse(raw).unwrap();
-        let code = req.php_superglobals_code(
-            Path::new("/app"),
-            "test.php",
-            "127.0.0.1",
-            8080,
-            false,
-        );
+        let code =
+            req.php_superglobals_code(Path::new("/app"), "test.php", "127.0.0.1", 8080, false);
 
         assert!(code.contains("$_SERVER['REQUEST_METHOD'] = 'GET'"));
         assert!(code.contains("$_SERVER['QUERY_STRING'] = 'x=1'"));
@@ -994,7 +987,10 @@ mod tests {
 
         assert_eq!(structure.resolve_path("/"), "index.php");
         assert_eq!(structure.resolve_path("/info.php"), "info.php");
-        assert_eq!(structure.resolve_path("/api/users.php?id=1"), "api/users.php");
+        assert_eq!(
+            structure.resolve_path("/api/users.php?id=1"),
+            "api/users.php"
+        );
     }
 
     #[test]
@@ -1016,15 +1012,11 @@ mod tests {
 
     #[test]
     fn full_request_body_injection() {
-        let raw = b"POST /api HTTP/1.1\r\nContent-Type: application/json\r\n\r\n{\"name\":\"test\"}";
+        let raw =
+            b"POST /api HTTP/1.1\r\nContent-Type: application/json\r\n\r\n{\"name\":\"test\"}";
         let req = FullHttpRequest::parse(raw).unwrap();
-        let code = req.php_superglobals_code(
-            Path::new("/app"),
-            "index.php",
-            "127.0.0.1",
-            8080,
-            false,
-        );
+        let code =
+            req.php_superglobals_code(Path::new("/app"), "index.php", "127.0.0.1", 8080, false);
         assert!(code.contains("__turbine_raw_body"));
         assert!(code.contains("TurbineInputStream"));
     }
@@ -1036,7 +1028,10 @@ mod tests {
         let security = UploadSecurityConfig::default();
         let fname = "shell.php";
         let fname_lower = fname.to_lowercase();
-        let blocked = security.blocked_extensions.iter().any(|ext| fname_lower.ends_with(&ext.to_lowercase()));
+        let blocked = security
+            .blocked_extensions
+            .iter()
+            .any(|ext| fname_lower.ends_with(&ext.to_lowercase()));
         assert!(blocked, "shell.php should be blocked");
     }
 
@@ -1049,7 +1044,10 @@ mod tests {
             let with_dot = format!("{}.", ext.to_lowercase());
             fname_lower.contains(&with_dot)
         });
-        assert!(blocked, "avatar.php.jpg should be blocked (double extension)");
+        assert!(
+            blocked,
+            "avatar.php.jpg should be blocked (double extension)"
+        );
     }
 
     #[test]
@@ -1069,10 +1067,15 @@ mod tests {
     #[test]
     fn upload_security_blocks_all_php_variants() {
         let security = UploadSecurityConfig::default();
-        for ext in &[".phtml", ".phar", ".php7", ".php8", ".inc", ".phps", ".pht", ".pgif"] {
+        for ext in &[
+            ".phtml", ".phar", ".php7", ".php8", ".inc", ".phps", ".pht", ".pgif",
+        ] {
             let fname = format!("test{ext}");
             let fname_lower = fname.to_lowercase();
-            let blocked = security.blocked_extensions.iter().any(|blocked_ext| fname_lower.ends_with(&blocked_ext.to_lowercase()));
+            let blocked = security
+                .blocked_extensions
+                .iter()
+                .any(|blocked_ext| fname_lower.ends_with(&blocked_ext.to_lowercase()));
             assert!(blocked, "{fname} should be blocked");
         }
     }
@@ -1083,7 +1086,9 @@ mod tests {
         let content_lower: Vec<u8> = data.iter().map(|b| b.to_ascii_lowercase()).collect();
         let detected = PHP_SIGNATURES.iter().any(|sig| {
             let sig_lower: Vec<u8> = sig.iter().map(|b| b.to_ascii_lowercase()).collect();
-            content_lower.windows(sig_lower.len()).any(|w| w == sig_lower.as_slice())
+            content_lower
+                .windows(sig_lower.len())
+                .any(|w| w == sig_lower.as_slice())
         });
         assert!(detected, "Should detect <?php in uploaded content");
     }
@@ -1094,7 +1099,9 @@ mod tests {
         let content_lower: Vec<u8> = data.iter().map(|b| b.to_ascii_lowercase()).collect();
         let detected = PHP_SIGNATURES.iter().any(|sig| {
             let sig_lower: Vec<u8> = sig.iter().map(|b| b.to_ascii_lowercase()).collect();
-            content_lower.windows(sig_lower.len()).any(|w| w == sig_lower.as_slice())
+            content_lower
+                .windows(sig_lower.len())
+                .any(|w| w == sig_lower.as_slice())
         });
         assert!(!detected, "Clean PNG binary should NOT be flagged");
     }
@@ -1105,7 +1112,9 @@ mod tests {
         let content_lower: Vec<u8> = data.iter().map(|b| b.to_ascii_lowercase()).collect();
         let detected = PHP_SIGNATURES.iter().any(|sig| {
             let sig_lower: Vec<u8> = sig.iter().map(|b| b.to_ascii_lowercase()).collect();
-            content_lower.windows(sig_lower.len()).any(|w| w == sig_lower.as_slice())
+            content_lower
+                .windows(sig_lower.len())
+                .any(|w| w == sig_lower.as_slice())
         });
         assert!(detected, "Should detect <?= short tag in content");
     }
@@ -1124,13 +1133,19 @@ mod tests {
         };
         let whitelist = vec!["index.php".to_string()];
         let path = structure.resolve_path("/admin/shell.php");
-        assert!(!whitelist.contains(&path), "admin/shell.php should NOT be in whitelist");
+        assert!(
+            !whitelist.contains(&path),
+            "admin/shell.php should NOT be in whitelist"
+        );
     }
 
     #[test]
     fn execution_whitelist_allows_entry_point() {
         let whitelist = vec!["index.php".to_string()];
-        assert!(whitelist.contains(&"index.php".to_string()), "index.php should be in whitelist");
+        assert!(
+            whitelist.contains(&"index.php".to_string()),
+            "index.php should be in whitelist"
+        );
     }
 
     #[test]

@@ -15,7 +15,10 @@ mod shared_mem;
 mod worker;
 
 pub use error::WorkerError;
-pub use persistent::{PersistentRequest, PersistentResponse, encode_request, decode_response};
-pub use pool::{WorkerPool, WorkerMode, NativeResponse, encode_native_request, read_native_response_from_fd, write_to_fd, worker_event_loop_channel, safe_cstring};
+pub use persistent::{decode_response, encode_request, PersistentRequest, PersistentResponse};
+pub use pool::{
+    encode_native_request, read_native_response_from_fd, safe_cstring, worker_event_loop_channel,
+    write_to_fd, NativeResponse, WorkerMode, WorkerPool,
+};
 pub use shared_mem::SharedMemory;
-pub use worker::{Worker, WorkerState, WorkerKind};
+pub use worker::{Worker, WorkerKind, WorkerState};

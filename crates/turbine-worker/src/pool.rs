@@ -1,8 +1,8 @@
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::os::unix::io::{FromRawFd, RawFd};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use nix::sys::wait::{waitpid, WaitPidFlag};
 use nix::unistd::{fork, ForkResult};
@@ -181,12 +181,7 @@ impl WorkerPool {
                     libc::close(resp_write);
                 }
 
-                let worker = Worker::new(
-                    child,
-                    self.config.max_requests,
-                    cmd_write,
-                    resp_read,
-                );
+                let worker = Worker::new(child, self.config.max_requests, cmd_write, resp_read);
 
                 // Master keeps cmd_write and resp_read (no forget needed)
                 self.idle_queue.push_back(self.workers.len());
@@ -276,8 +271,8 @@ impl WorkerPool {
                 let mut reaped = false;
                 for _ in 0..10 {
                     match nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
-                        Ok(nix::sys::wait::WaitStatus::Exited(_, _)) |
-                        Ok(nix::sys::wait::WaitStatus::Signaled(_, _, _)) => {
+                        Ok(nix::sys::wait::WaitStatus::Exited(_, _))
+                        | Ok(nix::sys::wait::WaitStatus::Signaled(_, _, _)) => {
                             reaped = true;
                             break;
                         }
@@ -417,7 +412,10 @@ impl WorkerPool {
         let index = self.workers.len();
         let is_master = self.spawn_one(index, worker_main)?;
         if is_master {
-            info!(total = self.workers.len(), "Scaled up: spawned additional worker");
+            info!(
+                total = self.workers.len(),
+                "Scaled up: spawned additional worker"
+            );
         }
         Ok(is_master)
     }
@@ -444,12 +442,18 @@ impl WorkerPool {
 
     /// Count of workers that are currently busy.
     pub fn busy_count(&self) -> usize {
-        self.workers.iter().filter(|w| w.state() == WorkerState::Busy).count()
+        self.workers
+            .iter()
+            .filter(|w| w.state() == WorkerState::Busy)
+            .count()
     }
 
     /// Count of workers that are alive (idle or busy).
     pub fn alive_count(&self) -> usize {
-        self.workers.iter().filter(|w| matches!(w.state(), WorkerState::Idle | WorkerState::Busy)).count()
+        self.workers
+            .iter()
+            .filter(|w| matches!(w.state(), WorkerState::Idle | WorkerState::Busy))
+            .count()
     }
 
     /// Get the pool's worker mode.
@@ -472,7 +476,11 @@ impl WorkerPool {
     where
         F: Fn(RawFd, RawFd) + Send + 'static + Clone,
     {
-        info!(count = self.config.workers, mode = "thread", "Spawning worker threads");
+        info!(
+            count = self.config.workers,
+            mode = "thread",
+            "Spawning worker threads"
+        );
 
         // Validate ZTS at runtime
         let is_zts = unsafe { turbine_php_sys::turbine_php_is_thread_safe() };
@@ -518,7 +526,10 @@ impl WorkerPool {
                 // Initialize TSRM context for this thread (ZTS only)
                 let init_rc = unsafe { turbine_php_sys::turbine_thread_init() };
                 if init_rc != 0 {
-                    error!(thread_id = thread_id, "Failed to initialize TSRM context for worker thread");
+                    error!(
+                        thread_id = thread_id,
+                        "Failed to initialize TSRM context for worker thread"
+                    );
                     alive_clone.store(false, Ordering::Release);
                     unsafe {
                         libc::close(cmd_read);
@@ -531,7 +542,9 @@ impl WorkerPool {
                 worker_main(cmd_read, resp_write);
 
                 // Clean up TSRM context
-                unsafe { turbine_php_sys::turbine_thread_cleanup(); }
+                unsafe {
+                    turbine_php_sys::turbine_thread_cleanup();
+                }
 
                 // Close our ends of the pipes
                 unsafe {
@@ -549,11 +562,21 @@ impl WorkerPool {
             })?;
 
         // Master keeps cmd_write and resp_read
-        let worker = Worker::new_thread(alive, thread_id, self.config.max_requests, cmd_write, resp_read);
+        let worker = Worker::new_thread(
+            alive,
+            thread_id,
+            self.config.max_requests,
+            cmd_write,
+            resp_read,
+        );
         self.idle_queue.push_back(self.workers.len());
         self.workers.push(worker);
 
-        debug!(thread_id = thread_id, index = index, "Worker thread spawned");
+        debug!(
+            thread_id = thread_id,
+            index = index,
+            "Worker thread spawned"
+        );
         Ok(())
     }
 
@@ -564,7 +587,10 @@ impl WorkerPool {
     {
         let index = self.workers.len();
         self.spawn_one_thread(index, worker_main)?;
-        info!(total = self.workers.len(), "Scaled up: spawned additional worker thread");
+        info!(
+            total = self.workers.len(),
+            "Scaled up: spawned additional worker thread"
+        );
         Ok(())
     }
 
@@ -613,7 +639,9 @@ impl WorkerPool {
                         return;
                     }
                     wm(cmd_read, resp_write);
-                    unsafe { turbine_php_sys::turbine_thread_cleanup(); }
+                    unsafe {
+                        turbine_php_sys::turbine_thread_cleanup();
+                    }
                     unsafe {
                         libc::close(cmd_read);
                         libc::close(resp_write);
@@ -622,9 +650,19 @@ impl WorkerPool {
                 })
                 .map_err(|_| WorkerError::Fork(nix::Error::ENOMEM))?;
 
-            let worker = Worker::new_thread(alive, thread_id, self.config.max_requests, cmd_write, resp_read);
+            let worker = Worker::new_thread(
+                alive,
+                thread_id,
+                self.config.max_requests,
+                cmd_write,
+                resp_read,
+            );
             self.replace_worker(idx, worker);
-            info!(thread_id = thread_id, index = idx, "Worker thread respawned");
+            info!(
+                thread_id = thread_id,
+                index = idx,
+                "Worker thread respawned"
+            );
         }
 
         Ok(())
@@ -632,7 +670,10 @@ impl WorkerPool {
 
     /// Collect (cmd_fd, resp_fd) for all workers (used by ThreadDispatch).
     pub fn worker_fds(&self) -> Vec<(RawFd, RawFd)> {
-        self.workers.iter().map(|w| (w.cmd_fd(), w.resp_fd())).collect()
+        self.workers
+            .iter()
+            .map(|w| (w.cmd_fd(), w.resp_fd()))
+            .collect()
     }
 
     /// Register a thread worker that uses in-memory channels instead of pipes.
@@ -690,7 +731,9 @@ pub fn worker_event_loop(cmd_fd: RawFd, resp_fd: RawFd) {
     // Re-install our custom ub_write/header_handler in the child process.
     // The parent's php_embed_init sets them up, but after fork the child
     // must reinstall to ensure its own thread-local buffers are used.
-    unsafe { output::install_output_capture(); }
+    unsafe {
+        output::install_output_capture();
+    }
 
     // Signal ready (with zero-length output)
     let _ = write_response(&mut resp_writer, WorkerResp::Ready, &[]);
@@ -722,7 +765,11 @@ pub fn worker_event_loop(cmd_fd: RawFd, resp_fd: RawFd) {
                 }
                 let code = String::from_utf8_lossy(&code_buf);
 
-                debug!(pid = std::process::id(), code_len = code_len, "Executing PHP");
+                debug!(
+                    pid = std::process::id(),
+                    code_len = code_len,
+                    "Executing PHP"
+                );
 
                 // Execute PHP and capture output
                 output::clear_output_buffer();
@@ -735,8 +782,7 @@ pub fn worker_event_loop(cmd_fd: RawFd, resp_fd: RawFd) {
                         continue;
                     }
                 };
-                let c_name =
-                    std::ffi::CString::new("turbine_worker").expect("static string");
+                let c_name = std::ffi::CString::new("turbine_worker").expect("static string");
 
                 let result = unsafe {
                     turbine_php_sys::zend_eval_string(
@@ -829,7 +875,10 @@ pub fn worker_event_loop(cmd_fd: RawFd, resp_fd: RawFd) {
 ///     [2 byte key_len LE][key bytes][2 byte val_len LE][val bytes]
 ///   [4 byte body_len LE][body bytes]
 pub fn worker_event_loop_native(cmd_fd: RawFd, resp_fd: RawFd) {
-    debug!(pid = std::process::id(), "Native SAPI worker event loop started");
+    debug!(
+        pid = std::process::id(),
+        "Native SAPI worker event loop started"
+    );
 
     let mut cmd_reader = unsafe { std::fs::File::from_raw_fd(cmd_fd) };
     let mut resp_writer = unsafe { std::fs::File::from_raw_fd(resp_fd) };
@@ -861,18 +910,28 @@ pub fn worker_event_loop_native(cmd_fd: RawFd, resp_fd: RawFd) {
             x if x == WorkerCmd::ExecuteNative as u8 => {
                 // Read total payload length
                 let mut len_buf = [0u8; 4];
-                if cmd_reader.read_exact(&mut len_buf).is_err() { break; }
+                if cmd_reader.read_exact(&mut len_buf).is_err() {
+                    break;
+                }
                 let total_len = u32::from_le_bytes(len_buf) as usize;
 
                 // Read the entire binary payload
                 let mut payload = vec![0u8; total_len];
-                if cmd_reader.read_exact(&mut payload).is_err() { break; }
+                if cmd_reader.read_exact(&mut payload).is_err() {
+                    break;
+                }
 
                 // Parse binary request
                 let req = match NativeRequest::decode(&payload) {
                     Some(r) => r,
                     None => {
-                        let _ = write_native_response(&mut resp_writer, WorkerResp::Error, 500, &[], b"Failed to decode native request");
+                        let _ = write_native_response(
+                            &mut resp_writer,
+                            WorkerResp::Error,
+                            500,
+                            &[],
+                            b"Failed to decode native request",
+                        );
                         continue;
                     }
                 };
@@ -892,14 +951,20 @@ pub fn worker_event_loop_native(cmd_fd: RawFd, resp_fd: RawFd) {
                 let c_scriptname = safe_cstring(req.script_name.as_bytes());
 
                 // Build header key/value CStrings
-                let c_keys: Vec<std::ffi::CString> = req.headers.iter()
+                let c_keys: Vec<std::ffi::CString> = req
+                    .headers
+                    .iter()
                     .map(|(k, _)| safe_cstring(k.as_bytes()))
                     .collect();
-                let c_vals: Vec<std::ffi::CString> = req.headers.iter()
+                let c_vals: Vec<std::ffi::CString> = req
+                    .headers
+                    .iter()
                     .map(|(_, v)| safe_cstring(v.as_bytes()))
                     .collect();
-                let key_ptrs: Vec<*const std::ffi::c_char> = c_keys.iter().map(|k| k.as_ptr()).collect();
-                let val_ptrs: Vec<*const std::ffi::c_char> = c_vals.iter().map(|v| v.as_ptr()).collect();
+                let key_ptrs: Vec<*const std::ffi::c_char> =
+                    c_keys.iter().map(|k| k.as_ptr()).collect();
+                let val_ptrs: Vec<*const std::ffi::c_char> =
+                    c_vals.iter().map(|v| v.as_ptr()).collect();
 
                 let content_length: libc::c_long = if req.body.is_empty() {
                     -1
@@ -913,9 +978,17 @@ pub fn worker_event_loop_native(cmd_fd: RawFd, resp_fd: RawFd) {
                         c_method.as_ptr(),
                         c_uri.as_ptr(),
                         c_qs.as_ptr(),
-                        if req.content_type.is_empty() { std::ptr::null() } else { c_ct.as_ptr() },
+                        if req.content_type.is_empty() {
+                            std::ptr::null()
+                        } else {
+                            c_ct.as_ptr()
+                        },
                         content_length,
-                        if req.cookie.is_empty() { std::ptr::null() } else { c_cookie.as_ptr() },
+                        if req.cookie.is_empty() {
+                            std::ptr::null()
+                        } else {
+                            c_cookie.as_ptr()
+                        },
                         c_script.as_ptr(),
                         c_docroot.as_ptr(),
                         c_addr.as_ptr(),
@@ -924,11 +997,23 @@ pub fn worker_event_loop_native(cmd_fd: RawFd, resp_fd: RawFd) {
                         req.is_https as libc::c_int,
                         c_pathinfo.as_ptr(),
                         c_scriptname.as_ptr(),
-                        if req.body.is_empty() { std::ptr::null() } else { req.body.as_ptr() as *const _ },
+                        if req.body.is_empty() {
+                            std::ptr::null()
+                        } else {
+                            req.body.as_ptr() as *const _
+                        },
                         req.body.len(),
                         req.headers.len() as libc::c_int,
-                        if key_ptrs.is_empty() { std::ptr::null() } else { key_ptrs.as_ptr() },
-                        if val_ptrs.is_empty() { std::ptr::null() } else { val_ptrs.as_ptr() },
+                        if key_ptrs.is_empty() {
+                            std::ptr::null()
+                        } else {
+                            key_ptrs.as_ptr()
+                        },
+                        if val_ptrs.is_empty() {
+                            std::ptr::null()
+                        } else {
+                            val_ptrs.as_ptr()
+                        },
                     );
 
                     // 2. php_request_startup — PHP auto-populates $_SERVER, $_GET, $_POST, $_COOKIE
@@ -951,9 +1036,21 @@ pub fn worker_event_loop_native(cmd_fd: RawFd, resp_fd: RawFd) {
                     turbine_php_sys::php_request_shutdown(std::ptr::null_mut());
 
                     if result == turbine_php_sys::SUCCESS {
-                        let _ = write_native_response(&mut resp_writer, WorkerResp::Ok, status, &headers, &body);
+                        let _ = write_native_response(
+                            &mut resp_writer,
+                            WorkerResp::Ok,
+                            status,
+                            &headers,
+                            &body,
+                        );
                     } else {
-                        let _ = write_native_response(&mut resp_writer, WorkerResp::Error, status, &headers, &body);
+                        let _ = write_native_response(
+                            &mut resp_writer,
+                            WorkerResp::Error,
+                            status,
+                            &headers,
+                            &body,
+                        );
                     }
                 }
             }
@@ -963,7 +1060,13 @@ pub fn worker_event_loop_native(cmd_fd: RawFd, resp_fd: RawFd) {
             }
             other => {
                 warn!(cmd = other, "Unknown command byte");
-                let _ = write_native_response(&mut resp_writer, WorkerResp::Error, 500, &[], b"Unknown command");
+                let _ = write_native_response(
+                    &mut resp_writer,
+                    WorkerResp::Error,
+                    500,
+                    &[],
+                    b"Unknown command",
+                );
             }
         }
     }
@@ -1025,7 +1128,8 @@ pub fn worker_event_loop_channel(
         }
 
         if cmd == WorkerCmd::ExecuteNative as u8 && payload.len() > 5 {
-            let total_len = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]) as usize;
+            let total_len =
+                u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]) as usize;
             let request_data = &payload[5..5 + total_len.min(payload.len() - 5)];
 
             let req = match NativeRequest::decode(request_data) {
@@ -1052,25 +1156,43 @@ pub fn worker_event_loop_channel(
             let c_pathinfo = safe_cstring(req.path_info.as_bytes());
             let c_scriptname = safe_cstring(req.script_name.as_bytes());
 
-            let c_keys: Vec<std::ffi::CString> = req.headers.iter()
+            let c_keys: Vec<std::ffi::CString> = req
+                .headers
+                .iter()
                 .map(|(k, _)| safe_cstring(k.as_bytes()))
                 .collect();
-            let c_vals: Vec<std::ffi::CString> = req.headers.iter()
+            let c_vals: Vec<std::ffi::CString> = req
+                .headers
+                .iter()
                 .map(|(_, v)| safe_cstring(v.as_bytes()))
                 .collect();
-            let key_ptrs: Vec<*const std::ffi::c_char> = c_keys.iter().map(|k| k.as_ptr()).collect();
-            let val_ptrs: Vec<*const std::ffi::c_char> = c_vals.iter().map(|v| v.as_ptr()).collect();
+            let key_ptrs: Vec<*const std::ffi::c_char> =
+                c_keys.iter().map(|k| k.as_ptr()).collect();
+            let val_ptrs: Vec<*const std::ffi::c_char> =
+                c_vals.iter().map(|v| v.as_ptr()).collect();
 
-            let content_length: libc::c_long = if req.body.is_empty() { -1 } else { req.body.len() as libc::c_long };
+            let content_length: libc::c_long = if req.body.is_empty() {
+                -1
+            } else {
+                req.body.len() as libc::c_long
+            };
 
             unsafe {
                 turbine_php_sys::turbine_sapi_set_request(
                     c_method.as_ptr(),
                     c_uri.as_ptr(),
                     c_qs.as_ptr(),
-                    if req.content_type.is_empty() { std::ptr::null() } else { c_ct.as_ptr() },
+                    if req.content_type.is_empty() {
+                        std::ptr::null()
+                    } else {
+                        c_ct.as_ptr()
+                    },
                     content_length,
-                    if req.cookie.is_empty() { std::ptr::null() } else { c_cookie.as_ptr() },
+                    if req.cookie.is_empty() {
+                        std::ptr::null()
+                    } else {
+                        c_cookie.as_ptr()
+                    },
                     c_script.as_ptr(),
                     c_docroot.as_ptr(),
                     c_addr.as_ptr(),
@@ -1079,11 +1201,23 @@ pub fn worker_event_loop_channel(
                     req.is_https as libc::c_int,
                     c_pathinfo.as_ptr(),
                     c_scriptname.as_ptr(),
-                    if req.body.is_empty() { std::ptr::null() } else { req.body.as_ptr() as *const _ },
+                    if req.body.is_empty() {
+                        std::ptr::null()
+                    } else {
+                        req.body.as_ptr() as *const _
+                    },
                     req.body.len(),
                     req.headers.len() as libc::c_int,
-                    if key_ptrs.is_empty() { std::ptr::null() } else { key_ptrs.as_ptr() },
-                    if val_ptrs.is_empty() { std::ptr::null() } else { val_ptrs.as_ptr() },
+                    if key_ptrs.is_empty() {
+                        std::ptr::null()
+                    } else {
+                        key_ptrs.as_ptr()
+                    },
+                    if val_ptrs.is_empty() {
+                        std::ptr::null()
+                    } else {
+                        val_ptrs.as_ptr()
+                    },
                 );
 
                 turbine_php_sys::php_request_startup();
@@ -1138,10 +1272,14 @@ impl NativeRequest {
         let mut pos = 0;
 
         let read_str = |data: &[u8], pos: &mut usize| -> Option<String> {
-            if *pos + 2 > data.len() { return None; }
+            if *pos + 2 > data.len() {
+                return None;
+            }
             let len = u16::from_le_bytes([data[*pos], data[*pos + 1]]) as usize;
             *pos += 2;
-            if *pos + len > data.len() { return None; }
+            if *pos + len > data.len() {
+                return None;
+            }
             let s = String::from_utf8_lossy(&data[*pos..*pos + len]).into_owned();
             *pos += len;
             Some(s)
@@ -1153,23 +1291,32 @@ impl NativeRequest {
         let query_string = read_str(data, &mut pos)?;
         let content_type = read_str(data, &mut pos)?;
 
-        if pos + 4 > data.len() { return None; }
-        let _content_length = i32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]);
+        if pos + 4 > data.len() {
+            return None;
+        }
+        let _content_length =
+            i32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
         pos += 4;
 
         let cookie = read_str(data, &mut pos)?;
         let document_root = read_str(data, &mut pos)?;
         let remote_addr = read_str(data, &mut pos)?;
 
-        if pos + 2 > data.len() { return None; }
+        if pos + 2 > data.len() {
+            return None;
+        }
         let remote_port = u16::from_le_bytes([data[pos], data[pos + 1]]);
         pos += 2;
 
-        if pos + 2 > data.len() { return None; }
+        if pos + 2 > data.len() {
+            return None;
+        }
         let server_port = u16::from_le_bytes([data[pos], data[pos + 1]]);
         pos += 2;
 
-        if pos + 1 > data.len() { return None; }
+        if pos + 1 > data.len() {
+            return None;
+        }
         let is_https = data[pos] != 0;
         pos += 1;
 
@@ -1177,15 +1324,22 @@ impl NativeRequest {
         let script_name = read_str(data, &mut pos)?;
 
         // Body
-        if pos + 4 > data.len() { return None; }
-        let body_len = u32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]) as usize;
+        if pos + 4 > data.len() {
+            return None;
+        }
+        let body_len =
+            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
         pos += 4;
-        if pos + body_len > data.len() { return None; }
+        if pos + body_len > data.len() {
+            return None;
+        }
         let body = data[pos..pos + body_len].to_vec();
         pos += body_len;
 
         // Headers
-        if pos + 2 > data.len() { return None; }
+        if pos + 2 > data.len() {
+            return None;
+        }
         let header_count = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
         pos += 2;
 
@@ -1197,9 +1351,21 @@ impl NativeRequest {
         }
 
         Some(NativeRequest {
-            script_path, method, uri, query_string, content_type, cookie,
-            document_root, remote_addr, remote_port, server_port, is_https,
-            path_info, script_name, body, headers,
+            script_path,
+            method,
+            uri,
+            query_string,
+            content_type,
+            cookie,
+            document_root,
+            remote_addr,
+            remote_port,
+            server_port,
+            is_https,
+            path_info,
+            script_name,
+            body,
+            headers,
         })
     }
 }
@@ -1303,7 +1469,11 @@ pub fn read_native_response_from_fd(resp_fd: RawFd) -> std::io::Result<NativeRes
     impl Read for RawReader {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
             let ret = unsafe { libc::read(self.0, buf.as_mut_ptr() as *mut _, buf.len()) };
-            if ret < 0 { Err(std::io::Error::last_os_error()) } else { Ok(ret as usize) }
+            if ret < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(ret as usize)
+            }
         }
     }
 
@@ -1327,13 +1497,17 @@ pub fn read_native_response_from_fd(resp_fd: RawFd) -> std::io::Result<NativeRes
         r.read_exact(&mut kl)?;
         let key_len = u16::from_le_bytes(kl) as usize;
         let mut key = vec![0u8; key_len];
-        if key_len > 0 { r.read_exact(&mut key)?; }
+        if key_len > 0 {
+            r.read_exact(&mut key)?;
+        }
 
         let mut vl = [0u8; 2];
         r.read_exact(&mut vl)?;
         let val_len = u16::from_le_bytes(vl) as usize;
         let mut val = vec![0u8; val_len];
-        if val_len > 0 { r.read_exact(&mut val)?; }
+        if val_len > 0 {
+            r.read_exact(&mut val)?;
+        }
 
         headers.push((
             String::from_utf8_lossy(&key).into_owned(),
@@ -1345,9 +1519,16 @@ pub fn read_native_response_from_fd(resp_fd: RawFd) -> std::io::Result<NativeRes
     r.read_exact(&mut blen)?;
     let body_len = u32::from_le_bytes(blen) as usize;
     let mut body = vec![0u8; body_len];
-    if body_len > 0 { r.read_exact(&mut body)?; }
+    if body_len > 0 {
+        r.read_exact(&mut body)?;
+    }
 
-    Ok(NativeResponse { success, http_status, headers, body })
+    Ok(NativeResponse {
+        success,
+        http_status,
+        headers,
+        body,
+    })
 }
 
 /// Read a worker response directly from a raw resp_fd WITHOUT holding any lock.
@@ -1356,7 +1537,9 @@ pub fn read_native_response_from_fd(resp_fd: RawFd) -> std::io::Result<NativeRes
 /// on the pipe read, enabling true concurrent execution across multiple workers.
 ///
 /// Protocol: [1 byte status][4 byte payload_len LE][payload bytes]
-pub fn read_response_from_fd(resp_fd: std::os::unix::io::RawFd) -> std::io::Result<(bool, Vec<u8>)> {
+pub fn read_response_from_fd(
+    resp_fd: std::os::unix::io::RawFd,
+) -> std::io::Result<(bool, Vec<u8>)> {
     use std::io::Read;
 
     struct RawReader(std::os::unix::io::RawFd);
@@ -1385,8 +1568,7 @@ pub fn read_response_from_fd(resp_fd: std::os::unix::io::RawFd) -> std::io::Resu
         r.read_exact(&mut payload)?;
     }
 
-    let success = status_buf[0] == WorkerResp::Ok as u8
-        || status_buf[0] == WorkerResp::Ready as u8;
+    let success = status_buf[0] == WorkerResp::Ok as u8 || status_buf[0] == WorkerResp::Ready as u8;
 
     Ok((success, payload))
 }
@@ -1552,7 +1734,8 @@ mod tests {
 
         // Skip cmd byte (1) + length (4)
         assert_eq!(encoded[0], WorkerCmd::ExecuteNative as u8);
-        let total_len = u32::from_le_bytes([encoded[1], encoded[2], encoded[3], encoded[4]]) as usize;
+        let total_len =
+            u32::from_le_bytes([encoded[1], encoded[2], encoded[3], encoded[4]]) as usize;
         let payload = &encoded[5..5 + total_len];
 
         let decoded = NativeRequest::decode(payload).expect("decode failed");
@@ -1597,7 +1780,8 @@ mod tests {
             &headers,
         );
 
-        let total_len = u32::from_le_bytes([encoded[1], encoded[2], encoded[3], encoded[4]]) as usize;
+        let total_len =
+            u32::from_le_bytes([encoded[1], encoded[2], encoded[3], encoded[4]]) as usize;
         let payload = &encoded[5..5 + total_len];
 
         let decoded = NativeRequest::decode(payload).expect("decode failed");
@@ -1616,21 +1800,47 @@ mod tests {
         assert_eq!(decoded.script_name, "/index.php");
         assert_eq!(decoded.body, body);
         assert_eq!(decoded.headers.len(), 3);
-        assert_eq!(decoded.headers[0], ("Content-Type".to_string(), "application/x-www-form-urlencoded".to_string()));
-        assert_eq!(decoded.headers[1], ("Host".to_string(), "example.com".to_string()));
-        assert_eq!(decoded.headers[2], ("Accept".to_string(), "text/html".to_string()));
+        assert_eq!(
+            decoded.headers[0],
+            (
+                "Content-Type".to_string(),
+                "application/x-www-form-urlencoded".to_string()
+            )
+        );
+        assert_eq!(
+            decoded.headers[1],
+            ("Host".to_string(), "example.com".to_string())
+        );
+        assert_eq!(
+            decoded.headers[2],
+            ("Accept".to_string(), "text/html".to_string())
+        );
     }
 
     #[test]
     fn native_request_roundtrip_binary_body() {
         let body: Vec<u8> = (0..=255).collect();
         let encoded = encode_native_request(
-            "/upload.php", "PUT", "/upload", "", "application/octet-stream",
-            body.len() as i32, "", "/", "::1", 0, 80, false,
-            "/upload", "/upload.php", &body, &[],
+            "/upload.php",
+            "PUT",
+            "/upload",
+            "",
+            "application/octet-stream",
+            body.len() as i32,
+            "",
+            "/",
+            "::1",
+            0,
+            80,
+            false,
+            "/upload",
+            "/upload.php",
+            &body,
+            &[],
         );
 
-        let total_len = u32::from_le_bytes([encoded[1], encoded[2], encoded[3], encoded[4]]) as usize;
+        let total_len =
+            u32::from_le_bytes([encoded[1], encoded[2], encoded[3], encoded[4]]) as usize;
         let payload = &encoded[5..5 + total_len];
 
         let decoded = NativeRequest::decode(payload).expect("decode failed");
@@ -1664,11 +1874,26 @@ mod tests {
             .collect();
 
         let encoded = encode_native_request(
-            "/test.php", "GET", "/", "", "", -1, "", "/", "127.0.0.1",
-            0, 80, false, "/", "/test.php", &[], &headers,
+            "/test.php",
+            "GET",
+            "/",
+            "",
+            "",
+            -1,
+            "",
+            "/",
+            "127.0.0.1",
+            0,
+            80,
+            false,
+            "/",
+            "/test.php",
+            &[],
+            &headers,
         );
 
-        let total_len = u32::from_le_bytes([encoded[1], encoded[2], encoded[3], encoded[4]]) as usize;
+        let total_len =
+            u32::from_le_bytes([encoded[1], encoded[2], encoded[3], encoded[4]]) as usize;
         let payload = &encoded[5..5 + total_len];
 
         let decoded = NativeRequest::decode(payload).expect("decode failed");
@@ -1687,9 +1912,7 @@ mod tests {
 
         // Write a structured native response
         let mut writer = unsafe { std::fs::File::from_raw_fd(resp_write) };
-        let headers = vec![
-            ("Content-Type".to_string(), "application/json".to_string()),
-        ];
+        let headers = vec![("Content-Type".to_string(), "application/json".to_string())];
         write_native_response(&mut writer, WorkerResp::Ok, 200, &headers, b"{\"ok\":true}")
             .expect("write failed");
         // Don't close — from_raw_fd owns it
@@ -1702,7 +1925,10 @@ mod tests {
         assert_eq!(resp.headers[0].0, "Content-Type");
         assert_eq!(resp.body, b"{\"ok\":true}");
 
-        unsafe { libc::close(resp_read); libc::close(resp_write); }
+        unsafe {
+            libc::close(resp_read);
+            libc::close(resp_write);
+        }
     }
 
     #[test]
@@ -1722,6 +1948,9 @@ mod tests {
         assert!(resp.headers.is_empty());
         assert_eq!(resp.body, b"Fatal error");
 
-        unsafe { libc::close(resp_read); libc::close(resp_write); }
+        unsafe {
+            libc::close(resp_read);
+            libc::close(resp_write);
+        }
     }
 }

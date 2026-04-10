@@ -208,8 +208,11 @@ pub fn extract_structured_logs(body: &[u8]) -> (Vec<u8>, Vec<PhpLogEntry>) {
 fn parse_log_json(json_str: &str) -> Option<PhpLogEntry> {
     // Minimal JSON parsing without pulling in serde_json — we just need level, msg, context.
     // Format: {"level":"warn","msg":"text","key1":"val1","key2":"val2"}
-    let trimmed = json_str.trim().trim_start_matches('{').trim_end_matches('}');
-    
+    let trimmed = json_str
+        .trim()
+        .trim_start_matches('{')
+        .trim_end_matches('}');
+
     let mut level = "info".to_string();
     let mut message = String::new();
     let mut context = Vec::new();
@@ -309,9 +312,15 @@ mod tests {
     #[test]
     fn test_extract_early_hints() {
         let headers = vec![
-            ("Link".to_string(), "</style.css>; rel=preload; as=style".to_string()),
+            (
+                "Link".to_string(),
+                "</style.css>; rel=preload; as=style".to_string(),
+            ),
             ("Content-Type".to_string(), "text/html".to_string()),
-            ("Link".to_string(), "</app.js>; rel=preload; as=script".to_string()),
+            (
+                "Link".to_string(),
+                "</app.js>; rel=preload; as=script".to_string(),
+            ),
         ];
         let hints = extract_early_hints(&headers);
         assert_eq!(hints.len(), 2);
@@ -323,18 +332,23 @@ mod tests {
     fn test_check_x_sendfile() {
         let headers = vec![
             ("Content-Type".to_string(), "text/html".to_string()),
-            ("X-Accel-Redirect".to_string(), "/files/report.pdf".to_string()),
+            (
+                "X-Accel-Redirect".to_string(),
+                "/files/report.pdf".to_string(),
+            ),
         ];
-        assert_eq!(check_x_sendfile(&headers), Some("/files/report.pdf".to_string()));
+        assert_eq!(
+            check_x_sendfile(&headers),
+            Some("/files/report.pdf".to_string())
+        );
 
-        let headers_sendfile = vec![
-            ("x-sendfile".to_string(), "/data/file.zip".to_string()),
-        ];
-        assert_eq!(check_x_sendfile(&headers_sendfile), Some("/data/file.zip".to_string()));
+        let headers_sendfile = vec![("x-sendfile".to_string(), "/data/file.zip".to_string())];
+        assert_eq!(
+            check_x_sendfile(&headers_sendfile),
+            Some("/data/file.zip".to_string())
+        );
 
-        let no_sendfile = vec![
-            ("Content-Type".to_string(), "text/html".to_string()),
-        ];
+        let no_sendfile = vec![("Content-Type".to_string(), "text/html".to_string())];
         assert_eq!(check_x_sendfile(&no_sendfile), None);
     }
 

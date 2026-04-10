@@ -12,7 +12,7 @@ use std::cell::RefCell;
 use libc::{c_char, c_int, c_void, size_t};
 use tracing::trace;
 
-use turbine_php_sys::{sapi_header_struct, sapi_module, SapiUbWrite, read_sapi_response_code};
+use turbine_php_sys::{read_sapi_response_code, sapi_header_struct, sapi_module, SapiUbWrite};
 
 thread_local! {
     /// Buffer that accumulates PHP output for the current request.
@@ -78,7 +78,8 @@ unsafe extern "C" fn turbine_header_handler(
                 let header_ptr = (*sapi_header).header;
                 let header_len = (*sapi_header).header_len;
                 if !header_ptr.is_null() && header_len > 0 {
-                    let header_bytes = std::slice::from_raw_parts(header_ptr as *const u8, header_len);
+                    let header_bytes =
+                        std::slice::from_raw_parts(header_ptr as *const u8, header_len);
                     if let Ok(header_str) = std::str::from_utf8(header_bytes) {
                         let name = header_str.trim().to_lowercase();
                         HEADER_BUFFER.with(|buf| {
@@ -94,7 +95,8 @@ unsafe extern "C" fn turbine_header_handler(
                 let header_ptr = (*sapi_header).header;
                 let header_len = (*sapi_header).header_len;
                 if !header_ptr.is_null() && header_len > 0 {
-                    let header_bytes = std::slice::from_raw_parts(header_ptr as *const u8, header_len);
+                    let header_bytes =
+                        std::slice::from_raw_parts(header_ptr as *const u8, header_len);
                     if let Ok(header_str) = std::str::from_utf8(header_bytes) {
                         // Check for HTTP status line: "HTTP/1.1 302 Found"
                         if header_str.starts_with("HTTP/") {
@@ -154,16 +156,12 @@ pub fn clear_output_buffer() {
 
 /// Take the accumulated output, leaving the buffer empty.
 pub fn take_output() -> Vec<u8> {
-    OUTPUT_BUFFER.with(|buf| {
-        std::mem::take(&mut *buf.borrow_mut())
-    })
+    OUTPUT_BUFFER.with(|buf| std::mem::take(&mut *buf.borrow_mut()))
 }
 
 /// Take the accumulated HTTP headers, leaving the buffer empty.
 pub fn take_headers() -> Vec<(String, String)> {
-    HEADER_BUFFER.with(|buf| {
-        std::mem::take(&mut *buf.borrow_mut())
-    })
+    HEADER_BUFFER.with(|buf| std::mem::take(&mut *buf.borrow_mut()))
 }
 
 /// Get the HTTP response status code set by PHP.
@@ -206,7 +204,10 @@ mod tests {
     fn clear_output_buffer_resets_all() {
         // Set some state
         OUTPUT_BUFFER.with(|buf| buf.borrow_mut().extend_from_slice(b"hello"));
-        HEADER_BUFFER.with(|buf| buf.borrow_mut().push(("X-Test".to_string(), "val".to_string())));
+        HEADER_BUFFER.with(|buf| {
+            buf.borrow_mut()
+                .push(("X-Test".to_string(), "val".to_string()))
+        });
         RESPONSE_CODE.with(|rc| *rc.borrow_mut() = 404);
 
         clear_output_buffer();
@@ -391,8 +392,16 @@ mod tests {
         let (mut hdr1, _b1) = make_sapi_header("Set-Cookie: a=1");
         let (mut hdr2, _b2) = make_sapi_header("Set-Cookie: b=2");
         unsafe {
-            turbine_header_handler(&mut hdr1 as *mut _ as *mut c_void, SAPI_HEADER_ADD, std::ptr::null_mut());
-            turbine_header_handler(&mut hdr2 as *mut _ as *mut c_void, SAPI_HEADER_ADD, std::ptr::null_mut());
+            turbine_header_handler(
+                &mut hdr1 as *mut _ as *mut c_void,
+                SAPI_HEADER_ADD,
+                std::ptr::null_mut(),
+            );
+            turbine_header_handler(
+                &mut hdr2 as *mut _ as *mut c_void,
+                SAPI_HEADER_ADD,
+                std::ptr::null_mut(),
+            );
         }
         let headers = take_headers();
         assert_eq!(headers.len(), 2);
@@ -406,8 +415,16 @@ mod tests {
         let (mut hdr1, _b1) = make_sapi_header("Content-Type: text/plain");
         let (mut hdr2, _b2) = make_sapi_header("Content-Type: application/json");
         unsafe {
-            turbine_header_handler(&mut hdr1 as *mut _ as *mut c_void, SAPI_HEADER_REPLACE, std::ptr::null_mut());
-            turbine_header_handler(&mut hdr2 as *mut _ as *mut c_void, SAPI_HEADER_REPLACE, std::ptr::null_mut());
+            turbine_header_handler(
+                &mut hdr1 as *mut _ as *mut c_void,
+                SAPI_HEADER_REPLACE,
+                std::ptr::null_mut(),
+            );
+            turbine_header_handler(
+                &mut hdr2 as *mut _ as *mut c_void,
+                SAPI_HEADER_REPLACE,
+                std::ptr::null_mut(),
+            );
         }
         let headers = take_headers();
         assert_eq!(headers.len(), 1);
@@ -423,7 +440,11 @@ mod tests {
             b.push(("B".to_string(), "2".to_string()));
         });
         unsafe {
-            turbine_header_handler(std::ptr::null_mut(), SAPI_HEADER_DELETE_ALL, std::ptr::null_mut());
+            turbine_header_handler(
+                std::ptr::null_mut(),
+                SAPI_HEADER_DELETE_ALL,
+                std::ptr::null_mut(),
+            );
         }
         let headers = take_headers();
         assert!(headers.is_empty());
@@ -439,7 +460,11 @@ mod tests {
         });
         let (mut hdr, _bytes) = make_sapi_header("content-type");
         unsafe {
-            turbine_header_handler(&mut hdr as *mut _ as *mut c_void, SAPI_HEADER_DELETE, std::ptr::null_mut());
+            turbine_header_handler(
+                &mut hdr as *mut _ as *mut c_void,
+                SAPI_HEADER_DELETE,
+                std::ptr::null_mut(),
+            );
         }
         let headers = take_headers();
         assert_eq!(headers.len(), 1);
@@ -451,7 +476,11 @@ mod tests {
         clear_output_buffer();
         let (mut hdr, _bytes) = make_sapi_header("HTTP/1.1 302 Found");
         unsafe {
-            turbine_header_handler(&mut hdr as *mut _ as *mut c_void, SAPI_HEADER_REPLACE, std::ptr::null_mut());
+            turbine_header_handler(
+                &mut hdr as *mut _ as *mut c_void,
+                SAPI_HEADER_REPLACE,
+                std::ptr::null_mut(),
+            );
         }
         RESPONSE_CODE.with(|rc| {
             assert_eq!(*rc.borrow(), 302);
@@ -465,7 +494,11 @@ mod tests {
     fn header_handler_null_safe() {
         clear_output_buffer();
         unsafe {
-            let result = turbine_header_handler(std::ptr::null_mut(), SAPI_HEADER_REPLACE, std::ptr::null_mut());
+            let result = turbine_header_handler(
+                std::ptr::null_mut(),
+                SAPI_HEADER_REPLACE,
+                std::ptr::null_mut(),
+            );
             assert_eq!(result, SAPI_HEADER_SENT_SUCCESSFULLY);
         }
         // Should not crash or add anything

@@ -41,7 +41,6 @@
 /// [u8  0xAA]
 /// [u32 0 LE]
 /// ```
-
 use std::io::{self, Read};
 use std::os::unix::io::RawFd;
 
@@ -58,28 +57,28 @@ use crate::WorkerError;
 /// Decoded HTTP request ready to be sent to a persistent PHP worker.
 #[derive(Debug)]
 pub struct PersistentRequest<'a> {
-    pub method:          &'a str,
-    pub uri:             &'a str,          // full URI including query string
-    pub body:            &'a [u8],
-    pub client_ip:       &'a str,
-    pub port:            u16,
-    pub is_https:        bool,
-    pub headers:         &'a [(&'a str, &'a str)],
-    pub script_filename: &'a str,          // absolute path to PHP script
-    pub query_string:    &'a str,
-    pub document_root:   &'a str,
-    pub content_type:    &'a str,
-    pub cookie:          &'a str,
-    pub path_info:       &'a str,
-    pub script_name:     &'a str,
+    pub method: &'a str,
+    pub uri: &'a str, // full URI including query string
+    pub body: &'a [u8],
+    pub client_ip: &'a str,
+    pub port: u16,
+    pub is_https: bool,
+    pub headers: &'a [(&'a str, &'a str)],
+    pub script_filename: &'a str, // absolute path to PHP script
+    pub query_string: &'a str,
+    pub document_root: &'a str,
+    pub content_type: &'a str,
+    pub cookie: &'a str,
+    pub path_info: &'a str,
+    pub script_name: &'a str,
 }
 
 /// Decoded response from a persistent PHP worker.
 #[derive(Debug)]
 pub struct PersistentResponse {
-    pub status:  u16,
+    pub status: u16,
     pub headers: Vec<(String, String)>,
-    pub body:    Vec<u8>,
+    pub body: Vec<u8>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -168,7 +167,7 @@ fn read_bytes_fd(fd: RawFd) -> io::Result<Vec<u8>> {
 pub fn encode_request(req: &PersistentRequest<'_>) -> Vec<u8> {
     let mut buf = Vec::with_capacity(256 + req.body.len());
 
-    write_u8(&mut buf, 0x01);  // HandleRequest command
+    write_u8(&mut buf, 0x01); // HandleRequest command
     write_str(&mut buf, req.method);
     write_str(&mut buf, req.uri);
     write_bytes(&mut buf, req.body);
@@ -194,9 +193,9 @@ pub fn encode_request(req: &PersistentRequest<'_>) -> Vec<u8> {
 
 /// Decode a `PersistentResponse` from the worker's resp pipe (blocking).
 pub fn decode_response(resp_fd: RawFd) -> io::Result<PersistentResponse> {
-    let _marker    = read_u8_fd(resp_fd)?;
-    let status     = read_u16_le_fd(resp_fd)?;
-    let hdr_count  = read_u32_le_fd(resp_fd)?;
+    let _marker = read_u8_fd(resp_fd)?;
+    let status = read_u16_le_fd(resp_fd)?;
+    let hdr_count = read_u32_le_fd(resp_fd)?;
 
     if hdr_count > 256 {
         return Err(io::Error::new(
@@ -207,13 +206,17 @@ pub fn decode_response(resp_fd: RawFd) -> io::Result<PersistentResponse> {
 
     let mut headers = Vec::with_capacity(hdr_count as usize);
     for _ in 0..hdr_count {
-        let name  = read_string_fd(resp_fd)?;
+        let name = read_string_fd(resp_fd)?;
         let value = read_string_fd(resp_fd)?;
         headers.push((name, value));
     }
 
     let body = read_bytes_fd(resp_fd)?;
-    Ok(PersistentResponse { status, headers, body })
+    Ok(PersistentResponse {
+        status,
+        headers,
+        body,
+    })
 }
 
 /// Read and validate the ready signal from a persistent PHP worker.
@@ -243,49 +246,60 @@ pub fn read_ready_signal(resp_fd: RawFd) -> io::Result<bool> {
 
 /// Decoded request read from the cmd pipe inside the worker process.
 struct DecodedRequest {
-    method:          String,
-    uri:             String,
-    body:            Vec<u8>,
-    client_ip:       String,
-    port:            u16,
-    is_https:        bool,
-    headers:         Vec<(String, String)>,
+    method: String,
+    uri: String,
+    body: Vec<u8>,
+    client_ip: String,
+    port: u16,
+    is_https: bool,
+    headers: Vec<(String, String)>,
     script_filename: String,
-    query_string:    String,
-    document_root:   String,
-    content_type:    String,
-    cookie:          String,
-    path_info:       String,
-    script_name:     String,
+    query_string: String,
+    document_root: String,
+    content_type: String,
+    cookie: String,
+    path_info: String,
+    script_name: String,
 }
 
 /// Decode a full request from the cmd pipe (blocking).
 fn decode_request_from_fd(cmd_fd: RawFd) -> io::Result<DecodedRequest> {
-    let method    = read_string_fd(cmd_fd)?;
-    let uri       = read_string_fd(cmd_fd)?;
-    let body      = read_bytes_fd(cmd_fd)?;
+    let method = read_string_fd(cmd_fd)?;
+    let uri = read_string_fd(cmd_fd)?;
+    let body = read_bytes_fd(cmd_fd)?;
     let client_ip = read_string_fd(cmd_fd)?;
-    let port      = read_u32_le_fd(cmd_fd)? as u16;
-    let is_https  = read_u8_fd(cmd_fd)? != 0;
+    let port = read_u32_le_fd(cmd_fd)? as u16;
+    let is_https = read_u8_fd(cmd_fd)? != 0;
     let hdr_count = read_u32_le_fd(cmd_fd)? as usize;
     let mut headers = Vec::with_capacity(hdr_count);
     for _ in 0..hdr_count {
-        let name  = read_string_fd(cmd_fd)?;
+        let name = read_string_fd(cmd_fd)?;
         let value = read_string_fd(cmd_fd)?;
         headers.push((name, value));
     }
     let script_filename = read_string_fd(cmd_fd)?;
-    let query_string    = read_string_fd(cmd_fd)?;
-    let document_root   = read_string_fd(cmd_fd)?;
-    let content_type    = read_string_fd(cmd_fd)?;
-    let cookie          = read_string_fd(cmd_fd)?;
-    let path_info       = read_string_fd(cmd_fd)?;
-    let script_name     = read_string_fd(cmd_fd)?;
+    let query_string = read_string_fd(cmd_fd)?;
+    let document_root = read_string_fd(cmd_fd)?;
+    let content_type = read_string_fd(cmd_fd)?;
+    let cookie = read_string_fd(cmd_fd)?;
+    let path_info = read_string_fd(cmd_fd)?;
+    let script_name = read_string_fd(cmd_fd)?;
 
     Ok(DecodedRequest {
-        method, uri, body, client_ip, port, is_https, headers,
-        script_filename, query_string, document_root, content_type,
-        cookie, path_info, script_name,
+        method,
+        uri,
+        body,
+        client_ip,
+        port,
+        is_https,
+        headers,
+        script_filename,
+        query_string,
+        document_root,
+        content_type,
+        cookie,
+        path_info,
+        script_name,
     })
 }
 
@@ -325,9 +339,8 @@ fn write_response(
 fn write_all_fd(fd: RawFd, data: &[u8]) -> io::Result<()> {
     let mut offset = 0;
     while offset < data.len() {
-        let ret = unsafe {
-            libc::write(fd, data[offset..].as_ptr() as *const _, data.len() - offset)
-        };
+        let ret =
+            unsafe { libc::write(fd, data[offset..].as_ptr() as *const _, data.len() - offset) };
         if ret < 0 {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::Interrupted {
@@ -362,7 +375,11 @@ pub fn worker_event_loop_persistent(
     worker_boot: Option<&str>,
     worker_handler: Option<&str>,
 ) {
-    debug!(pid = std::process::id(), app_root = app_root, "Persistent worker started (native SAPI)");
+    debug!(
+        pid = std::process::id(),
+        app_root = app_root,
+        "Persistent worker started (native SAPI)"
+    );
 
     use crate::pool::safe_cstring;
     use turbine_engine::output;
@@ -374,10 +391,16 @@ pub fn worker_event_loop_persistent(
     unsafe {
         if turbine_php_sys::turbine_php_is_thread_safe() != 0 {
             if turbine_php_sys::turbine_thread_init() != 0 {
-                error!(pid = std::process::id(), "Failed to initialize TSRM context after fork");
+                error!(
+                    pid = std::process::id(),
+                    "Failed to initialize TSRM context after fork"
+                );
                 std::process::exit(1);
             }
-            debug!(pid = std::process::id(), "TSRM context initialized after fork (ZTS)");
+            debug!(
+                pid = std::process::id(),
+                "TSRM context initialized after fork (ZTS)"
+            );
         }
     }
 
@@ -400,12 +423,18 @@ pub fn worker_event_loop_persistent(
                 true
             }
             false => {
-                warn!(pid = std::process::id(), "Worker boot failed — falling back to full lifecycle");
+                warn!(
+                    pid = std::process::id(),
+                    "Worker boot failed — falling back to full lifecycle"
+                );
                 false
             }
         }
     } else {
-        debug!(pid = std::process::id(), "No worker_boot/worker_handler configured — using full lifecycle");
+        debug!(
+            pid = std::process::id(),
+            "No worker_boot/worker_handler configured — using full lifecycle"
+        );
         false
     };
 
@@ -468,21 +497,25 @@ pub fn worker_event_loop_persistent(
         );
 
         // Build CStrings for the C API.
-        let c_method     = safe_cstring(req.method.as_bytes());
-        let c_uri        = safe_cstring(req.uri.as_bytes());
-        let c_qs         = safe_cstring(req.query_string.as_bytes());
-        let c_ct         = safe_cstring(req.content_type.as_bytes());
-        let c_cookie     = safe_cstring(req.cookie.as_bytes());
-        let c_script     = safe_cstring(req.script_filename.as_bytes());
-        let c_docroot    = safe_cstring(req.document_root.as_bytes());
-        let c_addr       = safe_cstring(req.client_ip.as_bytes());
-        let c_pathinfo   = safe_cstring(req.path_info.as_bytes());
+        let c_method = safe_cstring(req.method.as_bytes());
+        let c_uri = safe_cstring(req.uri.as_bytes());
+        let c_qs = safe_cstring(req.query_string.as_bytes());
+        let c_ct = safe_cstring(req.content_type.as_bytes());
+        let c_cookie = safe_cstring(req.cookie.as_bytes());
+        let c_script = safe_cstring(req.script_filename.as_bytes());
+        let c_docroot = safe_cstring(req.document_root.as_bytes());
+        let c_addr = safe_cstring(req.client_ip.as_bytes());
+        let c_pathinfo = safe_cstring(req.path_info.as_bytes());
         let c_scriptname = safe_cstring(req.script_name.as_bytes());
 
-        let c_keys: Vec<std::ffi::CString> = req.headers.iter()
+        let c_keys: Vec<std::ffi::CString> = req
+            .headers
+            .iter()
             .map(|(k, _)| safe_cstring(k.as_bytes()))
             .collect();
-        let c_vals: Vec<std::ffi::CString> = req.headers.iter()
+        let c_vals: Vec<std::ffi::CString> = req
+            .headers
+            .iter()
             .map(|(_, v)| safe_cstring(v.as_bytes()))
             .collect();
         let key_ptrs: Vec<*const std::ffi::c_char> = c_keys.iter().map(|k| k.as_ptr()).collect();
@@ -500,9 +533,17 @@ pub fn worker_event_loop_persistent(
                 c_method.as_ptr(),
                 c_uri.as_ptr(),
                 c_qs.as_ptr(),
-                if req.content_type.is_empty() { std::ptr::null() } else { c_ct.as_ptr() },
+                if req.content_type.is_empty() {
+                    std::ptr::null()
+                } else {
+                    c_ct.as_ptr()
+                },
                 content_length,
-                if req.cookie.is_empty() { std::ptr::null() } else { c_cookie.as_ptr() },
+                if req.cookie.is_empty() {
+                    std::ptr::null()
+                } else {
+                    c_cookie.as_ptr()
+                },
                 c_script.as_ptr(),
                 c_docroot.as_ptr(),
                 c_addr.as_ptr(),
@@ -511,11 +552,23 @@ pub fn worker_event_loop_persistent(
                 req.is_https as libc::c_int,
                 c_pathinfo.as_ptr(),
                 c_scriptname.as_ptr(),
-                if req.body.is_empty() { std::ptr::null() } else { req.body.as_ptr() as *const _ },
+                if req.body.is_empty() {
+                    std::ptr::null()
+                } else {
+                    req.body.as_ptr() as *const _
+                },
                 req.body.len(),
                 req.headers.len() as libc::c_int,
-                if key_ptrs.is_empty() { std::ptr::null() } else { key_ptrs.as_ptr() },
-                if val_ptrs.is_empty() { std::ptr::null() } else { val_ptrs.as_ptr() },
+                if key_ptrs.is_empty() {
+                    std::ptr::null()
+                } else {
+                    key_ptrs.as_ptr()
+                },
+                if val_ptrs.is_empty() {
+                    std::ptr::null()
+                } else {
+                    val_ptrs.as_ptr()
+                },
             );
 
             let (result, body, headers, status) = if lightweight {
@@ -525,10 +578,7 @@ pub fn worker_event_loop_persistent(
                 output::install_output_capture();
                 output::clear_output_buffer();
 
-                let handler_code = format!(
-                    "include '{}';",
-                    handler_abs.as_ref().unwrap()
-                );
+                let handler_code = format!("include '{}';", handler_abs.as_ref().unwrap());
                 let c_handler = safe_cstring(handler_code.as_bytes());
                 let eval_name = safe_cstring(b"turbine_worker_handler");
                 let r = turbine_php_sys::zend_eval_string(
@@ -572,7 +622,9 @@ pub fn worker_event_loop_persistent(
 
     // Clean up before exiting.
     if lightweight {
-        unsafe { turbine_php_sys::turbine_worker_shutdown(); }
+        unsafe {
+            turbine_php_sys::turbine_worker_shutdown();
+        }
     }
     debug!(pid = std::process::id(), "Persistent worker exited");
 }
@@ -619,24 +671,29 @@ unsafe fn perform_worker_boot(boot_path: &str) -> bool {
     output::install_output_capture();
     output::clear_output_buffer();
 
-    let result = turbine_php_sys::zend_eval_string(
-        c_boot.as_ptr(),
-        std::ptr::null_mut(),
-        c_name.as_ptr(),
-    );
+    let result =
+        turbine_php_sys::zend_eval_string(c_boot.as_ptr(), std::ptr::null_mut(), c_name.as_ptr());
 
     // Discard any output from boot phase.
     let _ = output::take_output();
 
     if result != turbine_php_sys::SUCCESS {
-        error!(pid = std::process::id(), boot = boot_path, "Worker boot script eval failed");
+        error!(
+            pid = std::process::id(),
+            boot = boot_path,
+            "Worker boot script eval failed"
+        );
         return false;
     }
 
     // 3. Lightweight shutdown — preserve globals, classes, app state.
     turbine_php_sys::turbine_worker_request_shutdown();
 
-    info!(pid = std::process::id(), boot = boot_path, "Worker booted via boot script");
+    info!(
+        pid = std::process::id(),
+        boot = boot_path,
+        "Worker booted via boot script"
+    );
     true
 }
 
@@ -655,7 +712,11 @@ impl WorkerPool {
         worker_handler: Option<&str>,
     ) -> Result<bool, WorkerError> {
         let count = self.config().workers;
-        info!(count = count, app_root = app_root, "Spawning persistent workers");
+        info!(
+            count = count,
+            app_root = app_root,
+            "Spawning persistent workers"
+        );
         let owned_root = app_root.to_string();
         let owned_boot = worker_boot.map(|s| s.to_string());
         let owned_handler = worker_handler.map(|s| s.to_string());
@@ -670,7 +731,10 @@ impl WorkerPool {
             }
         }
 
-        info!(spawned = self.worker_count(), "All persistent workers spawned");
+        info!(
+            spawned = self.worker_count(),
+            "All persistent workers spawned"
+        );
         Ok(true)
     }
 
@@ -681,17 +745,17 @@ impl WorkerPool {
         worker_boot: Option<String>,
         worker_handler: Option<String>,
     ) -> Result<bool, WorkerError> {
-        let mut cmd_pipe  = [0i32; 2];
+        let mut cmd_pipe = [0i32; 2];
         let mut resp_pipe = [0i32; 2];
 
-        if unsafe { libc::pipe(cmd_pipe.as_mut_ptr())  } != 0 {
+        if unsafe { libc::pipe(cmd_pipe.as_mut_ptr()) } != 0 {
             return Err(WorkerError::Pipe(nix::Error::last()));
         }
         if unsafe { libc::pipe(resp_pipe.as_mut_ptr()) } != 0 {
             return Err(WorkerError::Pipe(nix::Error::last()));
         }
 
-        let (cmd_read,  cmd_write)  = (cmd_pipe[0],  cmd_pipe[1]);
+        let (cmd_read, cmd_write) = (cmd_pipe[0], cmd_pipe[1]);
         let (resp_read, resp_write) = (resp_pipe[0], resp_pipe[1]);
 
         match unsafe { fork() }.map_err(WorkerError::Fork)? {
@@ -703,7 +767,11 @@ impl WorkerPool {
                 let max_req = self.config().max_requests;
                 let worker = Worker::new(child, max_req, cmd_write, resp_read);
                 self.push_worker(worker);
-                debug!(pid = child.as_raw(), index = index, "Persistent worker forked");
+                debug!(
+                    pid = child.as_raw(),
+                    index = index,
+                    "Persistent worker forked"
+                );
                 Ok(true)
             }
             ForkResult::Child => {
@@ -763,17 +831,17 @@ impl WorkerPool {
         worker_boot: Option<String>,
         worker_handler: Option<String>,
     ) -> Result<bool, WorkerError> {
-        let mut cmd_pipe  = [0i32; 2];
+        let mut cmd_pipe = [0i32; 2];
         let mut resp_pipe = [0i32; 2];
 
-        if unsafe { libc::pipe(cmd_pipe.as_mut_ptr())  } != 0 {
+        if unsafe { libc::pipe(cmd_pipe.as_mut_ptr()) } != 0 {
             return Err(WorkerError::Pipe(nix::Error::last()));
         }
         if unsafe { libc::pipe(resp_pipe.as_mut_ptr()) } != 0 {
             return Err(WorkerError::Pipe(nix::Error::last()));
         }
 
-        let (cmd_read,  cmd_write)  = (cmd_pipe[0],  cmd_pipe[1]);
+        let (cmd_read, cmd_write) = (cmd_pipe[0], cmd_pipe[1]);
         let (resp_read, resp_write) = (resp_pipe[0], resp_pipe[1]);
 
         match unsafe { fork() }.map_err(WorkerError::Fork)? {
@@ -789,10 +857,18 @@ impl WorkerPool {
                 // Read the ready signal from the respawned worker before accepting requests.
                 match read_ready_signal(resp_read) {
                     Ok(true) => {
-                        info!(pid = child.as_raw(), index = index, "Persistent worker respawned and ready");
+                        info!(
+                            pid = child.as_raw(),
+                            index = index,
+                            "Persistent worker respawned and ready"
+                        );
                     }
                     Ok(false) => {
-                        warn!(pid = child.as_raw(), index = index, "Respawned persistent worker bootstrap failed");
+                        warn!(
+                            pid = child.as_raw(),
+                            index = index,
+                            "Respawned persistent worker bootstrap failed"
+                        );
                     }
                     Err(e) => {
                         error!(pid = child.as_raw(), index = index, error = %e, "Failed to read ready signal from respawned worker");
@@ -832,7 +908,12 @@ impl WorkerPool {
         worker_handler: Option<&str>,
     ) -> Result<(), WorkerError> {
         let count = self.config().workers;
-        info!(count = count, app_root = app_root, mode = "thread", "Spawning persistent worker threads");
+        info!(
+            count = count,
+            app_root = app_root,
+            mode = "thread",
+            "Spawning persistent worker threads"
+        );
 
         let is_zts = unsafe { turbine_php_sys::turbine_php_is_thread_safe() };
         if is_zts == 0 {
@@ -849,7 +930,10 @@ impl WorkerPool {
             )?;
         }
 
-        info!(spawned = self.worker_count(), "All persistent worker threads spawned");
+        info!(
+            spawned = self.worker_count(),
+            "All persistent worker threads spawned"
+        );
         Ok(())
     }
 
@@ -860,8 +944,8 @@ impl WorkerPool {
         worker_boot: Option<String>,
         worker_handler: Option<String>,
     ) -> Result<(), WorkerError> {
-        use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::Arc;
 
         static PERSISTENT_THREAD_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -886,7 +970,10 @@ impl WorkerPool {
                 // Initialize TSRM context
                 let init_rc = unsafe { turbine_php_sys::turbine_thread_init() };
                 if init_rc != 0 {
-                    error!(thread_id = thread_id, "Failed to initialize TSRM for persistent thread");
+                    error!(
+                        thread_id = thread_id,
+                        "Failed to initialize TSRM for persistent thread"
+                    );
                     alive_clone.store(false, Ordering::Release);
                     unsafe {
                         libc::close(cmd_read);
@@ -905,7 +992,9 @@ impl WorkerPool {
                 );
 
                 // Clean up
-                unsafe { turbine_php_sys::turbine_thread_cleanup(); }
+                unsafe {
+                    turbine_php_sys::turbine_thread_cleanup();
+                }
                 unsafe {
                     libc::close(cmd_read);
                     libc::close(resp_write);
@@ -919,7 +1008,11 @@ impl WorkerPool {
         let worker = Worker::new_thread(alive, thread_id, max_req, cmd_write, resp_read);
         self.push_worker(worker);
 
-        debug!(thread_id = thread_id, index = index, "Persistent worker thread spawned");
+        debug!(
+            thread_id = thread_id,
+            index = index,
+            "Persistent worker thread spawned"
+        );
         Ok(())
     }
 
@@ -934,7 +1027,10 @@ impl WorkerPool {
 
         for (idx, worker) in self.workers_mut().iter_mut().enumerate() {
             if !worker.is_alive() {
-                info!(index = idx, "Persistent worker thread exited — will respawn");
+                info!(
+                    index = idx,
+                    "Persistent worker thread exited — will respawn"
+                );
                 to_respawn.push(idx);
             }
         }
@@ -958,8 +1054,8 @@ impl WorkerPool {
         worker_boot: Option<String>,
         worker_handler: Option<String>,
     ) -> Result<(), WorkerError> {
-        use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::Arc;
 
         static RESPAWN_THREAD_ID: AtomicU64 = AtomicU64::new(10000);
 
@@ -997,7 +1093,9 @@ impl WorkerPool {
                     worker_boot.as_deref(),
                     worker_handler.as_deref(),
                 );
-                unsafe { turbine_php_sys::turbine_thread_cleanup(); }
+                unsafe {
+                    turbine_php_sys::turbine_thread_cleanup();
+                }
                 unsafe {
                     libc::close(cmd_read);
                     libc::close(resp_write);
@@ -1013,16 +1111,27 @@ impl WorkerPool {
         // Read the ready signal from the respawned thread worker.
         match read_ready_signal(resp_read) {
             Ok(true) => {
-                info!(index = index, thread_id = thread_id, "Persistent thread worker respawned and ready");
+                info!(
+                    index = index,
+                    thread_id = thread_id,
+                    "Persistent thread worker respawned and ready"
+                );
             }
             Ok(false) => {
-                warn!(index = index, "Respawned persistent thread worker bootstrap failed");
+                warn!(
+                    index = index,
+                    "Respawned persistent thread worker bootstrap failed"
+                );
             }
             Err(e) => {
                 error!(index = index, error = %e, "Failed to read ready signal from respawned thread worker");
             }
         }
-        info!(thread_id = thread_id, index = index, "Persistent worker thread respawned");
+        info!(
+            thread_id = thread_id,
+            index = index,
+            "Persistent worker thread respawned"
+        );
         Ok(())
     }
 }
@@ -1110,7 +1219,10 @@ mod tests {
     #[test]
     fn encode_request_with_body_and_headers() {
         let body = b"name=test&value=123";
-        let headers = [("Content-Type", "application/x-www-form-urlencoded"), ("Host", "example.com")];
+        let headers = [
+            ("Content-Type", "application/x-www-form-urlencoded"),
+            ("Host", "example.com"),
+        ];
         let req = PersistentRequest {
             method: "POST",
             uri: "/api/submit?debug=1",
@@ -1192,7 +1304,11 @@ mod tests {
 
         // Write encoded data to pipe (skip cmd byte — decode expects post-cmd)
         let written = unsafe {
-            libc::write(write_fd, encoded[1..].as_ptr() as *const _, encoded.len() - 1)
+            libc::write(
+                write_fd,
+                encoded[1..].as_ptr() as *const _,
+                encoded.len() - 1,
+            )
         };
         assert_eq!(written as usize, encoded.len() - 1);
 
@@ -1206,8 +1322,14 @@ mod tests {
         assert_eq!(decoded.port, 9000);
         assert!(decoded.is_https);
         assert_eq!(decoded.headers.len(), 2);
-        assert_eq!(decoded.headers[0], ("Host".to_string(), "localhost".to_string()));
-        assert_eq!(decoded.headers[1], ("Accept".to_string(), "text/html".to_string()));
+        assert_eq!(
+            decoded.headers[0],
+            ("Host".to_string(), "localhost".to_string())
+        );
+        assert_eq!(
+            decoded.headers[1],
+            ("Accept".to_string(), "text/html".to_string())
+        );
         assert_eq!(decoded.script_filename, "/var/www/index.php");
         assert_eq!(decoded.query_string, "q=1");
         assert_eq!(decoded.document_root, "/var/www");
@@ -1216,7 +1338,10 @@ mod tests {
         assert_eq!(decoded.path_info, "/test");
         assert_eq!(decoded.script_name, "/index.php");
 
-        unsafe { libc::close(read_fd); libc::close(write_fd); }
+        unsafe {
+            libc::close(read_fd);
+            libc::close(write_fd);
+        }
     }
 
     #[test]
@@ -1242,7 +1367,11 @@ mod tests {
 
         let encoded = encode_request(&req);
         let written = unsafe {
-            libc::write(write_fd, encoded[1..].as_ptr() as *const _, encoded.len() - 1)
+            libc::write(
+                write_fd,
+                encoded[1..].as_ptr() as *const _,
+                encoded.len() - 1,
+            )
         };
         assert_eq!(written as usize, encoded.len() - 1);
 
@@ -1253,7 +1382,10 @@ mod tests {
         assert!(!decoded.is_https);
         assert!(decoded.headers.is_empty());
 
-        unsafe { libc::close(read_fd); libc::close(write_fd); }
+        unsafe {
+            libc::close(read_fd);
+            libc::close(write_fd);
+        }
     }
 
     // ── Response Encoding / Decoding ────────────────────────────────
@@ -1273,11 +1405,20 @@ mod tests {
         let resp = decode_response(read_fd).expect("decode failed");
         assert_eq!(resp.status, 200);
         assert_eq!(resp.headers.len(), 2);
-        assert_eq!(resp.headers[0], ("Content-Type".to_string(), "text/html".to_string()));
-        assert_eq!(resp.headers[1], ("X-Custom".to_string(), "value".to_string()));
+        assert_eq!(
+            resp.headers[0],
+            ("Content-Type".to_string(), "text/html".to_string())
+        );
+        assert_eq!(
+            resp.headers[1],
+            ("X-Custom".to_string(), "value".to_string())
+        );
         assert_eq!(resp.body, b"<h1>Hello</h1>");
 
-        unsafe { libc::close(read_fd); libc::close(write_fd); }
+        unsafe {
+            libc::close(read_fd);
+            libc::close(write_fd);
+        }
     }
 
     #[test]
@@ -1291,7 +1432,10 @@ mod tests {
         assert!(resp.headers.is_empty());
         assert_eq!(resp.body, b"Internal Error");
 
-        unsafe { libc::close(read_fd); libc::close(write_fd); }
+        unsafe {
+            libc::close(read_fd);
+            libc::close(write_fd);
+        }
     }
 
     #[test]
@@ -1305,7 +1449,10 @@ mod tests {
         assert!(resp.headers.is_empty());
         assert!(resp.body.is_empty());
 
-        unsafe { libc::close(read_fd); libc::close(write_fd); }
+        unsafe {
+            libc::close(read_fd);
+            libc::close(write_fd);
+        }
     }
 
     #[test]
@@ -1323,7 +1470,10 @@ mod tests {
         assert_eq!(resp.headers[0].0, "X-Header-0");
         assert_eq!(resp.headers[49].0, "X-Header-49");
 
-        unsafe { libc::close(read_fd); libc::close(write_fd); }
+        unsafe {
+            libc::close(read_fd);
+            libc::close(write_fd);
+        }
     }
 
     // ── Ready Signal ────────────────────────────────────────────────
@@ -1337,7 +1487,10 @@ mod tests {
         let ready = read_ready_signal(read_fd).expect("read failed");
         assert!(ready);
 
-        unsafe { libc::close(read_fd); libc::close(write_fd); }
+        unsafe {
+            libc::close(read_fd);
+            libc::close(write_fd);
+        }
     }
 
     // ── Large Body ──────────────────────────────────────────────────
@@ -1371,7 +1524,9 @@ mod tests {
 
         let writer = std::thread::spawn(move || {
             write_all_fd(write_fd, &encoded[1..]).expect("write failed");
-            unsafe { libc::close(write_fd); }
+            unsafe {
+                libc::close(write_fd);
+            }
         });
 
         let decoded = decode_request_from_fd(read_fd).expect("decode failed");
@@ -1379,7 +1534,9 @@ mod tests {
         assert!(decoded.body.iter().all(|&b| b == 0x42));
 
         writer.join().unwrap();
-        unsafe { libc::close(read_fd); }
+        unsafe {
+            libc::close(read_fd);
+        }
     }
 
     #[test]
@@ -1391,7 +1548,9 @@ mod tests {
 
         let writer = std::thread::spawn(move || {
             write_response(write_fd, true, 200, &[], &body_clone).expect("write failed");
-            unsafe { libc::close(write_fd); }
+            unsafe {
+                libc::close(write_fd);
+            }
         });
 
         let resp = decode_response(read_fd).expect("decode failed");
@@ -1400,7 +1559,9 @@ mod tests {
         assert!(resp.body.iter().all(|&b| b == 0xBB));
 
         writer.join().unwrap();
-        unsafe { libc::close(read_fd); }
+        unsafe {
+            libc::close(read_fd);
+        }
     }
 
     // ── decode_response rejects excessive header count ───────────────
@@ -1415,18 +1576,20 @@ mod tests {
         buf.extend_from_slice(&200u16.to_le_bytes()); // status
         buf.extend_from_slice(&300u32.to_le_bytes()); // header_count > 256
 
-        let written = unsafe {
-            libc::write(write_fd, buf.as_ptr() as *const _, buf.len())
-        };
+        let written = unsafe { libc::write(write_fd, buf.as_ptr() as *const _, buf.len()) };
         assert_eq!(written as usize, buf.len());
-        unsafe { libc::close(write_fd); }
+        unsafe {
+            libc::close(write_fd);
+        }
 
         let result = decode_response(read_fd);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("invalid header_count"));
 
-        unsafe { libc::close(read_fd); }
+        unsafe {
+            libc::close(read_fd);
+        }
     }
 
     // ── Unicode in fields ───────────────────────────────────────────
@@ -1455,7 +1618,9 @@ mod tests {
         let encoded = encode_request(&req);
         let writer = std::thread::spawn(move || {
             write_all_fd(write_fd, &encoded[1..]).expect("write failed");
-            unsafe { libc::close(write_fd); }
+            unsafe {
+                libc::close(write_fd);
+            }
         });
 
         let decoded = decode_request_from_fd(read_fd).expect("decode failed");
@@ -1465,6 +1630,8 @@ mod tests {
         assert_eq!(decoded.headers[0].1, "über-header");
 
         writer.join().unwrap();
-        unsafe { libc::close(read_fd); }
+        unsafe {
+            libc::close(read_fd);
+        }
     }
 }

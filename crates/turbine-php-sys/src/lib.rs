@@ -7,9 +7,9 @@
 #![allow(non_upper_case_globals)]
 #![allow(non_snake_case)]
 
-pub mod zend;
-pub mod sapi;
 pub mod embed;
+pub mod sapi;
+pub mod zend;
 
 pub use embed::*;
 pub use sapi::*;

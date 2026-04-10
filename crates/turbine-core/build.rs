@@ -44,10 +44,13 @@ fn main() {
         let archive_path = Path::new(&out_dir).join("embedded_app.tar.gz");
         if !archive_path.exists() {
             // Create a minimal valid gzip stream (empty)
-            let _ = std::fs::write(&archive_path, &[
-                0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03,
-                0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            ]);
+            let _ = std::fs::write(
+                &archive_path,
+                &[
+                    0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x03, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                ],
+            );
         }
     }
 }
@@ -124,7 +127,11 @@ fn write_tar_header(tar_data: &mut Vec<u8>, name: &str, size: usize, type_flag: 
     header[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
 
     // Mode (100..108) — 0644 for files, 0755 for dirs
-    let mode = if type_flag == b'5' { "0000755\0" } else { "0000644\0" };
+    let mode = if type_flag == b'5' {
+        "0000755\0"
+    } else {
+        "0000644\0"
+    };
     header[100..108].copy_from_slice(mode.as_bytes());
 
     // UID (108..116) and GID (116..124)

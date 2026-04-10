@@ -23,9 +23,9 @@ pub union zend_value {
     pub lval: c_long,
     pub dval: f64,
     pub str_: *mut zend_string,
-    pub arr: *mut c_void, // HashTable*
-    pub obj: *mut c_void, // zend_object*
-    pub res: *mut c_void, // zend_resource*
+    pub arr: *mut c_void,  // HashTable*
+    pub obj: *mut c_void,  // zend_object*
+    pub res: *mut c_void,  // zend_resource*
     pub ref_: *mut c_void, // zend_reference*
     pub ptr: *mut c_void,
 }

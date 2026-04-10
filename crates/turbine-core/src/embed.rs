@@ -100,7 +100,8 @@ fn extract_tar_gz(data: &[u8], dest: &std::path::Path) -> Result<usize, String> 
     let decoder = GzDecoder::new(data);
     let mut archive = Vec::new();
     let mut decoder_reader = decoder;
-    decoder_reader.read_to_end(&mut archive)
+    decoder_reader
+        .read_to_end(&mut archive)
         .map_err(|e| format!("Gzip decompress failed: {e}"))?;
 
     // Simple tar extraction (POSIX tar format)
@@ -147,10 +148,14 @@ fn extract_tar_gz(data: &[u8], dest: &std::path::Path) -> Result<usize, String> 
             }
             if let Ok(canonical_target) = target.canonicalize().or_else(|_| {
                 // File doesn't exist yet — check parent
-                target.parent()
+                target
+                    .parent()
                     .and_then(|p| p.canonicalize().ok())
                     .map(|p| p.join(target.file_name().unwrap_or_default()))
-                    .ok_or(std::io::Error::new(std::io::ErrorKind::NotFound, "no parent"))
+                    .ok_or(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "no parent",
+                    ))
             }) {
                 if !canonical_target.starts_with(&canonical_dest) {
                     pos += (file_size + 511) / 512 * 512;

@@ -403,7 +403,10 @@ mod tests {
         }
         // The next check_request should evaluate scanning
         let v = guard.check_request(ip);
-        assert!(v.is_blocked(), "100% error rate should trigger scanning block");
+        assert!(
+            v.is_blocked(),
+            "100% error rate should trigger scanning block"
+        );
         assert!(v.reason().unwrap().contains("Scanning"));
     }
 
@@ -474,7 +477,10 @@ mod tests {
         let v = guard.check_request(ip);
         assert!(v.is_blocked());
         let reason = v.reason().unwrap();
-        assert!(reason.contains("172.16.0.5"), "Reason should include the IP, got: {reason}");
+        assert!(
+            reason.contains("172.16.0.5"),
+            "Reason should include the IP, got: {reason}"
+        );
     }
 
     #[test]
@@ -491,8 +497,15 @@ mod tests {
         guard.record_sqli_attempt(bad);
         guard.check_request(good);
 
-        assert!(guard.check_request(bad).is_blocked(), "bad IP should be blocked");
-        assert_eq!(guard.check_request(good), Verdict::Allow, "good IP must stay allowed");
+        assert!(
+            guard.check_request(bad).is_blocked(),
+            "bad IP should be blocked"
+        );
+        assert_eq!(
+            guard.check_request(good),
+            Verdict::Allow,
+            "good IP must stay allowed"
+        );
         assert_eq!(guard.tracked_ips(), 2);
     }
 
@@ -561,11 +574,18 @@ mod tests {
         guard.check_request(ip);
         guard.record_sqli_attempt(ip); // triggers block
 
-        assert!(guard.check_request(ip).is_blocked(), "should be blocked before unblock");
+        assert!(
+            guard.check_request(ip).is_blocked(),
+            "should be blocked before unblock"
+        );
 
         let found = guard.unblock_ip(ip);
         assert!(found, "unblock_ip should return true for a known IP");
-        assert_eq!(guard.check_request(ip), Verdict::Allow, "should be allowed after unblock");
+        assert_eq!(
+            guard.check_request(ip),
+            Verdict::Allow,
+            "should be allowed after unblock"
+        );
     }
 
     #[test]
@@ -589,7 +609,10 @@ mod tests {
 
         let blocked = guard.blocked_ips();
         let ips: Vec<IpAddr> = blocked.iter().map(|(ip, _)| *ip).collect();
-        assert!(ips.contains(&ip), "blocked list should contain the blocked IP");
+        assert!(
+            ips.contains(&ip),
+            "blocked list should contain the blocked IP"
+        );
     }
 
     #[test]
@@ -605,7 +628,10 @@ mod tests {
         guard.record_sqli_attempt(ip);
         guard.unblock_ip(ip);
 
-        assert!(guard.blocked_ips().is_empty(), "blocked list should be empty after unblock");
+        assert!(
+            guard.blocked_ips().is_empty(),
+            "blocked list should be empty after unblock"
+        );
     }
 
     #[test]
@@ -621,8 +647,14 @@ mod tests {
         guard.record_sqli_attempt(ip);
 
         let blocked = guard.blocked_ips();
-        let entry = blocked.iter().find(|(i, _)| *i == ip).expect("IP should be in list");
-        assert!(entry.1.is_some(), "expiry seconds should be Some for a fresh block");
+        let entry = blocked
+            .iter()
+            .find(|(i, _)| *i == ip)
+            .expect("IP should be in list");
+        assert!(
+            entry.1.is_some(),
+            "expiry seconds should be Some for a fresh block"
+        );
         assert!(entry.1.unwrap() > 0, "expiry should be > 0 seconds");
     }
 }

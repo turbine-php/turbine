@@ -5,9 +5,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, error, info, warn};
 
 use turbine_php_sys::{
-    php_embed_init, php_embed_module, php_embed_shutdown, php_request_shutdown, php_request_startup,
-    sapi_send_headers,
-    zend_eval_string, FAILURE, SUCCESS,
+    php_embed_init, php_embed_module, php_embed_shutdown, php_request_shutdown,
+    php_request_startup, sapi_send_headers, zend_eval_string, FAILURE, SUCCESS,
 };
 
 use crate::output;
@@ -120,7 +119,10 @@ fn write_php_ini(overrides: &PhpIniOverrides) -> std::path::PathBuf {
     {
         ini.push_str("opcache.enable=1\n");
         ini.push_str("opcache.enable_cli=1\n");
-        ini.push_str(&format!("opcache.memory_consumption={}\n", overrides.opcache_memory));
+        ini.push_str(&format!(
+            "opcache.memory_consumption={}\n",
+            overrides.opcache_memory
+        ));
         ini.push_str("opcache.interned_strings_buffer=16\n");
         ini.push_str("opcache.max_accelerated_files=10000\n");
         ini.push_str("opcache.validate_timestamps=0\n");
@@ -133,7 +135,10 @@ fn write_php_ini(overrides: &PhpIniOverrides) -> std::path::PathBuf {
         ini.push_str("opcache.protect_memory=0\n");
         // JIT function mode: compiles hot functions to native code
         ini.push_str("opcache.jit=function\n");
-        ini.push_str(&format!("opcache.jit_buffer_size={}\n", overrides.jit_buffer_size));
+        ini.push_str(&format!(
+            "opcache.jit_buffer_size={}\n",
+            overrides.jit_buffer_size
+        ));
         // OPcache preload: compile classes/functions once at startup
         if !overrides.preload_script.is_empty() {
             let preload_path = std::path::Path::new(&overrides.preload_script);
@@ -146,7 +151,10 @@ fn write_php_ini(overrides: &PhpIniOverrides) -> std::path::PathBuf {
             }
         }
         if opcache_so_exists {
-            info!(opcache_path = opcache_path, "OPcache configured (shared .so, SHM + file L2 cache)");
+            info!(
+                opcache_path = opcache_path,
+                "OPcache configured (shared .so, SHM + file L2 cache)"
+            );
         } else {
             info!("OPcache configured (built-in, SHM + file L2 cache)");
         }
@@ -156,19 +164,51 @@ fn write_php_ini(overrides: &PhpIniOverrides) -> std::path::PathBuf {
     ini.push_str("display_errors=0\n");
     ini.push_str("log_errors=1\n");
     ini.push_str(&format!("memory_limit={}\n", overrides.memory_limit));
-    ini.push_str(&format!("max_execution_time={}\n", overrides.max_execution_time));
-    ini.push_str(&format!("upload_max_filesize={}\n", overrides.upload_max_filesize));
+    ini.push_str(&format!(
+        "max_execution_time={}\n",
+        overrides.max_execution_time
+    ));
+    ini.push_str(&format!(
+        "upload_max_filesize={}\n",
+        overrides.upload_max_filesize
+    ));
     ini.push_str(&format!("post_max_size={}\n", overrides.post_max_size));
 
     // Session configuration
     ini.push_str("session.save_handler=files\n");
-    ini.push_str(&format!("session.save_path={}\n", overrides.session_save_path));
+    ini.push_str(&format!(
+        "session.save_path={}\n",
+        overrides.session_save_path
+    ));
     ini.push_str(&format!("session.name={}\n", overrides.session_cookie_name));
-    ini.push_str(&format!("session.cookie_lifetime={}\n", overrides.session_cookie_lifetime));
-    ini.push_str(&format!("session.cookie_httponly={}\n", if overrides.session_cookie_httponly { 1 } else { 0 }));
-    ini.push_str(&format!("session.cookie_secure={}\n", if overrides.session_cookie_secure { 1 } else { 0 }));
-    ini.push_str(&format!("session.cookie_samesite={}\n", overrides.session_cookie_samesite));
-    ini.push_str(&format!("session.gc_maxlifetime={}\n", overrides.session_gc_maxlifetime));
+    ini.push_str(&format!(
+        "session.cookie_lifetime={}\n",
+        overrides.session_cookie_lifetime
+    ));
+    ini.push_str(&format!(
+        "session.cookie_httponly={}\n",
+        if overrides.session_cookie_httponly {
+            1
+        } else {
+            0
+        }
+    ));
+    ini.push_str(&format!(
+        "session.cookie_secure={}\n",
+        if overrides.session_cookie_secure {
+            1
+        } else {
+            0
+        }
+    ));
+    ini.push_str(&format!(
+        "session.cookie_samesite={}\n",
+        overrides.session_cookie_samesite
+    ));
+    ini.push_str(&format!(
+        "session.gc_maxlifetime={}\n",
+        overrides.session_gc_maxlifetime
+    ));
     ini.push_str("session.use_strict_mode=1\n");
     ini.push_str("session.use_only_cookies=1\n");
 
@@ -178,7 +218,10 @@ fn write_php_ini(overrides: &PhpIniOverrides) -> std::path::PathBuf {
         info!(open_basedir = %overrides.open_basedir, "PHP open_basedir restriction active");
     }
     if !overrides.disabled_functions.is_empty() {
-        ini.push_str(&format!("disable_functions={}\n", overrides.disabled_functions));
+        ini.push_str(&format!(
+            "disable_functions={}\n",
+            overrides.disabled_functions
+        ));
         info!(functions = %overrides.disabled_functions, "PHP dangerous functions disabled");
     }
     if overrides.block_url_include {
@@ -322,8 +365,7 @@ impl PhpEngine {
 
         debug!(code = code, "Evaluating PHP code");
 
-        let result =
-            unsafe { zend_eval_string(c_code.as_ptr(), ptr::null_mut(), c_name.as_ptr()) };
+        let result = unsafe { zend_eval_string(c_code.as_ptr(), ptr::null_mut(), c_name.as_ptr()) };
 
         debug!(code = code, result = result, "zend_eval_string returned");
 

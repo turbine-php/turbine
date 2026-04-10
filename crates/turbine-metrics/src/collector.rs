@@ -74,21 +74,21 @@ impl MetricsCollector {
 
     /// Record a completed request.
     #[inline]
-    pub fn record_request(
-        &self,
-        path: &str,
-        status: u16,
-        latency_us: u64,
-        bytes: u64,
-    ) {
+    pub fn record_request(&self, path: &str, status: u16, latency_us: u64, bytes: u64) {
         self.total_requests.fetch_add(1, Ordering::Relaxed);
         self.total_bytes_out.fetch_add(bytes, Ordering::Relaxed);
         self.latency.record(latency_us);
 
         match status {
-            200..=299 => { self.total_2xx.fetch_add(1, Ordering::Relaxed); }
-            300..=399 => { self.total_3xx.fetch_add(1, Ordering::Relaxed); }
-            400..=499 => { self.total_4xx.fetch_add(1, Ordering::Relaxed); }
+            200..=299 => {
+                self.total_2xx.fetch_add(1, Ordering::Relaxed);
+            }
+            300..=399 => {
+                self.total_3xx.fetch_add(1, Ordering::Relaxed);
+            }
+            400..=499 => {
+                self.total_4xx.fetch_add(1, Ordering::Relaxed);
+            }
             500..=599 => {
                 self.total_5xx.fetch_add(1, Ordering::Relaxed);
                 self.total_errors.fetch_add(1, Ordering::Relaxed);
@@ -217,7 +217,11 @@ impl MetricsCollector {
             "# HELP turbine_request_duration_ms Request latency in milliseconds\n\
              # TYPE turbine_request_duration_ms histogram\n",
         );
-        out.push_str(&self.latency.prometheus_buckets("turbine_request_duration_ms"));
+        out.push_str(
+            &self
+                .latency
+                .prometheus_buckets("turbine_request_duration_ms"),
+        );
         out.push('\n');
 
         // Uptime

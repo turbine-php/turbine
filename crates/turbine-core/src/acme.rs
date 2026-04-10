@@ -58,7 +58,10 @@ pub fn load_cached_certificate(config: &AcmeConfig) -> Option<AcmeCertificate> {
                     key = %key_path.display(),
                     "Loaded cached ACME certificate"
                 );
-                Some(AcmeCertificate { cert_path, key_path })
+                Some(AcmeCertificate {
+                    cert_path,
+                    key_path,
+                })
             } else {
                 warn!("Cached ACME certificate is expired or invalid");
                 None
@@ -145,8 +148,7 @@ pub async fn provision_certificate(
     challenge_tokens: &ChallengeTokens,
 ) -> Result<AcmeCertificate, String> {
     use instant_acme::{
-        Account, AuthorizationStatus, ChallengeType, Identifier, NewAccount, NewOrder,
-        OrderStatus,
+        Account, AuthorizationStatus, ChallengeType, Identifier, NewAccount, NewOrder, OrderStatus,
     };
 
     let cache_dir = Path::new(&config.cache_dir);
@@ -234,7 +236,12 @@ pub async fn provision_certificate(
         match auth.status {
             AuthorizationStatus::Pending => {}
             AuthorizationStatus::Valid => continue,
-            _ => return Err(format!("Unexpected authorization status: {:?}", auth.status)),
+            _ => {
+                return Err(format!(
+                    "Unexpected authorization status: {:?}",
+                    auth.status
+                ))
+            }
         }
 
         // Find HTTP-01 challenge
@@ -302,8 +309,8 @@ pub async fn provision_certificate(
         .map_err(|e| format!("Failed to create cert params: {e}"))?;
     params.distinguished_name = rcgen::DistinguishedName::new();
 
-    let private_key = rcgen::KeyPair::generate()
-        .map_err(|e| format!("Failed to generate key pair: {e}"))?;
+    let private_key =
+        rcgen::KeyPair::generate().map_err(|e| format!("Failed to generate key pair: {e}"))?;
 
     let csr = params
         .serialize_request(&private_key)
@@ -370,7 +377,10 @@ pub async fn provision_certificate(
         "ACME certificate provisioned successfully"
     );
 
-    Ok(AcmeCertificate { cert_path, key_path })
+    Ok(AcmeCertificate {
+        cert_path,
+        key_path,
+    })
 }
 
 /// Provision is not available without the `acme` feature.
@@ -388,10 +398,7 @@ pub async fn provision_certificate(
 }
 
 /// Spawn a background renewal task that checks certificate expiry periodically.
-pub fn spawn_renewal_task(
-    config: AcmeConfig,
-    challenge_tokens: ChallengeTokens,
-) {
+pub fn spawn_renewal_task(config: AcmeConfig, challenge_tokens: ChallengeTokens) {
     tokio::spawn(async move {
         // Check every 12 hours
         let interval = std::time::Duration::from_secs(12 * 3600);
@@ -437,10 +444,7 @@ mod tests {
             handle_challenge_request("/.well-known/acme-challenge/unknown", &tokens),
             None
         );
-        assert_eq!(
-            handle_challenge_request("/other/path", &tokens),
-            None
-        );
+        assert_eq!(handle_challenge_request("/other/path", &tokens), None);
         // Prevent path traversal in token
         assert_eq!(
             handle_challenge_request("/.well-known/acme-challenge/../../etc/passwd", &tokens),

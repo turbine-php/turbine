@@ -3,15 +3,15 @@
 //! All guards run inside the process with < 2μs total overhead per request.
 //! No external WAF needed.
 
+mod behaviour_guard;
+mod code_guard;
 mod error;
 mod sql_guard;
-mod code_guard;
-mod behaviour_guard;
 
+pub use behaviour_guard::{BehaviourConfig, BehaviourGuard};
+pub use code_guard::CodeGuard;
 pub use error::SecurityError;
 pub use sql_guard::SqlGuard;
-pub use code_guard::CodeGuard;
-pub use behaviour_guard::{BehaviourGuard, BehaviourConfig};
 
 use std::net::IpAddr;
 use tracing::{debug, warn};
@@ -370,8 +370,10 @@ mod tests {
         assert!(layer.check_input(ip, sqli).is_blocked()); // 2nd — reaches threshold
 
         // Now even a safe request from this IP is blocked by the behaviour guard
-        assert!(layer.check_input(ip, safe).is_blocked(),
-            "IP should be permanently blocked after 2 SQLi attempts");
+        assert!(
+            layer.check_input(ip, safe).is_blocked(),
+            "IP should be permanently blocked after 2 SQLi attempts"
+        );
     }
 
     #[test]
@@ -401,7 +403,10 @@ mod tests {
         }
         // Next request should be flagged as scanning
         let v = layer.check_input(ip, &[("x", "normal")]);
-        assert!(v.is_blocked(), "Scanning should be detected after high error rate");
+        assert!(
+            v.is_blocked(),
+            "Scanning should be detected after high error rate"
+        );
     }
 
     // ─── Guard ordering: Behaviour → SQL → Code ──────────────────────────────
@@ -424,8 +429,8 @@ mod tests {
         let ip: IpAddr = "192.168.1.100".parse().unwrap();
 
         // Trigger behaviour block first
-        layer.check_input(ip, &[("id", "1 UNION SELECT 1")]);  // records SQLi
-        // IP is now blocked. Even with a SQL payload, behaviour guard fires first.
+        layer.check_input(ip, &[("id", "1 UNION SELECT 1")]); // records SQLi
+                                                              // IP is now blocked. Even with a SQL payload, behaviour guard fires first.
         let v = layer.check_input(ip, &[("id", "1 UNION SELECT 1")]);
         assert!(v.is_blocked());
         // Reason should mention "temporarily blocked" (behaviour guard), not SQL

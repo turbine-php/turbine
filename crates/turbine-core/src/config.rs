@@ -1,7 +1,6 @@
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
-
 #[derive(Debug, Deserialize)]
 pub struct RuntimeConfig {
     #[serde(default)]
@@ -522,12 +521,16 @@ fn default_session_gc_maxlifetime() -> u64 {
 
 fn default_cors_methods() -> Vec<String> {
     vec!["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]
-        .into_iter().map(String::from).collect()
+        .into_iter()
+        .map(String::from)
+        .collect()
 }
 
 fn default_cors_headers() -> Vec<String> {
     vec!["Content-Type", "Authorization", "X-Requested-With"]
-        .into_iter().map(String::from).collect()
+        .into_iter()
+        .map(String::from)
+        .collect()
 }
 
 fn default_cors_max_age() -> u64 {
@@ -962,13 +965,19 @@ impl RuntimeConfig {
 
         if let Some(ref tls_cert) = self.server.tls.cert_file {
             if !std::path::Path::new(tls_cert).exists() {
-                errors.push(format!("[server.tls] cert_file = \"{}\" — file not found", tls_cert));
+                errors.push(format!(
+                    "[server.tls] cert_file = \"{}\" — file not found",
+                    tls_cert
+                ));
             }
         }
 
         if let Some(ref tls_key) = self.server.tls.key_file {
             if !std::path::Path::new(tls_key).exists() {
-                errors.push(format!("[server.tls] key_file = \"{}\" — file not found", tls_key));
+                errors.push(format!(
+                    "[server.tls] key_file = \"{}\" — file not found",
+                    tls_key
+                ));
             }
         }
 
@@ -978,7 +987,11 @@ impl RuntimeConfig {
             warnings.push("[server] workers = 0 + request_timeout = 0 — a slow request will block ALL subsequent requests".to_string());
         }
 
-        if self.security.enabled && !self.security.sql_guard && !self.security.code_injection_guard && !self.security.behaviour_guard {
+        if self.security.enabled
+            && !self.security.sql_guard
+            && !self.security.code_injection_guard
+            && !self.security.behaviour_guard
+        {
             warnings.push("[security] enabled = true but all guards are disabled — security layer has no effect".to_string());
         }
 
@@ -999,15 +1012,27 @@ impl RuntimeConfig {
         }
 
         if self.compression.level > 9 {
-            warnings.push(format!("[compression] level = {} — should be 1–9", self.compression.level));
+            warnings.push(format!(
+                "[compression] level = {} — should be 1–9",
+                self.compression.level
+            ));
         }
 
-        if self.session.cookie_samesite != "Lax" && self.session.cookie_samesite != "Strict" && self.session.cookie_samesite != "None" {
-            warnings.push(format!("[session] cookie_samesite = \"{}\" — should be Lax, Strict, or None", self.session.cookie_samesite));
+        if self.session.cookie_samesite != "Lax"
+            && self.session.cookie_samesite != "Strict"
+            && self.session.cookie_samesite != "None"
+        {
+            warnings.push(format!(
+                "[session] cookie_samesite = \"{}\" — should be Lax, Strict, or None",
+                self.session.cookie_samesite
+            ));
         }
 
         if self.cors.enabled && self.cors.allow_origins.is_empty() {
-            warnings.push("[cors] enabled = true but allow_origins is empty — no origins will be allowed".to_string());
+            warnings.push(
+                "[cors] enabled = true but allow_origins is empty — no origins will be allowed"
+                    .to_string(),
+            );
         }
 
         if self.acme.enabled && self.server.tls.enabled {
@@ -1018,16 +1043,24 @@ impl RuntimeConfig {
             warnings.push("[acme] domains is set but [[virtual_hosts]] are configured — vhost domains are auto-collected into ACME, 'domains' is redundant".to_string());
         }
 
-        if self.watcher.enabled && self.logging.level == "warn" || self.watcher.enabled && self.logging.level == "error" {
+        if self.watcher.enabled && self.logging.level == "warn"
+            || self.watcher.enabled && self.logging.level == "error"
+        {
             // Fine, no warning needed
         }
 
         for (i, pool) in self.worker_pools.iter().enumerate() {
             if pool.match_path.is_empty() {
-                warnings.push(format!("[[worker_pools]][{}] match_path is empty — pool will never match any request", i));
+                warnings.push(format!(
+                    "[[worker_pools]][{}] match_path is empty — pool will never match any request",
+                    i
+                ));
             }
             if pool.min_workers > pool.max_workers {
-                errors.push(format!("[[worker_pools]][{}] min_workers ({}) > max_workers ({}) — invalid", i, pool.min_workers, pool.max_workers));
+                errors.push(format!(
+                    "[[worker_pools]][{}] min_workers ({}) > max_workers ({}) — invalid",
+                    i, pool.min_workers, pool.max_workers
+                ));
             }
         }
 
@@ -1040,13 +1073,22 @@ impl RuntimeConfig {
             } else {
                 let lower = vhost.domain.to_lowercase();
                 if !seen_domains.insert(lower.clone()) {
-                    errors.push(format!("[[virtual_hosts]][{}] duplicate domain \"{}\"", i, vhost.domain));
+                    errors.push(format!(
+                        "[[virtual_hosts]][{}] duplicate domain \"{}\"",
+                        i, vhost.domain
+                    ));
                 }
             }
             if vhost.root.is_empty() {
-                errors.push(format!("[[virtual_hosts]][{}] root is empty for domain \"{}\"", i, vhost.domain));
+                errors.push(format!(
+                    "[[virtual_hosts]][{}] root is empty for domain \"{}\"",
+                    i, vhost.domain
+                ));
             } else if !std::path::Path::new(&vhost.root).exists() {
-                errors.push(format!("[[virtual_hosts]][{}] root = \"{}\" — directory not found for domain \"{}\"", i, vhost.root, vhost.domain));
+                errors.push(format!(
+                    "[[virtual_hosts]][{}] root = \"{}\" — directory not found for domain \"{}\"",
+                    i, vhost.root, vhost.domain
+                ));
             }
             for alias in &vhost.aliases {
                 let lower = alias.to_lowercase();
@@ -1061,7 +1103,10 @@ impl RuntimeConfig {
             }
             if let Some(ref key) = vhost.tls_key {
                 if !std::path::Path::new(key).exists() {
-                    errors.push(format!("[[virtual_hosts]][{}] tls_key = \"{}\" — file not found for domain \"{}\"", i, key, vhost.domain));
+                    errors.push(format!(
+                        "[[virtual_hosts]][{}] tls_key = \"{}\" — file not found for domain \"{}\"",
+                        i, key, vhost.domain
+                    ));
                 }
             }
             if vhost.tls_cert.is_some() != vhost.tls_key.is_some() {
@@ -1523,7 +1568,10 @@ scan_upload_content = false
         let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.sandbox.execution_mode, "strict");
         assert_eq!(config.sandbox.execution_whitelist, vec!["public/index.php"]);
-        assert_eq!(config.sandbox.data_directories, vec!["storage/", "uploads/"]);
+        assert_eq!(
+            config.sandbox.data_directories,
+            vec!["storage/", "uploads/"]
+        );
         assert!(!config.sandbox.scan_upload_content);
     }
 
@@ -1538,7 +1586,10 @@ scan_upload_content = false
         assert!(config.sandbox.block_url_include);
         assert!(config.sandbox.block_url_fopen);
         assert_eq!(config.sandbox.disabled_functions.len(), 9);
-        assert!(config.sandbox.disabled_functions.contains(&"exec".to_string()));
+        assert!(config
+            .sandbox
+            .disabled_functions
+            .contains(&"exec".to_string()));
     }
 
     #[test]
@@ -1892,7 +1943,11 @@ foo = "bar"
     fn check_defaults_no_errors() {
         let config = RuntimeConfig::default();
         let (errors, _warnings) = config.check();
-        assert!(errors.is_empty(), "Default config should have no errors: {:?}", errors);
+        assert!(
+            errors.is_empty(),
+            "Default config should have no errors: {:?}",
+            errors
+        );
     }
 
     #[test]
@@ -1900,7 +1955,9 @@ foo = "bar"
         let mut config = RuntimeConfig::default();
         config.server.worker_mode = "fork".into();
         let (errors, _) = config.check();
-        assert!(errors.iter().any(|e| e.contains("worker_mode") && e.contains("fork")));
+        assert!(errors
+            .iter()
+            .any(|e| e.contains("worker_mode") && e.contains("fork")));
     }
 
     #[test]
@@ -1909,8 +1966,11 @@ foo = "bar"
             let mut config = RuntimeConfig::default();
             config.server.worker_mode = mode.to_string();
             let (errors, _) = config.check();
-            assert!(!errors.iter().any(|e| e.contains("worker_mode")),
-                "worker_mode = \"{}\" should be valid", mode);
+            assert!(
+                !errors.iter().any(|e| e.contains("worker_mode")),
+                "worker_mode = \"{}\" should be valid",
+                mode
+            );
         }
     }
 
@@ -1919,7 +1979,9 @@ foo = "bar"
         let mut config = RuntimeConfig::default();
         config.sandbox.execution_mode = "custom".into();
         let (errors, _) = config.check();
-        assert!(errors.iter().any(|e| e.contains("execution_mode") && e.contains("custom")));
+        assert!(errors
+            .iter()
+            .any(|e| e.contains("execution_mode") && e.contains("custom")));
     }
 
     #[test]
@@ -1949,8 +2011,12 @@ foo = "bar"
         config.server.tls.cert_file = Some("/nonexistent/cert.pem".into());
         config.server.tls.key_file = Some("/nonexistent/key.pem".into());
         let (errors, _) = config.check();
-        assert!(errors.iter().any(|e| e.contains("cert.pem") && e.contains("not found")));
-        assert!(errors.iter().any(|e| e.contains("key.pem") && e.contains("not found")));
+        assert!(errors
+            .iter()
+            .any(|e| e.contains("cert.pem") && e.contains("not found")));
+        assert!(errors
+            .iter()
+            .any(|e| e.contains("key.pem") && e.contains("not found")));
     }
 
     #[test]
@@ -1959,7 +2025,9 @@ foo = "bar"
         config.sandbox.execution_mode = "strict".into();
         config.sandbox.execution_whitelist = vec![];
         let (errors, _) = config.check();
-        assert!(errors.iter().any(|e| e.contains("strict") && e.contains("whitelist")));
+        assert!(errors
+            .iter()
+            .any(|e| e.contains("strict") && e.contains("whitelist")));
     }
 
     #[test]
@@ -1981,7 +2049,9 @@ foo = "bar"
             name: None,
         });
         let (errors, _) = config.check();
-        assert!(errors.iter().any(|e| e.contains("min_workers") && e.contains("max_workers")));
+        assert!(errors
+            .iter()
+            .any(|e| e.contains("min_workers") && e.contains("max_workers")));
     }
 
     #[test]
@@ -1990,7 +2060,9 @@ foo = "bar"
         config.server.workers = 0;
         config.server.request_timeout = 0;
         let (_, warnings) = config.check();
-        assert!(warnings.iter().any(|w| w.contains("workers = 0") && w.contains("request_timeout = 0")));
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("workers = 0") && w.contains("request_timeout = 0")));
     }
 
     #[test]
@@ -2001,7 +2073,9 @@ foo = "bar"
         config.security.code_injection_guard = false;
         config.security.behaviour_guard = false;
         let (_, warnings) = config.check();
-        assert!(warnings.iter().any(|w| w.contains("all guards are disabled")));
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("all guards are disabled")));
     }
 
     #[test]
@@ -2027,7 +2101,9 @@ foo = "bar"
         config.server.persistent_workers = Some(true);
         config.server.worker_max_requests = 0;
         let (_, warnings) = config.check();
-        assert!(warnings.iter().any(|w| w.contains("persistent") && w.contains("recycle")));
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("persistent") && w.contains("recycle")));
     }
 
     #[test]
@@ -2052,8 +2128,11 @@ foo = "bar"
             let mut config = RuntimeConfig::default();
             config.session.cookie_samesite = val.to_string();
             let (_, warnings) = config.check();
-            assert!(!warnings.iter().any(|w| w.contains("cookie_samesite")),
-                "cookie_samesite = \"{}\" should not warn", val);
+            assert!(
+                !warnings.iter().any(|w| w.contains("cookie_samesite")),
+                "cookie_samesite = \"{}\" should not warn",
+                val
+            );
         }
     }
 
@@ -2074,7 +2153,9 @@ foo = "bar"
         config.server.tls.cert_file = Some("/tmp/cert.pem".into());
         config.server.tls.key_file = Some("/tmp/key.pem".into());
         let (_, warnings) = config.check();
-        assert!(warnings.iter().any(|w| w.contains("ACME") && w.contains("TLS")));
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("ACME") && w.contains("TLS")));
     }
 
     #[test]
@@ -2087,7 +2168,9 @@ foo = "bar"
             name: None,
         });
         let (_, warnings) = config.check();
-        assert!(warnings.iter().any(|w| w.contains("match_path") && w.contains("empty")));
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("match_path") && w.contains("empty")));
     }
 
     #[test]
@@ -2113,7 +2196,12 @@ foo = "bar"
         config.server.tls.cert_file = None;
         config.server.tls.key_file = None;
         let (errors, _) = config.check();
-        assert!(errors.len() >= 4, "Expected at least 4 errors, got {}: {:?}", errors.len(), errors);
+        assert!(
+            errors.len() >= 4,
+            "Expected at least 4 errors, got {}: {:?}",
+            errors.len(),
+            errors
+        );
     }
 
     // ── Virtual host config tests ───────────────────────────────────
@@ -2136,7 +2224,10 @@ root = "/var/www/outro"
         assert_eq!(config.virtual_hosts[0].domain, "xpto.com");
         assert_eq!(config.virtual_hosts[0].root, "/var/www/xpto");
         assert_eq!(config.virtual_hosts[0].aliases, vec!["www.xpto.com"]);
-        assert_eq!(config.virtual_hosts[0].entry_point, Some("index.php".into()));
+        assert_eq!(
+            config.virtual_hosts[0].entry_point,
+            Some("index.php".into())
+        );
         assert_eq!(config.virtual_hosts[1].domain, "outro.com");
         assert_eq!(config.virtual_hosts[1].root, "/var/www/outro");
         assert!(config.virtual_hosts[1].aliases.is_empty());
@@ -2153,8 +2244,14 @@ tls_cert = "/etc/ssl/secure.pem"
 tls_key = "/etc/ssl/secure-key.pem"
 "#;
         let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.virtual_hosts[0].tls_cert, Some("/etc/ssl/secure.pem".into()));
-        assert_eq!(config.virtual_hosts[0].tls_key, Some("/etc/ssl/secure-key.pem".into()));
+        assert_eq!(
+            config.virtual_hosts[0].tls_cert,
+            Some("/etc/ssl/secure.pem".into())
+        );
+        assert_eq!(
+            config.virtual_hosts[0].tls_key,
+            Some("/etc/ssl/secure-key.pem".into())
+        );
     }
 
     #[test]
@@ -2264,7 +2361,9 @@ workers = 4
             tls_key: None,
         });
         let (errors, _) = config.check();
-        assert!(errors.iter().any(|e| e.contains("tls_cert and tls_key must both be set")));
+        assert!(errors
+            .iter()
+            .any(|e| e.contains("tls_cert and tls_key must both be set")));
     }
 
     #[test]
@@ -2296,8 +2395,15 @@ workers = 4
             tls_key: None,
         });
         let (errors, _) = config.check();
-        let vhost_errors: Vec<_> = errors.iter().filter(|e| e.contains("virtual_hosts")).collect();
-        assert!(vhost_errors.is_empty(), "Valid vhost should have no vhost errors: {:?}", vhost_errors);
+        let vhost_errors: Vec<_> = errors
+            .iter()
+            .filter(|e| e.contains("virtual_hosts"))
+            .collect();
+        assert!(
+            vhost_errors.is_empty(),
+            "Valid vhost should have no vhost errors: {:?}",
+            vhost_errors
+        );
     }
 
     #[test]

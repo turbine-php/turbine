@@ -19,19 +19,24 @@ use tracing_subscriber::EnvFilter;
 use turbine_cache::{CacheConfig, ResponseCache};
 use turbine_engine::{PhpEngine, PhpIniOverrides};
 use turbine_metrics::MetricsCollector;
-use turbine_security::{SecurityConfig as SecConfig, SecurityLayer, BehaviourConfig};
-use turbine_worker::pool::{PoolConfig, WorkerPool, WorkerMode, worker_event_loop_native, worker_event_loop_channel, read_native_response_from_fd};
-use turbine_worker::{encode_native_request, NativeResponse, write_to_fd};
-use turbine_worker::persistent::{encode_request, decode_response, read_ready_signal, PersistentRequest};
+use turbine_security::{BehaviourConfig, SecurityConfig as SecConfig, SecurityLayer};
+use turbine_worker::persistent::{
+    decode_response, encode_request, read_ready_signal, PersistentRequest,
+};
+use turbine_worker::pool::{
+    read_native_response_from_fd, worker_event_loop_channel, worker_event_loop_native, PoolConfig,
+    WorkerMode, WorkerPool,
+};
+use turbine_worker::{encode_native_request, write_to_fd, NativeResponse};
 
+mod acme;
 mod cli;
 mod compat;
 mod config;
 mod dashboard;
+mod embed;
 mod features;
 mod path_guard;
-mod acme;
-mod embed;
 
 use path_guard::RequestGuard;
 
@@ -53,8 +58,26 @@ fn main() {
         Some(Command::Check { config }) => cmd_check(config),
         Some(Command::Status { address }) => cmd_status(&address),
         Some(Command::CacheClear { address }) => cmd_cache_clear(&address),
-        Some(Command::Serve { listen, workers, config, root, tls_cert, tls_key, request_timeout, access_log }) => {
-            cmd_serve(listen, workers, config, root, tls_cert, tls_key, request_timeout, access_log);
+        Some(Command::Serve {
+            listen,
+            workers,
+            config,
+            root,
+            tls_cert,
+            tls_key,
+            request_timeout,
+            access_log,
+        }) => {
+            cmd_serve(
+                listen,
+                workers,
+                config,
+                root,
+                tls_cert,
+                tls_key,
+                request_timeout,
+                access_log,
+            );
         }
         None => cmd_serve(None, None, None, None, None, None, None, None),
     }
@@ -118,7 +141,10 @@ fn cmd_check(config_path: Option<String>) {
     println!("\x1b[1mSettings:\x1b[0m");
     println!("  workers          = {}", config.server.workers);
     println!("  worker_mode      = {}", config.server.worker_mode);
-    println!("  persistent       = {}", config.server.persistent_workers.unwrap_or(false));
+    println!(
+        "  persistent       = {}",
+        config.server.persistent_workers.unwrap_or(false)
+    );
     println!("  listen           = {}", config.server.listen);
     println!("  request_timeout  = {}s", config.server.request_timeout);
     println!("  max_requests     = {}", config.server.worker_max_requests);
@@ -200,7 +226,8 @@ fn cmd_status(address: &str) {
     match std::net::TcpStream::connect(address) {
         Ok(mut stream) => {
             use std::io::{BufRead, BufReader, Write};
-            let req = format!("GET /_/status HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n");
+            let req =
+                format!("GET /_/status HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n");
             let _ = stream.write_all(req.as_bytes());
             let mut response = String::new();
             let mut reader = BufReader::new(&stream);
@@ -232,7 +259,9 @@ fn cmd_cache_clear(address: &str) {
     match std::net::TcpStream::connect(address) {
         Ok(mut stream) => {
             use std::io::{BufRead, BufReader, Write};
-            let req = format!("POST /_/cache/clear HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n");
+            let req = format!(
+                "POST /_/cache/clear HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+            );
             let _ = stream.write_all(req.as_bytes());
             let mut response = String::new();
             let mut reader = BufReader::new(&stream);
@@ -320,10 +349,12 @@ impl ThreadDispatch {
     ) -> (Self, Vec<(Arc<std::sync::atomic::AtomicBool>, u64)>) {
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        static CHAN_THREAD_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1_000_000);
+        static CHAN_THREAD_ID: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(1_000_000);
 
         let mut request_txs = Vec::with_capacity(count);
-        let mut response_rxs_raw: Vec<tokio::sync::mpsc::UnboundedReceiver<NativeResponse>> = Vec::with_capacity(count);
+        let mut response_rxs_raw: Vec<tokio::sync::mpsc::UnboundedReceiver<NativeResponse>> =
+            Vec::with_capacity(count);
         let mut worker_info: Vec<(Arc<AtomicBool>, u64)> = Vec::with_capacity(count);
 
         // Validate ZTS at runtime
@@ -355,7 +386,9 @@ impl ThreadDispatch {
                     };
                     worker_event_loop_channel(req_rx, response_fn);
 
-                    unsafe { turbine_php_sys::turbine_thread_cleanup(); }
+                    unsafe {
+                        turbine_php_sys::turbine_thread_cleanup();
+                    }
                     alive_clone.store(false, Ordering::Release);
                     tracing::debug!(worker = i, "Channel worker thread exited");
                 })
@@ -448,7 +481,12 @@ impl ThreadDispatch {
 
     /// Update fds after a worker respawn.
     #[allow(dead_code)]
-    fn update_fds(&self, idx: usize, cmd_fd: std::os::unix::io::RawFd, resp_fd: std::os::unix::io::RawFd) {
+    fn update_fds(
+        &self,
+        idx: usize,
+        cmd_fd: std::os::unix::io::RawFd,
+        resp_fd: std::os::unix::io::RawFd,
+    ) {
         let mut fds = self.worker_fds.write();
         if idx < fds.len() {
             fds[idx] = (cmd_fd, resp_fd);
@@ -724,7 +762,10 @@ fn cmd_serve(
     if root_override.is_none() && embed::has_embedded_app() {
         if let Some(extract_dir) = embed::extract_embedded_app(&config.embed) {
             std::env::set_current_dir(&extract_dir).unwrap_or_else(|e| {
-                eprintln!("Cannot change to embedded app directory {}: {e}", extract_dir.display());
+                eprintln!(
+                    "Cannot change to embedded app directory {}: {e}",
+                    extract_dir.display()
+                );
                 std::process::exit(1);
             });
             // Reload config from extracted directory (if turbine.toml is embedded)
@@ -850,7 +891,8 @@ fn cmd_serve(
                 app_root.join("preload.php"),
                 app_root.join("config/preload.php"),
             ];
-            candidates.iter()
+            candidates
+                .iter()
                 .find(|p| p.exists())
                 .map(|p| p.display().to_string())
                 .unwrap_or_default()
@@ -914,7 +956,8 @@ fn cmd_serve(
     }
 
     // --- Virtual hosting ---
-    let mut virtual_hosts: std::collections::HashMap<String, Arc<VhostResolved>> = std::collections::HashMap::new();
+    let mut virtual_hosts: std::collections::HashMap<String, Arc<VhostResolved>> =
+        std::collections::HashMap::new();
     for vhost_cfg in &config.virtual_hosts {
         let vhost_root = std::path::Path::new(&vhost_cfg.root);
         let vhost_root = if vhost_root.is_absolute() {
@@ -1070,53 +1113,69 @@ fn cmd_serve(
     // --- Request timeout ---
     let request_timeout = std::time::Duration::from_secs(config.server.request_timeout);
     if config.server.request_timeout > 0 {
-        info!(timeout_s = config.server.request_timeout, "Request timeout configured");
+        info!(
+            timeout_s = config.server.request_timeout,
+            "Request timeout configured"
+        );
     } else {
         info!("Request timeout disabled");
     }
 
     // --- Access log ---
-    let access_log: Option<std::sync::Mutex<std::io::BufWriter<std::fs::File>>> =
-        if let Some(ref path) = config.logging.access_log {
-            match std::fs::OpenOptions::new().create(true).append(true).open(path) {
-                Ok(file) => {
-                    info!(path = %path, "Access log enabled");
-                    Some(std::sync::Mutex::new(std::io::BufWriter::new(file)))
-                }
-                Err(e) => {
-                    warn!(path = %path, error = %e, "Failed to open access log file, continuing without");
-                    None
-                }
+    let access_log: Option<std::sync::Mutex<std::io::BufWriter<std::fs::File>>> = if let Some(
+        ref path,
+    ) =
+        config.logging.access_log
+    {
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            Ok(file) => {
+                info!(path = %path, "Access log enabled");
+                Some(std::sync::Mutex::new(std::io::BufWriter::new(file)))
             }
-        } else {
-            None
-        };
+            Err(e) => {
+                warn!(path = %path, error = %e, "Failed to open access log file, continuing without");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // --- Custom error pages ---
-    let error_page_404 = config.error_pages.not_found.as_ref().and_then(|path| {
-        match std::fs::read(path) {
-            Ok(content) => {
-                info!(path = %path, "Custom 404 error page loaded");
-                Some(content)
-            }
-            Err(e) => {
-                warn!(path = %path, error = %e, "Failed to load custom 404 page");
-                None
-            }
-        }
-    });
-    let error_page_500 = config.error_pages.server_error.as_ref().and_then(|path| {
-        match std::fs::read(path) {
-            Ok(content) => {
-                info!(path = %path, "Custom 500 error page loaded");
-                Some(content)
-            }
-            Err(e) => {
-                warn!(path = %path, error = %e, "Failed to load custom 500 page");
-                None
-            }
-        }
-    });
+    let error_page_404 =
+        config
+            .error_pages
+            .not_found
+            .as_ref()
+            .and_then(|path| match std::fs::read(path) {
+                Ok(content) => {
+                    info!(path = %path, "Custom 404 error page loaded");
+                    Some(content)
+                }
+                Err(e) => {
+                    warn!(path = %path, error = %e, "Failed to load custom 404 page");
+                    None
+                }
+            });
+    let error_page_500 =
+        config
+            .error_pages
+            .server_error
+            .as_ref()
+            .and_then(|path| match std::fs::read(path) {
+                Ok(content) => {
+                    info!(path = %path, "Custom 500 error page loaded");
+                    Some(content)
+                }
+                Err(e) => {
+                    warn!(path = %path, error = %e, "Failed to load custom 500 page");
+                    None
+                }
+            });
 
     // --- X-Sendfile root ---
     let x_sendfile_root = if config.x_sendfile.enabled {
@@ -1147,7 +1206,10 @@ fn cmd_serve(
         }
     }
     if config.server.max_wait_time > 0 {
-        info!(max_wait_time_s = config.server.max_wait_time, "Worker queue timeout configured");
+        info!(
+            max_wait_time_s = config.server.max_wait_time,
+            "Worker queue timeout configured"
+        );
     }
 
     // --- ACME auto-TLS ---
@@ -1159,13 +1221,23 @@ fn cmd_serve(
                 continue;
             }
             let domain = vhost_cfg.domain.to_lowercase();
-            if !config.acme.domains.iter().any(|d| d.to_lowercase() == domain) {
+            if !config
+                .acme
+                .domains
+                .iter()
+                .any(|d| d.to_lowercase() == domain)
+            {
                 info!(domain = %vhost_cfg.domain, "Adding virtual host domain to ACME");
                 config.acme.domains.push(vhost_cfg.domain.clone());
             }
             for alias in &vhost_cfg.aliases {
                 let alias_lower = alias.to_lowercase();
-                if !config.acme.domains.iter().any(|d| d.to_lowercase() == alias_lower) {
+                if !config
+                    .acme
+                    .domains
+                    .iter()
+                    .any(|d| d.to_lowercase() == alias_lower)
+                {
                     info!(domain = %alias, "Adding virtual host alias to ACME");
                     config.acme.domains.push(alias.clone());
                 }
@@ -1206,13 +1278,16 @@ fn cmd_serve(
                     let acme_config_clone = config.acme.clone();
                     match rt.block_on(async {
                         // Spawn HTTP-01 challenge server on port 80
-                        let challenge_listener = match tokio::net::TcpListener::bind("0.0.0.0:80").await {
-                            Ok(l) => l,
-                            Err(e) => {
-                                return Err(format!("Cannot bind port 80 for ACME challenge: {e}. \
-                                    Ensure port 80 is available or use manual TLS."));
-                            }
-                        };
+                        let challenge_listener =
+                            match tokio::net::TcpListener::bind("0.0.0.0:80").await {
+                                Ok(l) => l,
+                                Err(e) => {
+                                    return Err(format!(
+                                        "Cannot bind port 80 for ACME challenge: {e}. \
+                                    Ensure port 80 is available or use manual TLS."
+                                    ));
+                                }
+                            };
                         let tokens_for_server = challenge_tokens_clone.clone();
                         let challenge_server = tokio::spawn(async move {
                             loop {
@@ -1223,24 +1298,34 @@ fn cmd_serve(
                                 let tokens = tokens_for_server.clone();
                                 tokio::spawn(async move {
                                     let io = hyper_util::rt::TokioIo::new(stream);
-                                    let svc = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
-                                        let tokens = tokens.clone();
-                                        async move {
-                                            let path = req.uri().path().to_string();
-                                            if let Some(response) = acme::handle_challenge_request(&path, &tokens) {
-                                                Ok::<_, hyper::Error>(hyper::Response::builder()
-                                                    .status(200)
-                                                    .header("Content-Type", "text/plain")
-                                                    .body(http_body_util::Full::new(bytes::Bytes::from(response)))
-                                                    .unwrap())
-                                            } else {
-                                                Ok(hyper::Response::builder()
-                                                    .status(404)
-                                                    .body(http_body_util::Full::new(bytes::Bytes::from("Not Found")))
-                                                    .unwrap())
+                                    let svc = hyper::service::service_fn(
+                                        move |req: hyper::Request<hyper::body::Incoming>| {
+                                            let tokens = tokens.clone();
+                                            async move {
+                                                let path = req.uri().path().to_string();
+                                                if let Some(response) =
+                                                    acme::handle_challenge_request(&path, &tokens)
+                                                {
+                                                    Ok::<_, hyper::Error>(
+                                                        hyper::Response::builder()
+                                                            .status(200)
+                                                            .header("Content-Type", "text/plain")
+                                                            .body(http_body_util::Full::new(
+                                                                bytes::Bytes::from(response),
+                                                            ))
+                                                            .unwrap(),
+                                                    )
+                                                } else {
+                                                    Ok(hyper::Response::builder()
+                                                        .status(404)
+                                                        .body(http_body_util::Full::new(
+                                                            bytes::Bytes::from("Not Found"),
+                                                        ))
+                                                        .unwrap())
+                                                }
                                             }
-                                        }
-                                    });
+                                        },
+                                    );
                                     let _ = hyper::server::conn::http1::Builder::new()
                                         .serve_connection(io, svc)
                                         .await;
@@ -1248,13 +1333,18 @@ fn cmd_serve(
                             }
                         });
 
-                        let result = acme::provision_certificate(&acme_config_clone, &challenge_tokens_clone).await;
+                        let result = acme::provision_certificate(
+                            &acme_config_clone,
+                            &challenge_tokens_clone,
+                        )
+                        .await;
                         challenge_server.abort();
                         result
                     }) {
                         Ok(cert) => {
                             config.server.tls.enabled = true;
-                            config.server.tls.cert_file = Some(cert.cert_path.display().to_string());
+                            config.server.tls.cert_file =
+                                Some(cert.cert_path.display().to_string());
                             config.server.tls.key_file = Some(cert.key_path.display().to_string());
                             info!("ACME certificate provisioned and TLS enabled");
                         }
@@ -1281,25 +1371,29 @@ fn cmd_serve(
             std::process::exit(1);
         });
         // Collect per-vhost TLS certs for SNI
-        let vhost_certs: Vec<(String, String, String)> = config.virtual_hosts.iter()
-            .filter_map(|v| {
-                match (&v.tls_cert, &v.tls_key) {
-                    (Some(cert), Some(key)) => {
-                        let mut domains = vec![(v.domain.to_lowercase(), cert.clone(), key.clone())];
-                        for alias in &v.aliases {
-                            domains.push((alias.to_lowercase(), cert.clone(), key.clone()));
-                        }
-                        Some(domains)
+        let vhost_certs: Vec<(String, String, String)> = config
+            .virtual_hosts
+            .iter()
+            .filter_map(|v| match (&v.tls_cert, &v.tls_key) {
+                (Some(cert), Some(key)) => {
+                    let mut domains = vec![(v.domain.to_lowercase(), cert.clone(), key.clone())];
+                    for alias in &v.aliases {
+                        domains.push((alias.to_lowercase(), cert.clone(), key.clone()));
                     }
-                    _ => None,
+                    Some(domains)
                 }
+                _ => None,
             })
             .flatten()
             .collect();
         if vhost_certs.is_empty() {
             Some(build_tls_acceptor(cert_path, key_path))
         } else {
-            Some(build_tls_acceptor_with_sni(cert_path, key_path, &vhost_certs))
+            Some(build_tls_acceptor_with_sni(
+                cert_path,
+                key_path,
+                &vhost_certs,
+            ))
         }
     } else {
         None
@@ -1336,7 +1430,11 @@ fn cmd_serve(
                 // Thread mode: spawn persistent workers as OS threads (ZTS required)
                 match pool.spawn_persistent_workers_threaded(&app_root_str, w_boot, w_handler) {
                     Ok(()) => {
-                        info!(workers = pool.worker_count(), mode = "thread", "Persistent worker thread pool ready");
+                        info!(
+                            workers = pool.worker_count(),
+                            mode = "thread",
+                            "Persistent worker thread pool ready"
+                        );
                     }
                     Err(e) => {
                         error!("Failed to spawn persistent worker threads: {e}");
@@ -1347,7 +1445,11 @@ fn cmd_serve(
                 // Process mode: spawn persistent workers via fork
                 match pool.spawn_persistent_workers(&app_root_str, w_boot, w_handler) {
                     Ok(true) => {
-                        info!(workers = pool.worker_count(), mode = "process", "Persistent worker pool ready");
+                        info!(
+                            workers = pool.worker_count(),
+                            mode = "process",
+                            "Persistent worker pool ready"
+                        );
                     }
                     Ok(false) => {
                         std::process::exit(0);
@@ -1363,9 +1465,11 @@ fn cmd_serve(
             for idx in 0..pool.worker_count() {
                 if let Some(worker) = pool.worker_mut(idx) {
                     match read_ready_signal(worker.resp_fd()) {
-                        Ok(true)  => debug!(idx = idx, "Persistent worker ready"),
+                        Ok(true) => debug!(idx = idx, "Persistent worker ready"),
                         Ok(false) => warn!(idx = idx, "Persistent worker bootstrap failed"),
-                        Err(e)    => error!(idx = idx, error = %e, "Failed to read persistent ready signal"),
+                        Err(e) => {
+                            error!(idx = idx, error = %e, "Failed to read persistent ready signal")
+                        }
                     }
                 }
             }
@@ -1383,12 +1487,20 @@ fn cmd_serve(
                 // We stash it in an Option so the later ThreadDispatch build block
                 // can distinguish channel mode from pipe mode.
                 thread_dispatch_prebuilt = Some(td);
-                info!(workers = pool.worker_count(), mode = "thread-channel", "Worker thread pool ready (channel IPC)");
+                info!(
+                    workers = pool.worker_count(),
+                    mode = "thread-channel",
+                    "Worker thread pool ready (channel IPC)"
+                );
             } else {
                 // Process mode: spawn native SAPI workers via fork
                 match pool.spawn_workers(worker_event_loop_native) {
                     Ok(true) => {
-                        info!(workers = pool.worker_count(), mode = "process", "Worker pool ready");
+                        info!(
+                            workers = pool.worker_count(),
+                            mode = "process",
+                            "Worker pool ready"
+                        );
                     }
                     Ok(false) => {
                         std::process::exit(0);
@@ -1407,7 +1519,10 @@ fn cmd_serve(
                         match read_native_response_from_fd(worker.resp_fd()) {
                             Ok(resp) if resp.success => debug!(idx = idx, "Native worker ready"),
                             Ok(resp) => {
-                                warn!(idx = idx, "Native worker not ready: status={}", resp.http_status);
+                                warn!(
+                                    idx = idx,
+                                    "Native worker not ready: status={}", resp.http_status
+                                );
                             }
                             Err(e) => {
                                 error!(idx = idx, error = %e, "Failed to read native worker ready signal");
@@ -1459,7 +1574,9 @@ fn cmd_serve(
                 named_pools.push(NamedWorkerPool {
                     route: route_cfg.clone(),
                     pool: parking_lot::Mutex::new(np_pool),
-                    semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(route_cfg.min_workers)),
+                    semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                        route_cfg.min_workers,
+                    )),
                 });
             }
         }
@@ -1468,15 +1585,16 @@ fn cmd_serve(
         // For channel mode (non-persistent + thread), the dispatch was already
         // built by spawn_channel_workers.  For persistent + thread, we fall back
         // to the pipe-based dispatch.
-        let thread_dispatch: Option<Arc<ThreadDispatch>> = if let Some(td) = thread_dispatch_prebuilt.take() {
-            Some(Arc::new(td))
-        } else if is_thread_mode {
-            // Persistent workers — use pipe fds
-            let fds = pool.worker_fds();
-            Some(Arc::new(ThreadDispatch::new(fds)))
-        } else {
-            None
-        };
+        let thread_dispatch: Option<Arc<ThreadDispatch>> =
+            if let Some(td) = thread_dispatch_prebuilt.take() {
+                Some(Arc::new(td))
+            } else if is_thread_mode {
+                // Persistent workers — use pipe fds
+                let fds = pool.worker_fds();
+                Some(Arc::new(ThreadDispatch::new(fds)))
+            } else {
+                None
+            };
 
         let state = Arc::new(ServerState {
             listen: listen.clone(),
@@ -1512,7 +1630,9 @@ fn cmd_serve(
             worker_mode,
             thread_dispatch: thread_dispatch.clone(),
             persistent_workers: use_persistent,
-            worker_semaphore: Some(std::sync::Arc::new(tokio::sync::Semaphore::new(worker_count))),
+            worker_semaphore: Some(std::sync::Arc::new(tokio::sync::Semaphore::new(
+                worker_count,
+            ))),
             auto_scale: config.server.auto_scale,
             min_workers: config.server.min_workers,
             max_workers: config.server.max_workers,
@@ -1551,7 +1671,8 @@ fn cmd_serve(
         // --- Single-process mode: PHP on a dedicated thread, hyper for HTTP ---
         info!("Running in single-process mode");
 
-        let (php_tx, php_rx) = tokio::sync::mpsc::channel::<PhpRequest>(config.server.channel_capacity);
+        let (php_tx, php_rx) =
+            tokio::sync::mpsc::channel::<PhpRequest>(config.server.channel_capacity);
 
         let state = Arc::new(ServerState {
             listen: listen.clone(),
@@ -1624,10 +1745,7 @@ fn cmd_serve(
     }
 }
 
-fn php_executor_loop(
-    engine: &mut PhpEngine,
-    mut rx: tokio::sync::mpsc::Receiver<PhpRequest>,
-) {
+fn php_executor_loop(engine: &mut PhpEngine, mut rx: tokio::sync::mpsc::Receiver<PhpRequest>) {
     while let Some(req) = rx.blocking_recv() {
         for path in &req.uploaded_files {
             unsafe { turbine_engine::register_uploaded_file(path) };
@@ -1685,7 +1803,13 @@ fn build_tls_acceptor_with_sni(
     use std::io::BufReader;
 
     // Helper: load cert+key pair
-    fn load_cert_key(cert_path: &str, key_path: &str) -> (Vec<rustls::pki_types::CertificateDer<'static>>, rustls::pki_types::PrivateKeyDer<'static>) {
+    fn load_cert_key(
+        cert_path: &str,
+        key_path: &str,
+    ) -> (
+        Vec<rustls::pki_types::CertificateDer<'static>>,
+        rustls::pki_types::PrivateKeyDer<'static>,
+    ) {
         let cert_file = std::fs::File::open(cert_path).unwrap_or_else(|e| {
             error!(path = cert_path, "Failed to open certificate file: {e}");
             std::process::exit(1);
@@ -1738,8 +1862,8 @@ fn build_tls_acceptor_with_sni(
 
         for (domain, vcert_path, vkey_path) in vhost_certs {
             let (certs, key) = load_cert_key(vcert_path, vkey_path);
-            let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
-                .unwrap_or_else(|e| {
+            let signing_key =
+                rustls::crypto::ring::sign::any_supported_type(&key).unwrap_or_else(|e| {
                     error!(domain = %domain, "Failed to load signing key: {e}");
                     std::process::exit(1);
                 });
@@ -1773,7 +1897,10 @@ fn build_tls_acceptor_with_sni(
             }
         }
         impl ResolvesServerCert for SniWithFallback {
-            fn resolve(&self, client_hello: rustls::server::ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+            fn resolve(
+                &self,
+                client_hello: rustls::server::ClientHello<'_>,
+            ) -> Option<Arc<CertifiedKey>> {
                 // Try SNI lookup first — if the domain has a cert, use it.
                 // ResolvesServerCertUsingSni already checks server_name() internally.
                 if client_hello.server_name().is_some() {
@@ -1797,7 +1924,10 @@ fn build_tls_acceptor_with_sni(
             .with_no_client_auth()
             .with_cert_resolver(sni_fallback);
         cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-        info!(vhosts = vhost_certs.len(), "TLS configured with SNI (ALPN: h2, http/1.1)");
+        info!(
+            vhosts = vhost_certs.len(),
+            "TLS configured with SNI (ALPN: h2, http/1.1)"
+        );
         cfg
     };
 
@@ -1822,8 +1952,16 @@ async fn run_hyper_server(
         }
     };
 
-    let scheme = if tls_acceptor.is_some() { "https" } else { "http" };
-    let proto = if tls_acceptor.is_some() { "HTTP/1.1 + HTTP/2 (TLS)" } else { "HTTP/1.1 (keep-alive)" };
+    let scheme = if tls_acceptor.is_some() {
+        "https"
+    } else {
+        "http"
+    };
+    let proto = if tls_acceptor.is_some() {
+        "HTTP/1.1 + HTTP/2 (TLS)"
+    } else {
+        "HTTP/1.1 (keep-alive)"
+    };
     info!(listen = listen, protocol = proto, "Server listening");
     info!("Try: curl {scheme}://{listen}/");
     info!("Metrics: {scheme}://{listen}/_/metrics  Status: {scheme}://{listen}/_/status");
@@ -1842,12 +1980,16 @@ async fn run_hyper_server(
                 let new_config = RuntimeConfig::load();
 
                 // Reload error pages
-                let new_404 = new_config.error_pages.not_found.as_ref().and_then(|path| {
-                    std::fs::read(path).ok()
-                });
-                let new_500 = new_config.error_pages.server_error.as_ref().and_then(|path| {
-                    std::fs::read(path).ok()
-                });
+                let new_404 = new_config
+                    .error_pages
+                    .not_found
+                    .as_ref()
+                    .and_then(|path| std::fs::read(path).ok());
+                let new_500 = new_config
+                    .error_pages
+                    .server_error
+                    .as_ref()
+                    .and_then(|path| std::fs::read(path).ok());
                 *reload_state.error_page_404.write().unwrap() = new_404;
                 *reload_state.error_page_500.write().unwrap() = new_500;
                 info!("Configuration reloaded (error pages updated)");
@@ -1885,7 +2027,12 @@ async fn run_hyper_server(
                                     if let Some(ref sem) = scale_state.worker_semaphore {
                                         sem.add_permits(1);
                                     }
-                                    info!(alive = pool.alive_count(), busy = busy, mode = "thread", "Auto-scaled UP");
+                                    info!(
+                                        alive = pool.alive_count(),
+                                        busy = busy,
+                                        mode = "thread",
+                                        "Auto-scaled UP"
+                                    );
                                     idle_since = None;
                                 }
                                 Err(e) => warn!(error = %e, "Auto-scale thread spawn failed"),
@@ -1897,7 +2044,11 @@ async fn run_hyper_server(
                                     if let Some(ref sem) = scale_state.worker_semaphore {
                                         sem.add_permits(1);
                                     }
-                                    info!(alive = pool.alive_count(), busy = busy, "Auto-scaled UP");
+                                    info!(
+                                        alive = pool.alive_count(),
+                                        busy = busy,
+                                        "Auto-scaled UP"
+                                    );
                                     idle_since = None;
                                 }
                                 Ok(false) => std::process::exit(0), // child
@@ -1933,7 +2084,7 @@ async fn run_hyper_server(
         let watch_state = state.clone();
         let watcher_cfg = state.watcher_config.clone();
         tokio::task::spawn_blocking(move || {
-            use notify::{Watcher, RecursiveMode, Config};
+            use notify::{Config, RecursiveMode, Watcher};
             use std::sync::mpsc;
 
             let (tx, rx) = mpsc::channel();
@@ -1972,7 +2123,9 @@ async fn run_hyper_server(
                                 .unwrap_or(false)
                         });
                         if dominated && last_reload.elapsed() >= debounce {
-                            let changed: Vec<_> = event.paths.iter()
+                            let changed: Vec<_> = event
+                                .paths
+                                .iter()
                                 .filter_map(|p| p.file_name())
                                 .filter_map(|n| n.to_str())
                                 .collect();
@@ -1986,18 +2139,29 @@ async fn run_hyper_server(
                                 if watch_state.persistent_workers {
                                     // For persistent workers, a full respawn is needed
                                     // This is complex — for now, log a warning
-                                    warn!("Hot reload for persistent workers requires server restart");
+                                    warn!(
+                                        "Hot reload for persistent workers requires server restart"
+                                    );
                                 } else if watch_state.worker_mode == WorkerMode::Thread {
-                                    if let Err(e) = pool.spawn_workers_threaded(worker_event_loop_native) {
+                                    if let Err(e) =
+                                        pool.spawn_workers_threaded(worker_event_loop_native)
+                                    {
                                         error!(error = %e, "Failed to respawn worker threads after file change");
                                     } else {
-                                        info!(workers = pool.worker_count(), mode = "thread", "Worker threads restarted after file change");
+                                        info!(
+                                            workers = pool.worker_count(),
+                                            mode = "thread",
+                                            "Worker threads restarted after file change"
+                                        );
                                     }
                                 } else {
                                     if let Err(e) = pool.spawn_workers(worker_event_loop_native) {
                                         error!(error = %e, "Failed to respawn workers after file change");
                                     } else {
-                                        info!(workers = pool.worker_count(), "Workers restarted after file change");
+                                        info!(
+                                            workers = pool.worker_count(),
+                                            "Workers restarted after file change"
+                                        );
                                     }
                                 }
                             }
@@ -2020,8 +2184,9 @@ async fn run_hyper_server(
         let ctrl_c = tokio::signal::ctrl_c();
         #[cfg(unix)]
         {
-            let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("Failed to install SIGTERM handler");
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("Failed to install SIGTERM handler");
             tokio::select! {
                 _ = ctrl_c => info!("Received SIGINT, shutting down gracefully..."),
                 _ = sigterm.recv() => info!("Received SIGTERM, shutting down gracefully..."),
@@ -2118,7 +2283,10 @@ async fn run_hyper_server(
                 warn!(busy = busy, "Worker drain timeout reached");
                 break;
             }
-            info!(busy = busy, "Waiting for in-flight PHP requests to complete...");
+            info!(
+                busy = busy,
+                "Waiting for in-flight PHP requests to complete..."
+            );
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         }
 
@@ -2180,7 +2348,8 @@ async fn handle_request(
     let min_size = state.compression_min_size;
     let level = state.compression_level;
 
-    let origin = req.headers()
+    let origin = req
+        .headers()
         .get("origin")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
@@ -2203,7 +2372,9 @@ async fn handle_request(
     if is_tls {
         resp.headers_mut().insert(
             "Strict-Transport-Security",
-            "max-age=63072000; includeSubDomains; preload".parse().unwrap(),
+            "max-age=63072000; includeSubDomains; preload"
+                .parse()
+                .unwrap(),
         );
     }
 
@@ -2228,10 +2399,21 @@ async fn handle_request(
             let collected = body.collect().await.unwrap_or_default();
             let data = collected.to_bytes();
             if data.len() >= min_size {
-                if let Some((encoding, compressed)) = negotiate_compression(&accept_encoding, &state.compression_algorithms, &data, level) {
-                    parts.headers.insert("Content-Encoding", encoding.parse().unwrap());
-                    parts.headers.insert("Vary", "Accept-Encoding".parse().unwrap());
-                    parts.headers.insert("Content-Length", compressed.len().into());
+                if let Some((encoding, compressed)) = negotiate_compression(
+                    &accept_encoding,
+                    &state.compression_algorithms,
+                    &data,
+                    level,
+                ) {
+                    parts
+                        .headers
+                        .insert("Content-Encoding", encoding.parse().unwrap());
+                    parts
+                        .headers
+                        .insert("Vary", "Accept-Encoding".parse().unwrap());
+                    parts
+                        .headers
+                        .insert("Content-Length", compressed.len().into());
                     resp = Response::from_parts(parts, Full::new(Bytes::from(compressed)));
                 } else {
                     resp = Response::from_parts(parts, Full::new(data));
@@ -2260,35 +2442,61 @@ async fn handle_request_inner(
         // Dashboard is served without auth — the login screen handles it in-browser.
         if clean_path == "/_/dashboard" && state.dashboard_enabled {
             let body = dashboard::dashboard_html(&state.listen, state.dashboard_token.is_some());
-            return Ok(build_response(200, "text/html; charset=utf-8", body.into_bytes(), &[]));
+            return Ok(build_response(
+                200,
+                "text/html; charset=utf-8",
+                body.into_bytes(),
+                &[],
+            ));
         }
 
         // Token authentication for all other internal endpoints
         if let Some(ref expected_token) = state.dashboard_token {
-            let authorized = req.headers()
+            let authorized = req
+                .headers()
                 .get("authorization")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.strip_prefix("Bearer "))
                 .map(|t| t == expected_token.as_str())
                 .unwrap_or(false);
             if !authorized {
-                return Ok(build_response(401, "application/json", b"{\"error\": \"Unauthorized\"}".to_vec(), &[]));
+                return Ok(build_response(
+                    401,
+                    "application/json",
+                    b"{\"error\": \"Unauthorized\"}".to_vec(),
+                    &[],
+                ));
             }
         }
 
         if clean_path == "/_/metrics" && state.statistics_enabled {
             let body = state.metrics.prometheus();
-            return Ok(build_response(200, "text/plain; version=0.0.4", body.into_bytes(), &[]));
+            return Ok(build_response(
+                200,
+                "text/plain; version=0.0.4",
+                body.into_bytes(),
+                &[],
+            ));
         }
         if clean_path == "/_/status" && state.statistics_enabled {
             let body = state.metrics.status_json(state.worker_count);
-            return Ok(build_response(200, "application/json", body.into_bytes(), &[]));
+            return Ok(build_response(
+                200,
+                "application/json",
+                body.into_bytes(),
+                &[],
+            ));
         }
         if clean_path == "/_/cache/clear" {
             let cleared = state.cache.len();
             state.cache.clear();
             let body = format!("{{\"cleared\": {cleared}}}");
-            return Ok(build_response(200, "application/json", body.into_bytes(), &[]));
+            return Ok(build_response(
+                200,
+                "application/json",
+                body.into_bytes(),
+                &[],
+            ));
         }
 
         // GET /_/security/blocked — list currently blocked IPs
@@ -2298,18 +2506,41 @@ async fn handle_request_inner(
                 .iter()
                 .map(|(ip, secs)| match secs {
                     Some(s) => format!("{{\"ip\":\"{ip}\",\"expires_in_secs\":{s}}}"),
-                    None    => format!("{{\"ip\":\"{ip}\",\"expires_in_secs\":null}}"),
+                    None => format!("{{\"ip\":\"{ip}\",\"expires_in_secs\":null}}"),
                 })
                 .collect();
-            let body = format!("{{\"blocked\":[{}],\"count\":{}}}", entries.join(","), blocked.len());
-            return Ok(build_response(200, "application/json", body.into_bytes(), &[]));
+            let body = format!(
+                "{{\"blocked\":[{}],\"count\":{}}}",
+                entries.join(","),
+                blocked.len()
+            );
+            return Ok(build_response(
+                200,
+                "application/json",
+                body.into_bytes(),
+                &[],
+            ));
         }
 
         // POST /_/security/unblock  body: {"ip":"1.2.3.4"}
         if clean_path == "/_/security/unblock" && req_method == "POST" {
-            let (inner_req, _) = match FullHttpRequest::from_hyper(req, remote_addr, &state.upload_tmp_dir, &state.upload_security).await {
+            let (inner_req, _) = match FullHttpRequest::from_hyper(
+                req,
+                remote_addr,
+                &state.upload_tmp_dir,
+                &state.upload_security,
+            )
+            .await
+            {
                 Some(pair) => pair,
-                None => return Ok(build_response(400, "application/json", b"{\"error\":\"invalid request\"}".to_vec(), &[])),
+                None => {
+                    return Ok(build_response(
+                        400,
+                        "application/json",
+                        b"{\"error\":\"invalid request\"}".to_vec(),
+                        &[],
+                    ))
+                }
             };
             let body_str = String::from_utf8_lossy(&inner_req.body);
             // Parse {"ip":"x.x.x.x"} — minimal JSON extraction without a dep
@@ -2326,27 +2557,59 @@ async fn handle_request_inner(
                     if found {
                         warn!(ip = %ip, "IP manually unblocked via admin API");
                         let body = format!("{{\"unblocked\":true,\"ip\":\"{ip}\"}}");
-                        return Ok(build_response(200, "application/json", body.into_bytes(), &[]));
+                        return Ok(build_response(
+                            200,
+                            "application/json",
+                            body.into_bytes(),
+                            &[],
+                        ));
                     } else {
                         let body = format!("{{\"unblocked\":false,\"ip\":\"{ip}\",\"note\":\"IP was not blocked\"}}");
-                        return Ok(build_response(200, "application/json", body.into_bytes(), &[]));
+                        return Ok(build_response(
+                            200,
+                            "application/json",
+                            body.into_bytes(),
+                            &[],
+                        ));
                     }
                 }
                 Err(_) => {
-                    return Ok(build_response(400, "application/json", b"{\"error\":\"invalid IP address\"}".to_vec(), &[]));
+                    return Ok(build_response(
+                        400,
+                        "application/json",
+                        b"{\"error\":\"invalid IP address\"}".to_vec(),
+                        &[],
+                    ));
                 }
             }
         }
 
-        return Ok(build_response(404, "text/plain", b"Not found".to_vec(), &[]));
+        return Ok(build_response(
+            404,
+            "text/plain",
+            b"Not found".to_vec(),
+            &[],
+        ));
     }
 
     // --- ACME HTTP-01 challenge ---
     if clean_path.starts_with("/.well-known/acme-challenge/") {
-        if let Some(response) = acme::handle_challenge_request(&clean_path, &state.acme_challenge_tokens) {
-            return Ok(build_response(200, "text/plain", response.into_bytes(), &[]));
+        if let Some(response) =
+            acme::handle_challenge_request(&clean_path, &state.acme_challenge_tokens)
+        {
+            return Ok(build_response(
+                200,
+                "text/plain",
+                response.into_bytes(),
+                &[],
+            ));
         }
-        return Ok(build_response(404, "text/plain", b"ACME challenge token not found".to_vec(), &[]));
+        return Ok(build_response(
+            404,
+            "text/plain",
+            b"ACME challenge token not found".to_vec(),
+            &[],
+        ));
     }
 
     // --- Virtual host resolution (O(1) HashMap lookup) ---
@@ -2363,20 +2626,43 @@ async fn handle_request_inner(
     } else {
         None
     };
-    let app = vhost.as_ref().map(|v| &v.app_structure).unwrap_or(&state.app_structure);
+    let app = vhost
+        .as_ref()
+        .map(|v| &v.app_structure)
+        .unwrap_or(&state.app_structure);
 
-    let if_none_match = req.headers()
+    let if_none_match = req
+        .headers()
         .get("if-none-match")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
-    if let Some(resp) = try_serve_static(&app.document_root, &uri_path, &req_method, &state.metrics, request_start, if_none_match.as_deref()) {
+    if let Some(resp) = try_serve_static(
+        &app.document_root,
+        &uri_path,
+        &req_method,
+        &state.metrics,
+        request_start,
+        if_none_match.as_deref(),
+    ) {
         return Ok(resp);
     }
 
-    let (request, _remote) = match FullHttpRequest::from_hyper(req, remote_addr, &state.upload_tmp_dir, &state.upload_security).await {
+    let (request, _remote) = match FullHttpRequest::from_hyper(
+        req,
+        remote_addr,
+        &state.upload_tmp_dir,
+        &state.upload_security,
+    )
+    .await
+    {
         Some(pair) => pair,
         None => {
-            return Ok(build_response(400, "text/plain", b"Invalid HTTP request".to_vec(), &[]));
+            return Ok(build_response(
+                400,
+                "text/plain",
+                b"Invalid HTTP request".to_vec(),
+                &[],
+            ));
         }
     };
 
@@ -2388,7 +2674,7 @@ async fn handle_request_inner(
     // We include GET query params, POST form params, AND the raw body — this
     // ensures JSON POST bodies are also covered by the SQL / code injection guards.
     let query_params = request.get_params();
-    let post_params  = request.post_params();
+    let post_params = request.post_params();
 
     // Raw body scan: treat the first BODY_SCAN_LIMIT bytes as a single parameter so
     // that JSON-encoded payloads (e.g. {"q":"1 UNION SELECT *"}) are inspected even
@@ -2405,7 +2691,7 @@ async fn handle_request_inner(
     };
 
     let mut all_params: Vec<(String, String)> = Vec::with_capacity(
-        query_params.len() + post_params.len() + if raw_body_str.is_empty() { 0 } else { 1 }
+        query_params.len() + post_params.len() + if raw_body_str.is_empty() { 0 } else { 1 },
     );
     all_params.extend(query_params);
     all_params.extend(post_params);
@@ -2413,7 +2699,10 @@ async fn handle_request_inner(
         all_params.push(("_body".to_string(), raw_body_str));
     }
 
-    let param_refs: Vec<(&str, &str)> = all_params.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let param_refs: Vec<(&str, &str)> = all_params
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
 
     let php_path = app.resolve_path(&request.path);
 
@@ -2426,8 +2715,18 @@ async fn handle_request_inner(
             "BLOCKED: PHP file not in execution whitelist"
         );
         state.metrics.record_security_block();
-        state.metrics.record_request(&php_path, 403, request_start.elapsed().as_micros() as u64, 0);
-        return Ok(build_response(403, "text/plain", b"403 Forbidden: file not in execution whitelist".to_vec(), &[]));
+        state.metrics.record_request(
+            &php_path,
+            403,
+            request_start.elapsed().as_micros() as u64,
+            0,
+        );
+        return Ok(build_response(
+            403,
+            "text/plain",
+            b"403 Forbidden: file not in execution whitelist".to_vec(),
+            &[],
+        ));
     }
 
     // --- Camada 2: Data Directory Guard (Fortress) ---
@@ -2440,8 +2739,18 @@ async fn handle_request_inner(
                 "BLOCKED: PHP execution attempt inside data directory"
             );
             state.metrics.record_security_block();
-            state.metrics.record_request(&php_path, 403, request_start.elapsed().as_micros() as u64, 0);
-            return Ok(build_response(403, "text/plain", b"403 Forbidden: execution denied in data directory".to_vec(), &[]));
+            state.metrics.record_request(
+                &php_path,
+                403,
+                request_start.elapsed().as_micros() as u64,
+                0,
+            );
+            return Ok(build_response(
+                403,
+                "text/plain",
+                b"403 Forbidden: execution denied in data directory".to_vec(),
+                &[],
+            ));
         }
     }
 
@@ -2450,15 +2759,34 @@ async fn handle_request_inner(
         let reason = input_verdict.reason().unwrap_or("blocked");
         warn!(ip = %client_ip, reason = reason, "Request blocked by security layer");
         state.metrics.record_security_block();
-        state.metrics.record_request(&php_path, 403, request_start.elapsed().as_micros() as u64, 0);
+        state.metrics.record_request(
+            &php_path,
+            403,
+            request_start.elapsed().as_micros() as u64,
+            0,
+        );
         let body = format!("403 Forbidden: {reason}");
         return Ok(build_response(403, "text/plain", body.into_bytes(), &[]));
     }
 
     if !state.request_guard.exists(&php_path) {
-        state.metrics.record_request(&php_path, 404, request_start.elapsed().as_micros() as u64, 0);
-        if let Some(ref page) = *state.error_page_404.read().unwrap_or_else(|e| e.into_inner()) {
-            return Ok(build_response(404, "text/html; charset=utf-8", page.clone(), &[]));
+        state.metrics.record_request(
+            &php_path,
+            404,
+            request_start.elapsed().as_micros() as u64,
+            0,
+        );
+        if let Some(ref page) = *state
+            .error_page_404
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+        {
+            return Ok(build_response(
+                404,
+                "text/html; charset=utf-8",
+                page.clone(),
+                &[],
+            ));
         }
         let body = format!("File not found: {php_path}");
         return Ok(build_response(404, "text/plain", body.into_bytes(), &[]));
@@ -2481,12 +2809,27 @@ async fn handle_request_inner(
             let worker_idx = match td.get_idle(timeout_dur).await {
                 Some(idx) => idx,
                 None => {
-                    state.metrics.record_request(&php_path, 504, request_start.elapsed().as_micros() as u64, 0);
-                    return Ok(build_response(504, "text/plain", b"Request timeout waiting for worker".to_vec(), &[]));
+                    state.metrics.record_request(
+                        &php_path,
+                        504,
+                        request_start.elapsed().as_micros() as u64,
+                        0,
+                    );
+                    return Ok(build_response(
+                        504,
+                        "text/plain",
+                        b"Request timeout waiting for worker".to_vec(),
+                        &[],
+                    ));
                 }
             };
 
-            let server_port = state.listen.split(':').last().and_then(|p| p.parse::<u16>().ok()).unwrap_or(8080);
+            let server_port = state
+                .listen
+                .split(':')
+                .last()
+                .and_then(|p| p.parse::<u16>().ok())
+                .unwrap_or(8080);
             let full_uri_owned;
             let full_uri: &str = if request.query_string.is_empty() {
                 &request.path
@@ -2494,9 +2837,15 @@ async fn handle_request_inner(
                 full_uri_owned = format!("{}?{}", request.path, request.query_string);
                 &full_uri_owned
             };
-            let headers_vec: Vec<(&str, &str)> = request.headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            let headers_vec: Vec<(&str, &str)> = request
+                .headers
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
             let content_type = request.content_type.as_deref().unwrap_or("");
-            let cookie_header = request.headers.iter()
+            let cookie_header = request
+                .headers
+                .iter()
                 .find(|(k, _)| k.eq_ignore_ascii_case("Cookie"))
                 .map(|(_, v)| v.as_str())
                 .unwrap_or("");
@@ -2526,17 +2875,32 @@ async fn handle_request_inner(
             if let Err(e) = write_to_fd(cmd_fd, &encoded) {
                 error!(worker = worker_idx, error = %e, "Failed to send to persistent worker (thread dispatch)");
                 // guard returns worker on drop
-                return Ok(build_response(502, "text/plain", b"Worker communication error".to_vec(), &[]));
+                return Ok(build_response(
+                    502,
+                    "text/plain",
+                    b"Worker communication error".to_vec(),
+                    &[],
+                ));
             }
 
             let reader_handle = tokio::spawn(async move {
-                let result = tokio::task::spawn_blocking(move || {
-                    decode_response(resp_fd)
-                }).await.unwrap_or_else(|e| Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())));
+                let result = tokio::task::spawn_blocking(move || decode_response(resp_fd))
+                    .await
+                    .unwrap_or_else(|e| {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            e.to_string(),
+                        ))
+                    });
                 result
             });
 
-            let bin_result = reader_handle.await.unwrap_or_else(|e| Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())));
+            let bin_result = reader_handle.await.unwrap_or_else(|e| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e.to_string(),
+                ))
+            });
             drop(guard);
 
             match bin_result {
@@ -2544,25 +2908,66 @@ async fn handle_request_inner(
                     let mut body = resp.body;
                     let mut status_code = resp.status;
                     let elapsed_us = request_start.elapsed().as_micros() as u64;
-                    let php_content_type = resp.headers.iter()
+                    let php_content_type = resp
+                        .headers
+                        .iter()
                         .find(|(k, _)| k.eq_ignore_ascii_case("Content-Type"))
                         .map(|(_, v)| v.as_str());
-                    let mut content_type = php_content_type.unwrap_or_else(|| detect_content_type(&body)).to_string();
+                    let mut content_type = php_content_type
+                        .unwrap_or_else(|| detect_content_type(&body))
+                        .to_string();
                     let mut resp_headers = resp.headers;
-                    postprocess_php_response(&state, &mut body, &mut status_code, &mut content_type, &mut resp_headers);
+                    postprocess_php_response(
+                        &state,
+                        &mut body,
+                        &mut status_code,
+                        &mut content_type,
+                        &mut resp_headers,
+                    );
                     state.security.record_request(client_ip, false);
-                    state.metrics.record_request(&php_path, status_code, elapsed_us, body.len() as u64);
-                    write_access_log(&state, &request.method, &request.path, status_code, request_start, &client_ip.to_string());
-                    let extra_headers: Vec<(&str, &str)> = resp_headers.iter()
-                        .filter(|(k, _)| !k.eq_ignore_ascii_case("Content-Type") && !k.eq_ignore_ascii_case("Content-Length"))
+                    state.metrics.record_request(
+                        &php_path,
+                        status_code,
+                        elapsed_us,
+                        body.len() as u64,
+                    );
+                    write_access_log(
+                        &state,
+                        &request.method,
+                        &request.path,
+                        status_code,
+                        request_start,
+                        &client_ip.to_string(),
+                    );
+                    let extra_headers: Vec<(&str, &str)> = resp_headers
+                        .iter()
+                        .filter(|(k, _)| {
+                            !k.eq_ignore_ascii_case("Content-Type")
+                                && !k.eq_ignore_ascii_case("Content-Length")
+                        })
                         .map(|(k, v)| (k.as_str(), v.as_str()))
                         .collect();
-                    return Ok(build_response(status_code, &content_type, body, &extra_headers));
+                    return Ok(build_response(
+                        status_code,
+                        &content_type,
+                        body,
+                        &extra_headers,
+                    ));
                 }
                 Err(e) => {
                     error!(worker = worker_idx, error = %e, "Persistent worker response decode error");
-                    state.metrics.record_request(&php_path, 502, request_start.elapsed().as_micros() as u64, 0);
-                    return Ok(build_response(502, "text/plain", format!("Worker error: {e}").into_bytes(), &[]));
+                    state.metrics.record_request(
+                        &php_path,
+                        502,
+                        request_start.elapsed().as_micros() as u64,
+                        0,
+                    );
+                    return Ok(build_response(
+                        502,
+                        "text/plain",
+                        format!("Worker error: {e}").into_bytes(),
+                        &[],
+                    ));
                 }
             }
         }
@@ -2580,18 +2985,38 @@ async fn handle_request_inner(
                 match tokio::time::timeout(timeout_dur, sem_arc.acquire_owned()).await {
                     Ok(Ok(permit)) => Some(permit),
                     Ok(Err(_)) => {
-                        return Ok(build_response(503, "text/plain", b"Worker pool closed".to_vec(), &[]));
+                        return Ok(build_response(
+                            503,
+                            "text/plain",
+                            b"Worker pool closed".to_vec(),
+                            &[],
+                        ));
                     }
                     Err(_) => {
-                        state.metrics.record_request(&php_path, 504, request_start.elapsed().as_micros() as u64, 0);
-                        return Ok(build_response(504, "text/plain", b"Request timeout waiting for worker".to_vec(), &[]));
+                        state.metrics.record_request(
+                            &php_path,
+                            504,
+                            request_start.elapsed().as_micros() as u64,
+                            0,
+                        );
+                        return Ok(build_response(
+                            504,
+                            "text/plain",
+                            b"Request timeout waiting for worker".to_vec(),
+                            &[],
+                        ));
                     }
                 }
             } else {
                 None
             };
 
-            let server_port = state.listen.split(':').last().and_then(|p| p.parse::<u16>().ok()).unwrap_or(8080);
+            let server_port = state
+                .listen
+                .split(':')
+                .last()
+                .and_then(|p| p.parse::<u16>().ok())
+                .unwrap_or(8080);
             let full_uri_owned;
             let full_uri: &str = if request.query_string.is_empty() {
                 &request.path
@@ -2599,9 +3024,15 @@ async fn handle_request_inner(
                 full_uri_owned = format!("{}?{}", request.path, request.query_string);
                 &full_uri_owned
             };
-            let headers_vec: Vec<(&str, &str)> = request.headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            let headers_vec: Vec<(&str, &str)> = request
+                .headers
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
             let content_type = request.content_type.as_deref().unwrap_or("");
-            let cookie_header = request.headers.iter()
+            let cookie_header = request
+                .headers
+                .iter()
                 .find(|(k, _)| k.eq_ignore_ascii_case("Cookie"))
                 .map(|(_, v)| v.as_str())
                 .unwrap_or("");
@@ -2648,7 +3079,12 @@ async fn handle_request_inner(
                         match pool.get_idle_worker() {
                             Some(idx) => idx,
                             None => {
-                                return Ok(build_response(503, "text/plain", b"All workers busy".to_vec(), &[]));
+                                return Ok(build_response(
+                                    503,
+                                    "text/plain",
+                                    b"All workers busy".to_vec(),
+                                    &[],
+                                ));
                             }
                         }
                     }
@@ -2659,11 +3095,21 @@ async fn handle_request_inner(
                     if let Err(e) = worker.send_request(&encoded) {
                         error!(worker = worker_idx, error = %e, "Failed to send to persistent worker");
                         pool.return_worker(worker_idx);
-                        return Ok(build_response(502, "text/plain", b"Worker communication error".to_vec(), &[]));
+                        return Ok(build_response(
+                            502,
+                            "text/plain",
+                            b"Worker communication error".to_vec(),
+                            &[],
+                        ));
                     }
                     worker.resp_fd()
                 } else {
-                    return Ok(build_response(502, "text/plain", b"Worker unavailable".to_vec(), &[]));
+                    return Ok(build_response(
+                        502,
+                        "text/plain",
+                        b"Worker unavailable".to_vec(),
+                        &[],
+                    ));
                 };
                 (worker_idx, resp_fd)
             };
@@ -2677,9 +3123,14 @@ async fn handle_request_inner(
             let return_state = state.clone();
             let reader_handle = tokio::spawn(async move {
                 let _permit_guard = permit; // Hold permit until task completes
-                let result = tokio::task::spawn_blocking(move || {
-                    decode_response(resp_fd)
-                }).await.unwrap_or_else(|e| Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())));
+                let result = tokio::task::spawn_blocking(move || decode_response(resp_fd))
+                    .await
+                    .unwrap_or_else(|e| {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            e.to_string(),
+                        ))
+                    });
                 if let Some(ref pool_mutex) = return_state.worker_pool {
                     let mut pool = pool_mutex.lock();
                     if result.is_ok() {
@@ -2704,7 +3155,12 @@ async fn handle_request_inner(
                 result
             });
 
-            let bin_result = reader_handle.await.unwrap_or_else(|e| Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())));
+            let bin_result = reader_handle.await.unwrap_or_else(|e| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e.to_string(),
+                ))
+            });
 
             match bin_result {
                 Ok(resp) => {
@@ -2712,31 +3168,72 @@ async fn handle_request_inner(
                     let mut status_code = resp.status;
 
                     let elapsed_us = request_start.elapsed().as_micros() as u64;
-                    let php_content_type = resp.headers.iter()
+                    let php_content_type = resp
+                        .headers
+                        .iter()
                         .find(|(k, _)| k.eq_ignore_ascii_case("Content-Type"))
                         .map(|(_, v)| v.as_str());
-                    let mut content_type = php_content_type.unwrap_or_else(|| detect_content_type(&body)).to_string();
+                    let mut content_type = php_content_type
+                        .unwrap_or_else(|| detect_content_type(&body))
+                        .to_string();
                     let mut resp_headers = resp.headers;
 
-                    postprocess_php_response(&state, &mut body, &mut status_code, &mut content_type, &mut resp_headers);
+                    postprocess_php_response(
+                        &state,
+                        &mut body,
+                        &mut status_code,
+                        &mut content_type,
+                        &mut resp_headers,
+                    );
 
                     state.security.record_request(client_ip, false);
-                    state.metrics.record_request(&php_path, status_code, elapsed_us, body.len() as u64);
+                    state.metrics.record_request(
+                        &php_path,
+                        status_code,
+                        elapsed_us,
+                        body.len() as u64,
+                    );
 
                     debug!(method = %request.method, path = %request.path, worker = worker_idx, status = status_code, elapsed_us = elapsed_us, bytes = body.len(), "Persistent fast-path completed");
-                    write_access_log(&state, &request.method, &request.path, status_code, request_start, &client_ip.to_string());
+                    write_access_log(
+                        &state,
+                        &request.method,
+                        &request.path,
+                        status_code,
+                        request_start,
+                        &client_ip.to_string(),
+                    );
 
-                    let extra_headers: Vec<(&str, &str)> = resp_headers.iter()
-                        .filter(|(k, _)| !k.eq_ignore_ascii_case("Content-Type") && !k.eq_ignore_ascii_case("Content-Length"))
+                    let extra_headers: Vec<(&str, &str)> = resp_headers
+                        .iter()
+                        .filter(|(k, _)| {
+                            !k.eq_ignore_ascii_case("Content-Type")
+                                && !k.eq_ignore_ascii_case("Content-Length")
+                        })
                         .map(|(k, v)| (k.as_str(), v.as_str()))
                         .collect();
 
-                    return Ok(build_response(status_code, &content_type, body, &extra_headers));
+                    return Ok(build_response(
+                        status_code,
+                        &content_type,
+                        body,
+                        &extra_headers,
+                    ));
                 }
                 Err(e) => {
                     error!(worker = worker_idx, error = %e, "Persistent worker response decode error");
-                    state.metrics.record_request(&php_path, 502, request_start.elapsed().as_micros() as u64, 0);
-                    return Ok(build_response(502, "text/plain", format!("Worker error: {e}").into_bytes(), &[]));
+                    state.metrics.record_request(
+                        &php_path,
+                        502,
+                        request_start.elapsed().as_micros() as u64,
+                        0,
+                    );
+                    return Ok(build_response(
+                        502,
+                        "text/plain",
+                        format!("Worker error: {e}").into_bytes(),
+                        &[],
+                    ));
                 }
             }
         }
@@ -2746,7 +3243,12 @@ async fn handle_request_inner(
     if let Err(e) = state.request_guard.validate(&php_path) {
         let body = format!("403 Forbidden: {e}");
         state.metrics.record_security_block();
-        state.metrics.record_request(&php_path, 403, request_start.elapsed().as_micros() as u64, 0);
+        state.metrics.record_request(
+            &php_path,
+            403,
+            request_start.elapsed().as_micros() as u64,
+            0,
+        );
         return Ok(build_response(403, "text/plain", body.into_bytes(), &[]));
     }
 
@@ -2763,16 +3265,37 @@ async fn handle_request_inner(
     if let Some(cached) = state.cache.get(&request.method, &request.path, source_hash) {
         let elapsed = request_start.elapsed();
         state.metrics.record_cache_hit();
-        state.metrics.record_request(&php_path, cached.status, elapsed.as_micros() as u64, cached.body.len() as u64);
+        state.metrics.record_request(
+            &php_path,
+            cached.status,
+            elapsed.as_micros() as u64,
+            cached.body.len() as u64,
+        );
         state.security.record_request(client_ip, false);
         debug!(path = %request.path, elapsed_us = elapsed.as_micros(), "Cache hit");
-        return Ok(build_response(cached.status, &cached.content_type, cached.body.clone(), &[]));
+        return Ok(build_response(
+            cached.status,
+            &cached.content_type,
+            cached.body.clone(),
+            &[],
+        ));
     }
     state.metrics.record_cache_miss();
 
     let app_root = std::env::current_dir().unwrap_or_default();
-    let server_port = state.listen.split(':').last().and_then(|p| p.parse::<u16>().ok()).unwrap_or(8080);
-    let superglobals = request.php_superglobals_code(&app_root, &php_path, &client_ip.to_string(), server_port, state.is_tls);
+    let server_port = state
+        .listen
+        .split(':')
+        .last()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(8080);
+    let superglobals = request.php_superglobals_code(
+        &app_root,
+        &php_path,
+        &client_ip.to_string(),
+        server_port,
+        state.is_tls,
+    );
     let abs_php_path = app.document_root.join(&php_path);
     let include_path = abs_php_path.display().to_string().replace('\'', "\\'");
     let session_code = if state.session_auto_start {
@@ -2787,9 +3310,7 @@ async fn handle_request_inner(
         bootstrap = state.php_bootstrap,
     );
 
-    let uploaded_files: Vec<String> = request.files.iter()
-        .map(|f| f.tmp_path.clone())
-        .collect();
+    let uploaded_files: Vec<String> = request.files.iter().map(|f| f.tmp_path.clone()).collect();
 
     if let Some(ref php_tx) = state.php_tx {
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
@@ -2800,7 +3321,12 @@ async fn handle_request_inner(
         };
 
         if php_tx.send(php_req).await.is_err() {
-            return Ok(build_response(500, "text/plain", b"PHP executor unavailable".to_vec(), &[]));
+            return Ok(build_response(
+                500,
+                "text/plain",
+                b"PHP executor unavailable".to_vec(),
+                &[],
+            ));
         }
 
         let php_result = if state.request_timeout.is_zero() {
@@ -2810,16 +3336,35 @@ async fn handle_request_inner(
                 Ok(result) => result,
                 Err(_) => {
                     warn!(method = %request.method, path = %request.path, timeout_s = state.request_timeout.as_secs(), "Request timeout");
-                    state.metrics.record_request(&php_path, 504, request_start.elapsed().as_micros() as u64, 0);
-                    write_access_log(&state, &request.method, &request.path, 504, request_start, &client_ip.to_string());
-                    return Ok(build_response(504, "text/plain", b"Request timeout".to_vec(), &[]));
+                    state.metrics.record_request(
+                        &php_path,
+                        504,
+                        request_start.elapsed().as_micros() as u64,
+                        0,
+                    );
+                    write_access_log(
+                        &state,
+                        &request.method,
+                        &request.path,
+                        504,
+                        request_start,
+                        &client_ip.to_string(),
+                    );
+                    return Ok(build_response(
+                        504,
+                        "text/plain",
+                        b"Request timeout".to_vec(),
+                        &[],
+                    ));
                 }
             }
         };
 
         match php_result {
             Ok(Ok(mut response)) => {
-                if let Some((status_code, headers, body)) = parse_turbine_response_envelope(&response.body) {
+                if let Some((status_code, headers, body)) =
+                    parse_turbine_response_envelope(&response.body)
+                {
                     response.status_code = status_code;
                     response.headers = headers;
                     response.body = body;
@@ -2827,45 +3372,103 @@ async fn handle_request_inner(
 
                 let elapsed = request_start.elapsed();
                 let elapsed_us = elapsed.as_micros() as u64;
-                let php_content_type = response.headers.iter()
+                let php_content_type = response
+                    .headers
+                    .iter()
                     .find(|(k, _)| k.eq_ignore_ascii_case("Content-Type"))
                     .map(|(_, v)| v.as_str());
-                let mut content_type = php_content_type.unwrap_or_else(|| detect_content_type(&response.body)).to_string();
+                let mut content_type = php_content_type
+                    .unwrap_or_else(|| detect_content_type(&response.body))
+                    .to_string();
                 let mut status_code = response.status_code;
 
-                postprocess_php_response(&state, &mut response.body, &mut status_code, &mut content_type, &mut response.headers);
+                postprocess_php_response(
+                    &state,
+                    &mut response.body,
+                    &mut status_code,
+                    &mut content_type,
+                    &mut response.headers,
+                );
 
                 state.security.record_request(client_ip, false);
-                state.metrics.record_request(&php_path, status_code, elapsed_us, response.body.len() as u64);
+                state.metrics.record_request(
+                    &php_path,
+                    status_code,
+                    elapsed_us,
+                    response.body.len() as u64,
+                );
                 if !response_prevents_caching(&response.headers) {
-                    state.cache.put(&request.method, &request.path, source_hash, status_code, &content_type, &response.body);
+                    state.cache.put(
+                        &request.method,
+                        &request.path,
+                        source_hash,
+                        status_code,
+                        &content_type,
+                        &response.body,
+                    );
                 }
 
                 info!(method = %request.method, path = %request.path, status = status_code, elapsed_us = elapsed_us, "Request completed");
-                write_access_log(&state, &request.method, &request.path, status_code, request_start, &client_ip.to_string());
+                write_access_log(
+                    &state,
+                    &request.method,
+                    &request.path,
+                    status_code,
+                    request_start,
+                    &client_ip.to_string(),
+                );
 
-                let extra_headers: Vec<(&str, &str)> = response.headers.iter()
-                    .filter(|(k, _)| !k.eq_ignore_ascii_case("Content-Type") && !k.eq_ignore_ascii_case("Content-Length"))
+                let extra_headers: Vec<(&str, &str)> = response
+                    .headers
+                    .iter()
+                    .filter(|(k, _)| {
+                        !k.eq_ignore_ascii_case("Content-Type")
+                            && !k.eq_ignore_ascii_case("Content-Length")
+                    })
                     .map(|(k, v)| (k.as_str(), v.as_str()))
                     .collect();
 
-                Ok(build_response(status_code, &content_type, response.body, &extra_headers))
+                Ok(build_response(
+                    status_code,
+                    &content_type,
+                    response.body,
+                    &extra_headers,
+                ))
             }
             Ok(Err(e)) => {
                 state.security.record_request(client_ip, true);
-                state.metrics.record_request(&php_path, 500, request_start.elapsed().as_micros() as u64, 0);
-                if let Some(ref page) = *state.error_page_500.read().unwrap_or_else(|e| e.into_inner()) {
-                    Ok(build_response(500, "text/html; charset=utf-8", page.clone(), &[]))
+                state.metrics.record_request(
+                    &php_path,
+                    500,
+                    request_start.elapsed().as_micros() as u64,
+                    0,
+                );
+                if let Some(ref page) = *state
+                    .error_page_500
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                {
+                    Ok(build_response(
+                        500,
+                        "text/html; charset=utf-8",
+                        page.clone(),
+                        &[],
+                    ))
                 } else {
                     let body = format!("PHP Error: {e}");
                     Ok(build_response(500, "text/plain", body.into_bytes(), &[]))
                 }
             }
-            Err(_) => {
-                Ok(build_response(500, "text/plain", b"PHP executor channel closed".to_vec(), &[]))
-            }
+            Err(_) => Ok(build_response(
+                500,
+                "text/plain",
+                b"PHP executor channel closed".to_vec(),
+                &[],
+            )),
         }
-    } else if state.thread_dispatch.is_some() && find_pool(&state, &clean_path).map_or(false, |r| r.pool_index.is_none()) {
+    } else if state.thread_dispatch.is_some()
+        && find_pool(&state, &clean_path).map_or(false, |r| r.pool_index.is_none())
+    {
         // ── Thread-mode classic dispatch (lock-free) ─────────────────
         let td = state.thread_dispatch.as_ref().unwrap();
         let timeout_dur = if state.max_wait_time > 0 {
@@ -2879,8 +3482,18 @@ async fn handle_request_inner(
         let worker_idx = match td.get_idle(timeout_dur).await {
             Some(idx) => idx,
             None => {
-                state.metrics.record_request(&php_path, 504, request_start.elapsed().as_micros() as u64, 0);
-                return Ok(build_response(504, "text/plain", b"Request timeout waiting for worker".to_vec(), &[]));
+                state.metrics.record_request(
+                    &php_path,
+                    504,
+                    request_start.elapsed().as_micros() as u64,
+                    0,
+                );
+                return Ok(build_response(
+                    504,
+                    "text/plain",
+                    b"Request timeout waiting for worker".to_vec(),
+                    &[],
+                ));
             }
         };
 
@@ -2892,16 +3505,23 @@ async fn handle_request_inner(
             full_uri_owned = format!("{}?{}", request.path, request.query_string);
             &full_uri_owned
         };
-        let headers_vec: Vec<(&str, &str)> = request.headers
+        let headers_vec: Vec<(&str, &str)> = request
+            .headers
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
         let content_type_str = request.content_type.as_deref().unwrap_or("");
-        let cookie_header = request.headers.iter()
+        let cookie_header = request
+            .headers
+            .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case("Cookie"))
             .map(|(_, v)| v.as_str())
             .unwrap_or("");
-        let content_length: i32 = if request.body.is_empty() { -1 } else { request.body.len() as i32 };
+        let content_length: i32 = if request.body.is_empty() {
+            -1
+        } else {
+            request.body.len() as i32
+        };
         let document_root = app.document_root.display().to_string();
         let script_path_native = abs_php_path.display().to_string();
         let script_name = format!("/{}", &php_path);
@@ -2935,7 +3555,12 @@ async fn handle_request_inner(
             if let Err(e) = td.send_request(worker_idx, encoded) {
                 error!(worker = worker_idx, error = %e, "Channel send failed (thread dispatch)");
                 // guard will return_idle on drop
-                return Ok(build_response(502, "text/plain", b"Worker communication error".to_vec(), &[]));
+                return Ok(build_response(
+                    502,
+                    "text/plain",
+                    b"Worker communication error".to_vec(),
+                    &[],
+                ));
             }
             match td.recv_response(worker_idx).await {
                 Some(resp) => Ok(resp),
@@ -2946,18 +3571,34 @@ async fn handle_request_inner(
             let (cmd_fd, resp_fd) = td.fds(worker_idx);
             if let Err(e) = write_to_fd(cmd_fd, &encoded) {
                 error!(worker = worker_idx, error = %e, "Failed to send to worker (thread dispatch)");
-                return Ok(build_response(502, "text/plain", b"Worker communication error".to_vec(), &[]));
+                return Ok(build_response(
+                    502,
+                    "text/plain",
+                    b"Worker communication error".to_vec(),
+                    &[],
+                ));
             }
             let reader_handle = tokio::spawn(async move {
-                let result = tokio::task::spawn_blocking(move || {
-                    read_native_response_from_fd(resp_fd)
-                }).await.unwrap_or_else(|e| Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())));
+                let result =
+                    tokio::task::spawn_blocking(move || read_native_response_from_fd(resp_fd))
+                        .await
+                        .unwrap_or_else(|e| {
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                e.to_string(),
+                            ))
+                        });
                 result
             });
             // Note: guard (from outer scope) will return_idle when dropped.
             reader_handle
                 .await
-                .unwrap_or_else(|e| Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))
+                .unwrap_or_else(|e| {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        e.to_string(),
+                    ))
+                })
                 .map_err(|e| e.to_string())
         };
 
@@ -2969,27 +3610,72 @@ async fn handle_request_inner(
                 let mut body = resp.body;
                 let mut status_code = resp.http_status;
                 let elapsed_us = request_start.elapsed().as_micros() as u64;
-                let php_content_type = resp.headers.iter()
+                let php_content_type = resp
+                    .headers
+                    .iter()
                     .find(|(k, _)| k.eq_ignore_ascii_case("Content-Type"))
                     .map(|(_, v)| v.as_str());
-                let mut content_type = php_content_type.unwrap_or_else(|| detect_content_type(&body)).to_string();
+                let mut content_type = php_content_type
+                    .unwrap_or_else(|| detect_content_type(&body))
+                    .to_string();
                 let mut resp_headers = resp.headers;
-                postprocess_php_response(&state, &mut body, &mut status_code, &mut content_type, &mut resp_headers);
+                postprocess_php_response(
+                    &state,
+                    &mut body,
+                    &mut status_code,
+                    &mut content_type,
+                    &mut resp_headers,
+                );
                 state.security.record_request(client_ip, false);
-                state.metrics.record_request(&php_path, status_code, elapsed_us, body.len() as u64);
+                state
+                    .metrics
+                    .record_request(&php_path, status_code, elapsed_us, body.len() as u64);
                 if !response_prevents_caching(&resp_headers) {
-                    state.cache.put(&request.method, &request.path, source_hash, status_code, &content_type, &body);
+                    state.cache.put(
+                        &request.method,
+                        &request.path,
+                        source_hash,
+                        status_code,
+                        &content_type,
+                        &body,
+                    );
                 }
-                write_access_log(&state, &request.method, &request.path, status_code, request_start, &client_ip.to_string());
-                let extra_headers: Vec<(&str, &str)> = resp_headers.iter()
-                    .filter(|(k, _)| !k.eq_ignore_ascii_case("Content-Type") && !k.eq_ignore_ascii_case("Content-Length"))
+                write_access_log(
+                    &state,
+                    &request.method,
+                    &request.path,
+                    status_code,
+                    request_start,
+                    &client_ip.to_string(),
+                );
+                let extra_headers: Vec<(&str, &str)> = resp_headers
+                    .iter()
+                    .filter(|(k, _)| {
+                        !k.eq_ignore_ascii_case("Content-Type")
+                            && !k.eq_ignore_ascii_case("Content-Length")
+                    })
                     .map(|(k, v)| (k.as_str(), v.as_str()))
                     .collect();
-                Ok(build_response(status_code, &content_type, body, &extra_headers))
+                Ok(build_response(
+                    status_code,
+                    &content_type,
+                    body,
+                    &extra_headers,
+                ))
             }
             Err(e) => {
-                state.metrics.record_request(&php_path, 502, request_start.elapsed().as_micros() as u64, 0);
-                Ok(build_response(502, "text/plain", format!("Worker error: {e}").into_bytes(), &[]))
+                state.metrics.record_request(
+                    &php_path,
+                    502,
+                    request_start.elapsed().as_micros() as u64,
+                    0,
+                );
+                Ok(build_response(
+                    502,
+                    "text/plain",
+                    format!("Worker error: {e}").into_bytes(),
+                    &[],
+                ))
             }
         }
     } else if let Some(resolved) = find_pool(&state, &clean_path) {
@@ -3010,11 +3696,26 @@ async fn handle_request_inner(
             match tokio::time::timeout(timeout_dur, sem_arc.acquire_owned()).await {
                 Ok(Ok(permit)) => Some(permit),
                 Ok(Err(_)) => {
-                    return Ok(build_response(503, "text/plain", b"Worker pool closed".to_vec(), &[]));
+                    return Ok(build_response(
+                        503,
+                        "text/plain",
+                        b"Worker pool closed".to_vec(),
+                        &[],
+                    ));
                 }
                 Err(_) => {
-                    state.metrics.record_request(&php_path, 504, request_start.elapsed().as_micros() as u64, 0);
-                    return Ok(build_response(504, "text/plain", b"Request timeout waiting for worker".to_vec(), &[]));
+                    state.metrics.record_request(
+                        &php_path,
+                        504,
+                        request_start.elapsed().as_micros() as u64,
+                        0,
+                    );
+                    return Ok(build_response(
+                        504,
+                        "text/plain",
+                        b"Request timeout waiting for worker".to_vec(),
+                        &[],
+                    ));
                 }
             }
         } else {
@@ -3038,7 +3739,12 @@ async fn handle_request_inner(
                     match pool.get_idle_worker() {
                         Some(idx) => idx,
                         None => {
-                            return Ok(build_response(503, "text/plain", b"All workers busy".to_vec(), &[]));
+                            return Ok(build_response(
+                                503,
+                                "text/plain",
+                                b"All workers busy".to_vec(),
+                                &[],
+                            ));
                         }
                     }
                 }
@@ -3056,12 +3762,15 @@ async fn handle_request_inner(
                         full_uri_owned = format!("{}?{}", request.path, request.query_string);
                         &full_uri_owned
                     };
-                    let headers_vec: Vec<(&str, &str)> = request.headers
+                    let headers_vec: Vec<(&str, &str)> = request
+                        .headers
                         .iter()
                         .map(|(k, v)| (k.as_str(), v.as_str()))
                         .collect();
                     let content_type = request.content_type.as_deref().unwrap_or("");
-                    let cookie_header = request.headers.iter()
+                    let cookie_header = request
+                        .headers
+                        .iter()
                         .find(|(k, _)| k.eq_ignore_ascii_case("Cookie"))
                         .map(|(_, v)| v.as_str())
                         .unwrap_or("");
@@ -3069,20 +3778,20 @@ async fn handle_request_inner(
                     let script_filename = abs_php_path.display().to_string();
                     let script_name = format!("/{}", &php_path);
                     let per = PersistentRequest {
-                        method:          &request.method,
-                        uri:             full_uri,
-                        body:            &request.body,
-                        client_ip:       &client_ip.to_string(),
-                        port:            server_port,
-                        is_https:        state.is_tls,
-                        headers:         &headers_vec,
+                        method: &request.method,
+                        uri: full_uri,
+                        body: &request.body,
+                        client_ip: &client_ip.to_string(),
+                        port: server_port,
+                        is_https: state.is_tls,
+                        headers: &headers_vec,
                         script_filename: &script_filename,
-                        query_string:    &request.query_string,
-                        document_root:   &document_root,
+                        query_string: &request.query_string,
+                        document_root: &document_root,
                         content_type,
-                        cookie:          cookie_header,
-                        path_info:       &request.path,
-                        script_name:     &script_name,
+                        cookie: cookie_header,
+                        path_info: &request.path,
+                        script_name: &script_name,
                     };
                     let encoded = encode_request(&per);
                     worker.send_request(&encoded)
@@ -3092,19 +3801,27 @@ async fn handle_request_inner(
                     let full_uri_native: &str = if request.query_string.is_empty() {
                         &request.path
                     } else {
-                        full_uri_owned_native = format!("{}?{}", request.path, request.query_string);
+                        full_uri_owned_native =
+                            format!("{}?{}", request.path, request.query_string);
                         &full_uri_owned_native
                     };
-                    let headers_vec: Vec<(&str, &str)> = request.headers
+                    let headers_vec: Vec<(&str, &str)> = request
+                        .headers
                         .iter()
                         .map(|(k, v)| (k.as_str(), v.as_str()))
                         .collect();
                     let content_type = request.content_type.as_deref().unwrap_or("");
-                    let cookie_header = request.headers.iter()
+                    let cookie_header = request
+                        .headers
+                        .iter()
                         .find(|(k, _)| k.eq_ignore_ascii_case("Cookie"))
                         .map(|(_, v)| v.as_str())
                         .unwrap_or("");
-                    let content_length: i32 = if request.body.is_empty() { -1 } else { request.body.len() as i32 };
+                    let content_length: i32 = if request.body.is_empty() {
+                        -1
+                    } else {
+                        request.body.len() as i32
+                    };
                     let document_root = app.document_root.display().to_string();
                     let script_path_native = abs_php_path.display().to_string();
                     let script_name = format!("/{}", &php_path);
@@ -3133,11 +3850,21 @@ async fn handle_request_inner(
                 if let Err(e) = send_result {
                     error!(worker = worker_idx, error = %e, "Failed to send to worker");
                     pool.return_worker(worker_idx);
-                    return Ok(build_response(502, "text/plain", b"Worker communication error".to_vec(), &[]));
+                    return Ok(build_response(
+                        502,
+                        "text/plain",
+                        b"Worker communication error".to_vec(),
+                        &[],
+                    ));
                 }
                 worker.resp_fd()
             } else {
-                return Ok(build_response(502, "text/plain", b"Worker unavailable".to_vec(), &[]));
+                return Ok(build_response(
+                    502,
+                    "text/plain",
+                    b"Worker unavailable".to_vec(),
+                    &[],
+                ));
             };
 
             (worker_idx, resp_fd)
@@ -3165,13 +3892,23 @@ async fn handle_request_inner(
                 WorkerResult::Persistent(
                     tokio::task::spawn_blocking(move || decode_response(resp_fd))
                         .await
-                        .unwrap_or_else(|e| Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))
+                        .unwrap_or_else(|e| {
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                e.to_string(),
+                            ))
+                        }),
                 )
             } else {
                 WorkerResult::Native(
-                    tokio::task::spawn_blocking(move || {
-                        read_native_response_from_fd(resp_fd)
-                    }).await.unwrap_or_else(|e| Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))
+                    tokio::task::spawn_blocking(move || read_native_response_from_fd(resp_fd))
+                        .await
+                        .unwrap_or_else(|e| {
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                e.to_string(),
+                            ))
+                        }),
                 )
             };
             // Always return the worker after reading
@@ -3180,93 +3917,197 @@ async fn handle_request_inner(
         });
 
         let worker_result = reader_handle.await.unwrap_or_else(|e| {
-            WorkerResult::Native(Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))
+            WorkerResult::Native(Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                e.to_string(),
+            )))
         });
 
         match worker_result {
-            WorkerResult::Persistent(bin_result) => {
-                match bin_result {
-                    Ok(resp) => {
-                        let mut body = resp.body;
-                        let mut status_code = resp.status;
+            WorkerResult::Persistent(bin_result) => match bin_result {
+                Ok(resp) => {
+                    let mut body = resp.body;
+                    let mut status_code = resp.status;
 
-                        let elapsed = request_start.elapsed();
-                        let elapsed_us = elapsed.as_micros() as u64;
-                        let php_content_type = resp.headers.iter()
-                            .find(|(k, _)| k.eq_ignore_ascii_case("Content-Type"))
-                            .map(|(_, v)| v.as_str());
-                        let mut content_type = php_content_type.unwrap_or_else(|| detect_content_type(&body)).to_string();
-                        let mut resp_headers = resp.headers;
+                    let elapsed = request_start.elapsed();
+                    let elapsed_us = elapsed.as_micros() as u64;
+                    let php_content_type = resp
+                        .headers
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case("Content-Type"))
+                        .map(|(_, v)| v.as_str());
+                    let mut content_type = php_content_type
+                        .unwrap_or_else(|| detect_content_type(&body))
+                        .to_string();
+                    let mut resp_headers = resp.headers;
 
-                        postprocess_php_response(&state, &mut body, &mut status_code, &mut content_type, &mut resp_headers);
+                    postprocess_php_response(
+                        &state,
+                        &mut body,
+                        &mut status_code,
+                        &mut content_type,
+                        &mut resp_headers,
+                    );
 
-                        state.security.record_request(client_ip, false);
-                        state.metrics.record_request(&php_path, status_code, elapsed_us, body.len() as u64);
-                        if !response_prevents_caching(&resp_headers) {
-                            state.cache.put(&request.method, &request.path, source_hash, status_code, &content_type, &body);
-                        }
-
-                        info!(method = %request.method, path = %request.path, worker = worker_idx_log, status = status_code, elapsed_us = elapsed_us, bytes = body.len(), "Request completed");
-                        write_access_log(&state, &request.method, &request.path, status_code, request_start, &client_ip.to_string());
-
-                        let extra_headers: Vec<(&str, &str)> = resp_headers.iter()
-                            .filter(|(k, _)| !k.eq_ignore_ascii_case("Content-Type") && !k.eq_ignore_ascii_case("Content-Length"))
-                            .map(|(k, v)| (k.as_str(), v.as_str()))
-                            .collect();
-
-                        Ok(build_response(status_code, &content_type, body, &extra_headers))
+                    state.security.record_request(client_ip, false);
+                    state.metrics.record_request(
+                        &php_path,
+                        status_code,
+                        elapsed_us,
+                        body.len() as u64,
+                    );
+                    if !response_prevents_caching(&resp_headers) {
+                        state.cache.put(
+                            &request.method,
+                            &request.path,
+                            source_hash,
+                            status_code,
+                            &content_type,
+                            &body,
+                        );
                     }
-                    Err(e) => {
-                        state.security.record_request(client_ip, true);
-                        state.metrics.record_request(&php_path, 502, request_start.elapsed().as_micros() as u64, 0);
-                        error!(worker = worker_idx_log, error = %e, "Failed to read persistent worker response");
-                        Ok(build_response(502, "text/plain", b"Worker response error".to_vec(), &[]))
-                    }
+
+                    info!(method = %request.method, path = %request.path, worker = worker_idx_log, status = status_code, elapsed_us = elapsed_us, bytes = body.len(), "Request completed");
+                    write_access_log(
+                        &state,
+                        &request.method,
+                        &request.path,
+                        status_code,
+                        request_start,
+                        &client_ip.to_string(),
+                    );
+
+                    let extra_headers: Vec<(&str, &str)> = resp_headers
+                        .iter()
+                        .filter(|(k, _)| {
+                            !k.eq_ignore_ascii_case("Content-Type")
+                                && !k.eq_ignore_ascii_case("Content-Length")
+                        })
+                        .map(|(k, v)| (k.as_str(), v.as_str()))
+                        .collect();
+
+                    Ok(build_response(
+                        status_code,
+                        &content_type,
+                        body,
+                        &extra_headers,
+                    ))
                 }
-            }
-            WorkerResult::Native(native_result) => {
-                match native_result {
-                    Ok(resp) => {
-                        let mut body = resp.body;
-                        let mut status_code = if resp.http_status == 0 { 200 } else { resp.http_status };
-
-                        let elapsed = request_start.elapsed();
-                        let elapsed_us = elapsed.as_micros() as u64;
-                        let php_content_type = resp.headers.iter()
-                            .find(|(k, _)| k.eq_ignore_ascii_case("Content-Type"))
-                            .map(|(_, v)| v.as_str());
-                        let mut content_type = php_content_type.unwrap_or_else(|| detect_content_type(&body)).to_string();
-                        let mut resp_headers = resp.headers;
-
-                        postprocess_php_response(&state, &mut body, &mut status_code, &mut content_type, &mut resp_headers);
-
-                        state.security.record_request(client_ip, !resp.success);
-                        state.metrics.record_request(&php_path, status_code, elapsed_us, body.len() as u64);
-                        if !response_prevents_caching(&resp_headers) {
-                            state.cache.put(&request.method, &request.path, source_hash, status_code, &content_type, &body);
-                        }
-
-                        info!(method = %request.method, path = %request.path, worker = worker_idx_log, status = status_code, elapsed_us = elapsed_us, bytes = body.len(), "Request completed");
-                        write_access_log(&state, &request.method, &request.path, status_code, request_start, &client_ip.to_string());
-
-                        let extra_headers: Vec<(&str, &str)> = resp_headers.iter()
-                            .filter(|(k, _)| !k.eq_ignore_ascii_case("Content-Type") && !k.eq_ignore_ascii_case("Content-Length"))
-                            .map(|(k, v)| (k.as_str(), v.as_str()))
-                            .collect();
-
-                        Ok(build_response(status_code, &content_type, body, &extra_headers))
-                    }
-                    Err(e) => {
-                        state.security.record_request(client_ip, true);
-                        state.metrics.record_request(&php_path, 502, request_start.elapsed().as_micros() as u64, 0);
-                        error!(worker = worker_idx_log, error = %e, "Failed to read native worker response");
-                        Ok(build_response(502, "text/plain", b"Worker response error".to_vec(), &[]))
-                    }
+                Err(e) => {
+                    state.security.record_request(client_ip, true);
+                    state.metrics.record_request(
+                        &php_path,
+                        502,
+                        request_start.elapsed().as_micros() as u64,
+                        0,
+                    );
+                    error!(worker = worker_idx_log, error = %e, "Failed to read persistent worker response");
+                    Ok(build_response(
+                        502,
+                        "text/plain",
+                        b"Worker response error".to_vec(),
+                        &[],
+                    ))
                 }
-            }
+            },
+            WorkerResult::Native(native_result) => match native_result {
+                Ok(resp) => {
+                    let mut body = resp.body;
+                    let mut status_code = if resp.http_status == 0 {
+                        200
+                    } else {
+                        resp.http_status
+                    };
+
+                    let elapsed = request_start.elapsed();
+                    let elapsed_us = elapsed.as_micros() as u64;
+                    let php_content_type = resp
+                        .headers
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case("Content-Type"))
+                        .map(|(_, v)| v.as_str());
+                    let mut content_type = php_content_type
+                        .unwrap_or_else(|| detect_content_type(&body))
+                        .to_string();
+                    let mut resp_headers = resp.headers;
+
+                    postprocess_php_response(
+                        &state,
+                        &mut body,
+                        &mut status_code,
+                        &mut content_type,
+                        &mut resp_headers,
+                    );
+
+                    state.security.record_request(client_ip, !resp.success);
+                    state.metrics.record_request(
+                        &php_path,
+                        status_code,
+                        elapsed_us,
+                        body.len() as u64,
+                    );
+                    if !response_prevents_caching(&resp_headers) {
+                        state.cache.put(
+                            &request.method,
+                            &request.path,
+                            source_hash,
+                            status_code,
+                            &content_type,
+                            &body,
+                        );
+                    }
+
+                    info!(method = %request.method, path = %request.path, worker = worker_idx_log, status = status_code, elapsed_us = elapsed_us, bytes = body.len(), "Request completed");
+                    write_access_log(
+                        &state,
+                        &request.method,
+                        &request.path,
+                        status_code,
+                        request_start,
+                        &client_ip.to_string(),
+                    );
+
+                    let extra_headers: Vec<(&str, &str)> = resp_headers
+                        .iter()
+                        .filter(|(k, _)| {
+                            !k.eq_ignore_ascii_case("Content-Type")
+                                && !k.eq_ignore_ascii_case("Content-Length")
+                        })
+                        .map(|(k, v)| (k.as_str(), v.as_str()))
+                        .collect();
+
+                    Ok(build_response(
+                        status_code,
+                        &content_type,
+                        body,
+                        &extra_headers,
+                    ))
+                }
+                Err(e) => {
+                    state.security.record_request(client_ip, true);
+                    state.metrics.record_request(
+                        &php_path,
+                        502,
+                        request_start.elapsed().as_micros() as u64,
+                        0,
+                    );
+                    error!(worker = worker_idx_log, error = %e, "Failed to read native worker response");
+                    Ok(build_response(
+                        502,
+                        "text/plain",
+                        b"Worker response error".to_vec(),
+                        &[],
+                    ))
+                }
+            },
         }
     } else {
-        Ok(build_response(500, "text/plain", b"No PHP executor configured".to_vec(), &[]))
+        Ok(build_response(
+            500,
+            "text/plain",
+            b"No PHP executor configured".to_vec(),
+            &[],
+        ))
     }
 }
 
@@ -3346,7 +4187,8 @@ fn parse_turbine_response_envelope(body: &[u8]) -> Option<(u16, Vec<(String, Str
         })?;
 
     let envelope = &body[envelope_start..];
-    let body_marker_pos = envelope.windows(body_marker.len())
+    let body_marker_pos = envelope
+        .windows(body_marker.len())
         .position(|w| w == body_marker)?;
 
     let meta = std::str::from_utf8(&envelope[..body_marker_pos]).ok()?;
@@ -3465,7 +4307,10 @@ fn apply_cors_headers(
     }
 
     if cors.allow_credentials {
-        headers.insert("Access-Control-Allow-Credentials", HeaderValue::from_static("true"));
+        headers.insert(
+            "Access-Control-Allow-Credentials",
+            HeaderValue::from_static("true"),
+        );
     }
 
     let methods = cors.allow_methods.join(", ");
@@ -3490,7 +4335,12 @@ fn apply_cors_headers(
     }
 }
 
-fn build_response(status: u16, content_type: &str, body: Vec<u8>, extra_headers: &[(&str, &str)]) -> HyperResponse {
+fn build_response(
+    status: u16,
+    content_type: &str,
+    body: Vec<u8>,
+    extra_headers: &[(&str, &str)],
+) -> HyperResponse {
     let status_code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let content_length = body.len();
     let mut builder = Response::builder()
@@ -3503,7 +4353,10 @@ fn build_response(status: u16, content_type: &str, body: Vec<u8>, extra_headers:
         .header("X-Frame-Options", "SAMEORIGIN")
         .header("X-XSS-Protection", "0")
         .header("Referrer-Policy", "strict-origin-when-cross-origin")
-        .header("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+        .header(
+            "Permissions-Policy",
+            "camera=(), microphone=(), geolocation=()",
+        );
 
     for (name, value) in extra_headers {
         // Skip invalid header names/values to prevent panics from PHP code
@@ -3515,12 +4368,14 @@ fn build_response(status: u16, content_type: &str, body: Vec<u8>, extra_headers:
         }
     }
 
-    builder.body(Full::new(Bytes::from(body))).unwrap_or_else(|_| {
-        Response::builder()
-            .status(StatusCode::INTERNAL_SERVER_ERROR)
-            .body(Full::new(Bytes::from("Internal response build error")))
-            .unwrap()
-    })
+    builder
+        .body(Full::new(Bytes::from(body)))
+        .unwrap_or_else(|_| {
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Full::new(Bytes::from("Internal response build error")))
+                .unwrap()
+        })
 }
 
 /// Write an access log entry in Combined Log Format.
@@ -3541,9 +4396,7 @@ fn write_access_log(
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let line = format!(
-            "{client_ip} - - [{now}] \"{method} {path}\" {status} {elapsed_ms}ms\n"
-        );
+        let line = format!("{client_ip} - - [{now}] \"{method} {path}\" {status} {elapsed_ms}ms\n");
 
         if let Ok(mut writer) = log_mutex.lock() {
             let _ = writer.write_all(line.as_bytes());
@@ -3594,7 +4447,12 @@ fn try_serve_static(
                             let elapsed_us = elapsed.as_micros() as u64;
                             metrics.record_request(relative, 304, elapsed_us, 0);
                             info!(method = %method, path = uri_path, status = 304, elapsed_us = elapsed_us, "Not modified");
-                            return Some(build_response(304, content_type, Vec::new(), &[("ETag", &etag)]));
+                            return Some(build_response(
+                                304,
+                                content_type,
+                                Vec::new(),
+                                &[("ETag", &etag)],
+                            ));
                         }
                     }
 
@@ -3610,7 +4468,12 @@ fn try_serve_static(
 
                     info!(method = %method, path = uri_path, status = 200, elapsed_us = elapsed_us, bytes = body.len(), "Static file served");
 
-                    Some(build_response(200, content_type, body, &[("Cache-Control", cache_header), ("ETag", &etag)]))
+                    Some(build_response(
+                        200,
+                        content_type,
+                        body,
+                        &[("Cache-Control", cache_header), ("ETag", &etag)],
+                    ))
                 }
                 Err(_) => None,
             }
@@ -3628,7 +4491,9 @@ fn detect_content_type(output: &[u8]) -> &'static str {
     if prefix.starts_with(b"{") || prefix.starts_with(b"[") {
         "application/json"
     } else if prefix.windows(6).any(|w| w == b"<html>" || w == b"<HTML>")
-        || prefix.windows(9).any(|w| w == b"<!DOCTYPE" || w == b"<!doctype")
+        || prefix
+            .windows(9)
+            .any(|w| w == b"<!DOCTYPE" || w == b"<!doctype")
     {
         "text/html; charset=utf-8"
     } else {
@@ -3638,7 +4503,13 @@ fn detect_content_type(output: &[u8]) -> &'static str {
 
 /// Map file extension to MIME type for static file serving.
 fn mime_type_for_extension(path: &str) -> &'static str {
-    match path.rsplit('.').next().unwrap_or("").to_lowercase().as_str() {
+    match path
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_lowercase()
+        .as_str()
+    {
         "css" => "text/css; charset=utf-8",
         "js" | "mjs" => "application/javascript; charset=utf-8",
         "json" => "application/json",
