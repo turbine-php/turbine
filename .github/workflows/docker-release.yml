@@ -38,21 +38,29 @@ jobs:
             php_major: "8.4"
             zts: "0"
             thread_safety: "nts"
+            phalcon_version: "5.11.1"
+            phpredis_version: "6.1.0"
 
           - php_version: "8.4.6"
             php_major: "8.4"
             zts: "1"
             thread_safety: "zts"
+            phalcon_version: "5.11.1"
+            phpredis_version: "6.1.0"
 
           - php_version: "8.5.1"
             php_major: "8.5"
             zts: "0"
             thread_safety: "nts"
+            phalcon_version: "5.11.1"
+            phpredis_version: "6.2.0"
 
           - php_version: "8.5.1"
             php_major: "8.5"
             zts: "1"
             thread_safety: "zts"
+            phalcon_version: "5.11.1"
+            phpredis_version: "6.2.0"
 
     steps:
       - uses: actions/checkout@v4
@@ -88,6 +96,8 @@ jobs:
           build-args: |
             PHP_VERSION=${{ matrix.php_version }}
             ZTS=${{ matrix.zts }}
+            PHALCON_VERSION=${{ matrix.phalcon_version }}
+            PHPREDIS_VERSION=${{ matrix.phpredis_version }}
           tags: |
             ${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}-php${{ matrix.php_major }}-${{ matrix.thread_safety }}
             ${{ env.IMAGE_NAME }}:latest-php${{ matrix.php_major }}-${{ matrix.thread_safety }}
