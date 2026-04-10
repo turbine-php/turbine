@@ -54,7 +54,7 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     php8.4-fpm php8.4-cli php8.4-mbstring php8.4-xml php8.4-curl php8.4-zip \
     php8.4-intl php8.4-bcmath php8.4-gd php8.4-sqlite3 \
     php8.4-tokenizer php8.4-fileinfo php8.4-opcache php8.4-dev \
-    composer git unzip jq build-essential
+    php-pear composer git unzip jq build-essential
 
 log "Installing Phalcon ${PHALCON_VERSION} extension for native FPM..."
 pecl install phalcon-${PHALCON_VERSION}
