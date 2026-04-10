@@ -1,5 +1,7 @@
 # Turbine
 
+[![Tests](https://github.com/turbine-php/turbine/actions/workflows/test.yml/badge.svg?branch=master)](https://github.com/turbine-php/turbine/actions/workflows/test.yml)
+
 <p align="center">
   <img src="assets/logo.png" alt="Turbine" width="400" />
 </p>
