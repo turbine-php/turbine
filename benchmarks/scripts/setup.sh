@@ -1,227 +1,346 @@
 #!/usr/bin/env bash
 # setup.sh — One-time server setup on Hetzner CPX41 (Ubuntu 24.04)
 #
-# Uses the pre-built katisuhara/turbine-php Docker images to:
-#   1. Run Turbine benchmarks (via docker run — no compilation needed)
-#   2. Extract phalcon.so for the PHP-FPM baseline (avoids ~10 min of compilation)
-#
-# Installs: Docker, Nginx, PHP 8.4-FPM, Composer, wrk
+# Strategy:
+#   - All PHP servers run as Docker containers (Turbine NTS/ZTS, FrankenPHP)
+#   - Nginx + PHP-FPM run natively as the classic baseline (raw + Laravel only)
+#   - No Phalcon compilation — FrankenPHP+Phalcon image is built using
+#     install-php-extensions (same mechanism the Turbine image uses)
+#   - bombardier provides HTTP metrics including latency percentiles
 
 set -euo pipefail
 
 TURBINE_IMAGE_NTS="katisuhara/turbine-php:latest-php8.4-nts"
 TURBINE_IMAGE_ZTS="katisuhara/turbine-php:latest-php8.4-zts"
+FRANKENPHP_IMAGE="dunglas/frankenphp:latest"
+FRANKENPHP_PHALCON_IMAGE="frankenphp-phalcon:bench"
+PHALCON_VERSION="5.11.1"
+BOMBARDIER_VERSION="1.2.6"
 
 log() { echo "[setup] $*"; }
 
-# ── Docker (needed first — images are the source of PHP + extensions) ────────
+# ── 1. Docker ─────────────────────────────────────────────────────────────────
 log "Installing Docker..."
 apt-get update -qq
 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    ca-certificates curl
+    ca-certificates curl gnupg
 curl -fsSL https://get.docker.com | sh
 
-log "Pulling Turbine Docker images..."
+# ── 2. Pull Turbine images ────────────────────────────────────────────────────
+log "Pulling Turbine images..."
 docker pull "$TURBINE_IMAGE_NTS"
 docker pull "$TURBINE_IMAGE_ZTS"
 
-# ── Extract phalcon.so from NTS image — no compilation needed ────────────────
-log "Extracting phalcon.so from Docker image..."
-CONTAINER_ID=$(docker create "$TURBINE_IMAGE_NTS")
-# Find where phalcon.so lives inside the image
-PHALCON_PATH=$(docker run --rm "$TURBINE_IMAGE_NTS" \
-    sh -c 'find /opt/php-embed/lib/php/extensions -name phalcon.so | head -1')
-docker cp "${CONTAINER_ID}:${PHALCON_PATH}" /tmp/phalcon.so
-docker rm "${CONTAINER_ID}" >/dev/null
-log "phalcon.so extracted from image (path was: ${PHALCON_PATH})"
+# ── 3. Pull + build FrankenPHP images ────────────────────────────────────────
+log "Pulling FrankenPHP image..."
+docker pull "$FRANKENPHP_IMAGE"
 
-# ── System packages: Nginx, PHP-FPM, Composer, wrk ──────────────────────────
-log "Adding ondrej/php PPA for PHP 8.4..."
+log "Building FrankenPHP + Phalcon image (uses pre-built binaries, ~2 min)..."
+docker build -t "$FRANKENPHP_PHALCON_IMAGE" - << DOCKERFILE
+FROM ${FRANKENPHP_IMAGE}
+RUN install-php-extensions phalcon-${PHALCON_VERSION}
+DOCKERFILE
+log "FrankenPHP + Phalcon image ready."
+
+# ── 4. bombardier ─────────────────────────────────────────────────────────────
+log "Installing bombardier..."
+curl -fsSL "https://github.com/codesenberg/bombardier/releases/download/v${BOMBARDIER_VERSION}/bombardier-linux-amd64" \
+    -o /usr/local/bin/bombardier
+chmod +x /usr/local/bin/bombardier
+bombardier --version
+
+# ── 5. Native Nginx + PHP 8.4-FPM (baseline for raw + laravel) ───────────────
+log "Adding ondrej/php PPA..."
 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    software-properties-common gnupg
+    software-properties-common
 add-apt-repository -y ppa:ondrej/php
 apt-get update -qq
 
-log "Installing Nginx, PHP 8.4-FPM, Composer, wrk..."
+log "Installing Nginx, PHP 8.4-FPM, Composer..."
 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     nginx \
     php8.4-fpm php8.4-cli php8.4-mbstring php8.4-xml php8.4-curl php8.4-zip \
     php8.4-intl php8.4-bcmath php8.4-gd php8.4-sqlite3 \
     php8.4-tokenizer php8.4-fileinfo php8.4-opcache \
-    composer wrk \
-    git unzip jq
+    composer git unzip jq
 
-# ── Raw PHP application ──────────────────────────────────────────────────────
+# ── 6. Application directories ───────────────────────────────────────────────
 log "Creating raw PHP application..."
-mkdir -p /var/www/raw
+mkdir -p /var/www/raw/public
 cat > /var/www/raw/index.php << 'PHPEOF'
 <?php
 header('Content-Type: text/plain');
 echo "Hello, World!";
 PHPEOF
+# FrankenPHP reads from public/ by default
+ln -sf /var/www/raw/index.php /var/www/raw/public/index.php
 
-# ── Laravel application ──────────────────────────────────────────────────────
-log "Creating Laravel project (this takes a few minutes)..."
-COMPOSER_ALLOW_SUPERUSER=1 composer create-project laravel/laravel /var/www/laravel \
-    --quiet --no-interaction --prefer-dist
-
-# Replace routes/web.php with a single lightweight benchmark route (no DB, no session)
-cat > /var/www/laravel/routes/web.php << 'PHPEOF'
-<?php
-use Illuminate\Support\Facades\Route;
-
-Route::get('/', fn() => response()->json(['status' => 'ok']));
-PHPEOF
-
-chown -R www-data:www-data /var/www/laravel/storage /var/www/laravel/bootstrap/cache
-chmod -R ug+rw /var/www/laravel/storage /var/www/laravel/bootstrap/cache
-
-# ── Phalcon micro application ────────────────────────────────────────────────
 log "Creating Phalcon micro application..."
-mkdir -p /var/www/phalcon
+mkdir -p /var/www/phalcon/public
 cat > /var/www/phalcon/index.php << 'PHPEOF'
 <?php
 use Phalcon\Mvc\Micro;
-
 $app = new Micro();
 $app->get('/', function () {
+    header('Content-Type: application/json');
     echo json_encode(['status' => 'ok']);
 });
 $app->handle($_SERVER['REQUEST_URI'] ?? '/');
 PHPEOF
+ln -sf /var/www/phalcon/index.php /var/www/phalcon/public/index.php
 
-# ── Install phalcon.so into PHP-FPM (extracted from Docker image) ─────────────
-log "Installing phalcon.so into PHP 8.4 extension dir..."
-PHP_EXT_DIR=$(php8.4 -r 'echo ini_get("extension_dir");')
-cp /tmp/phalcon.so "${PHP_EXT_DIR}/phalcon.so"
-PHP_MODS_DIR="/etc/php/8.4/mods-available"
-echo "extension=phalcon.so" > "${PHP_MODS_DIR}/phalcon.ini"
-phpenmod -v 8.4 phalcon
-log "Phalcon extension installed (no compilation needed)."
+log "Copying PHP benchmark scripts..."
+mkdir -p /var/www/php-bench
+cp /root/bench/php/*.php /var/www/php-bench/
 
-# ── PHP-FPM configuration ────────────────────────────────────────────────────
-log "Configuring PHP-FPM (static pool, 8 workers)..."
-sed -i 's/^pm = .*/pm = static/'             /etc/php/8.4/fpm/pool.d/www.conf
-sed -i 's/^pm.max_children = .*/pm.max_children = 8/' /etc/php/8.4/fpm/pool.d/www.conf
-# Disable slow log to avoid I/O overhead during bench
-sed -i 's/^slowlog.*/#&/'                   /etc/php/8.4/fpm/pool.d/www.conf
+log "Creating Laravel project (this may take a few minutes)..."
+COMPOSER_ALLOW_SUPERUSER=1 composer create-project laravel/laravel /var/www/laravel \
+    --quiet --no-interaction --prefer-dist
 
-# ── Nginx virtual hosts ───────────────────────────────────────────────────────
+# Minimal benchmark route: no DB, no session, pure JSON
+cat > /var/www/laravel/routes/web.php << 'PHPEOF'
+<?php
+use Illuminate\Support\Facades\Route;
+Route::get('/', fn() => response()->json(['status' => 'ok']));
+PHPEOF
+
+chown -R www-data:www-data \
+    /var/www/laravel/storage \
+    /var/www/laravel/bootstrap/cache
+chmod -R ug+rw \
+    /var/www/laravel/storage \
+    /var/www/laravel/bootstrap/cache
+
+# ── 7. PHP-FPM: two static pools (4w and 8w) ─────────────────────────────────
+# VPS: 8 vCPU / 16 GB RAM  →  memory_limit=256M, max_requests=50000
+log "Configuring PHP-FPM pools (4w and 8w)..."
+mv /etc/php/8.4/fpm/pool.d/www.conf /etc/php/8.4/fpm/pool.d/www.conf.disabled
+
+for POOL_WORKERS in 4 8; do
+cat > /etc/php/8.4/fpm/pool.d/bench-${POOL_WORKERS}w.conf << FPMEOF
+[bench-${POOL_WORKERS}w]
+user  = www-data
+group = www-data
+listen = /run/php/fpm-${POOL_WORKERS}w.sock
+listen.owner = www-data
+listen.group = www-data
+pm = static
+pm.max_children = ${POOL_WORKERS}
+pm.max_requests = 50000
+php_admin_value[memory_limit]              = 256M
+php_admin_value[opcache.memory_consumption] = 128
+php_admin_value[opcache.enable]            = 1
+FPMEOF
+done
+
+# ── 8. Nginx virtual hosts (raw / php-bench / laravel × 4w + 8w) ─────────────
 log "Configuring Nginx..."
 rm -f /etc/nginx/sites-enabled/default
 
-cat > /etc/nginx/sites-available/bench-raw << 'NGINXEOF'
+for NW in 4 8; do
+    SOCK="unix:/run/php/fpm-${NW}w.sock"
+
+    # raw PHP
+    RAW_PORT=$([[ $NW -eq 4 ]] && echo 8804 || echo 8803)
+    cat > /etc/nginx/sites-available/bench-raw-${NW}w << NGINXEOF
 server {
-    listen 8803;
+    listen ${RAW_PORT};
     root /var/www/raw;
-    location ~ \.php$ {
-        fastcgi_pass unix:/run/php/php8.4-fpm.sock;
-        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+    location / { try_files \$uri \$uri/ /index.php?\$query_string; }
+    location ~ \\.php\$ {
+        fastcgi_pass ${SOCK};
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
         include fastcgi_params;
     }
 }
 NGINXEOF
 
-cat > /etc/nginx/sites-available/bench-laravel << 'NGINXEOF'
+    # PHP benchmark scripts
+    PHP_PORT=$([[ $NW -eq 4 ]] && echo 8834 || echo 8833)
+    cat > /etc/nginx/sites-available/bench-php-scripts-${NW}w << NGINXEOF
 server {
-    listen 8813;
+    listen ${PHP_PORT};
+    root /var/www/php-bench;
+    location ~ \\.php\$ {
+        fastcgi_pass ${SOCK};
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        include fastcgi_params;
+    }
+}
+NGINXEOF
+
+    # Laravel
+    LAR_PORT=$([[ $NW -eq 4 ]] && echo 8814 || echo 8813)
+    cat > /etc/nginx/sites-available/bench-laravel-${NW}w << NGINXEOF
+server {
+    listen ${LAR_PORT};
     root /var/www/laravel/public;
-    location / { try_files $uri $uri/ /index.php?$query_string; }
-    location ~ \.php$ {
-        fastcgi_pass unix:/run/php/php8.4-fpm.sock;
-        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+    location / { try_files \$uri \$uri/ /index.php?\$query_string; }
+    location ~ \\.php\$ {
+        fastcgi_pass ${SOCK};
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
         include fastcgi_params;
     }
 }
 NGINXEOF
 
-cat > /etc/nginx/sites-available/bench-phalcon << 'NGINXEOF'
-server {
-    listen 8823;
-    root /var/www/phalcon;
-    location / { try_files $uri $uri/ /index.php?$query_string; }
-    location ~ \.php$ {
-        fastcgi_pass unix:/run/php/php8.4-fpm.sock;
-        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
-        include fastcgi_params;
-    }
-}
-NGINXEOF
-
-for site in bench-raw bench-laravel bench-phalcon; do
-    ln -sf "/etc/nginx/sites-available/${site}" /etc/nginx/sites-enabled/
+    ln -sf /etc/nginx/sites-available/bench-raw-${NW}w         /etc/nginx/sites-enabled/
+    ln -sf /etc/nginx/sites-available/bench-php-scripts-${NW}w /etc/nginx/sites-enabled/
+    ln -sf /etc/nginx/sites-available/bench-laravel-${NW}w     /etc/nginx/sites-enabled/
 done
 
 nginx -t
 systemctl restart nginx php8.4-fpm
 
-# ── Turbine config files ─────────────────────────────────────────────────────
+# ── 9. Turbine config files (all apps × modes × worker counts) ────────────────
+# Naming: {app}-{nts|zts}-{N}w[-p].toml
+#   nts = worker_mode "process"   persistent_workers false/true
+#   zts = worker_mode "thread"    (no persistent variant needed)
+# PHP: memory_limit=256M, opcache=128M, worker_max_requests=50000
 log "Creating Turbine config files..."
 mkdir -p /etc/turbine
 
-# Raw PHP — process mode, no extensions needed
-cat > /etc/turbine/raw.toml << 'TOMLEOF'
+make_turbine_toml() {
+    local file="$1" workers="$2" mode="$3" persistent="$4"
+    local extensions="${5:-[]}"
+    local extra_ini="${6:-}"
+    cat > "$file" << TOML
 [server]
 listen = "0.0.0.0:80"
-workers = 8
-worker_mode = "process"
+workers = ${workers}
+worker_mode = "${mode}"
+worker_max_requests = 50000
+persistent_workers = ${persistent}
 request_timeout = 30
-
 [php]
-extensions = []
-
+memory_limit = "256M"
+opcache_memory = 128
+extensions = ${extensions}
+${extra_ini}
 [logging]
 level = "error"
-TOMLEOF
+TOML
+}
 
-# Laravel — process mode, no extra extensions
-cat > /etc/turbine/laravel.toml << 'TOMLEOF'
-[server]
-listen = "0.0.0.0:80"
-workers = 8
-worker_mode = "process"
-request_timeout = 30
+for W in 4 8; do
+    # Raw PHP + PHP-bench scripts (stateless — persistent mode is safe)
+    for APP in raw php-bench; do
+        make_turbine_toml /etc/turbine/${APP}-nts-${W}w.toml    ${W} process false
+        make_turbine_toml /etc/turbine/${APP}-nts-${W}w-p.toml  ${W} process true
+        make_turbine_toml /etc/turbine/${APP}-zts-${W}w.toml    ${W} thread  false
+    done
 
-[php]
-extensions = []
+    # Laravel (stateful framework — include persistent variant for comparison)
+    LARAVEL_INI=$'[php.ini]\nerror_reporting = "0"\ndisplay_errors = "Off"\n"date.timezone" = "UTC"'
+    make_turbine_toml /etc/turbine/laravel-nts-${W}w.toml   ${W} process false "[]" "$LARAVEL_INI"
+    make_turbine_toml /etc/turbine/laravel-nts-${W}w-p.toml ${W} process true  "[]" "$LARAVEL_INI"
+    make_turbine_toml /etc/turbine/laravel-zts-${W}w.toml   ${W} thread  false "[]" "$LARAVEL_INI"
 
-[php.ini]
-error_reporting = "0"
-display_errors = "Off"
-"date.timezone" = "UTC"
+    # Phalcon (requires phalcon extension)
+    make_turbine_toml /etc/turbine/phalcon-nts-${W}w.toml   ${W} process false '["phalcon.so"]'
+    make_turbine_toml /etc/turbine/phalcon-nts-${W}w-p.toml ${W} process true  '["phalcon.so"]'
+    make_turbine_toml /etc/turbine/phalcon-zts-${W}w.toml   ${W} thread  false '["phalcon.so"]'
+done
 
-[logging]
-level = "error"
-TOMLEOF
+# ── 10. FrankenPHP worker scripts ─────────────────────────────────────────────
+log "Creating FrankenPHP worker scripts..."
 
-# Phalcon NTS — process mode, Phalcon extension from image
-cat > /etc/turbine/phalcon-nts.toml << 'TOMLEOF'
-[server]
-listen = "0.0.0.0:80"
-workers = 8
-worker_mode = "process"
-request_timeout = 30
+# Raw PHP worker — handler stays in memory, avoids per-request PHP startup
+cat > /var/www/raw/worker.php << 'PHPEOF'
+<?php
+$handler = static function (): void {
+    header('Content-Type: text/plain');
+    echo "Hello, World!";
+};
+while (\frankenphp_handle_request($handler));
+PHPEOF
+ln -sf /var/www/raw/worker.php /var/www/raw/public/worker.php
 
-[php]
-extensions = ["phalcon.so"]
+# PHP-bench worker — dispatches to the requested .php file via URI
+cat > /var/www/php-bench/worker.php << 'PHPEOF'
+<?php
+$handler = static function (): void {
+    $raw  = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?? '/';
+    $file = realpath(__DIR__ . $raw);
+    if ($file !== false
+        && str_starts_with($file, __DIR__ . '/')
+        && str_ends_with($file, '.php')
+        && basename($file) !== 'worker.php'
+    ) {
+        require $file;
+        return;
+    }
+    http_response_code(404);
+};
+while (\frankenphp_handle_request($handler));
+PHPEOF
 
-[logging]
-level = "error"
-TOMLEOF
+# Laravel worker — bootstrap once, handle many requests
+cat > /var/www/laravel/public/worker.php << 'PHPEOF'
+<?php
+use Illuminate\Http\Request;
 
-# Phalcon ZTS — thread mode, Phalcon extension from image
-cat > /etc/turbine/phalcon-zts.toml << 'TOMLEOF'
-[server]
-listen = "0.0.0.0:80"
-workers = 8
-worker_mode = "thread"
-request_timeout = 30
+require_once __DIR__ . '/../vendor/autoload.php';
+$app    = require_once __DIR__ . '/../bootstrap/app.php';
+$kernel = $app->make(Illuminate\Contracts\Http\Kernel::class);
 
-[php]
-extensions = ["phalcon.so"]
+$handler = static function () use ($kernel): void {
+    $request  = Request::capture();
+    $response = $kernel->handle($request);
+    $response->send();
+    $kernel->terminate($request, $response);
+};
+while (\frankenphp_handle_request($handler));
+PHPEOF
 
-[logging]
-level = "error"
-TOMLEOF
+# Phalcon worker — Micro app persists between requests
+cat > /var/www/phalcon/public/worker.php << 'PHPEOF'
+<?php
+use Phalcon\Mvc\Micro;
+$app = new Micro();
+$app->get('/', static function (): void {
+    header('Content-Type: application/json');
+    echo json_encode(['status' => 'ok']);
+});
+$handler = static function () use ($app): void {
+    $app->handle($_SERVER['REQUEST_URI'] ?? '/');
+};
+while (\frankenphp_handle_request($handler));
+PHPEOF
+
+# ── 11. FrankenPHP Caddyfile templates ────────────────────────────────────────
+# Mounted at /etc/caddy/Caddyfile inside the container.
+# Variants: {app}-{N}w.Caddyfile (regular) and {app}-{N}w-worker.Caddyfile (worker mode)
+log "Creating FrankenPHP Caddyfile templates..."
+mkdir -p /etc/frankenphp
+
+make_caddyfile() {
+    local file="$1" num_threads="$2" root="$3" worker_script="${4:-}"
+    {
+        echo "{"
+        echo "    frankenphp {"
+        echo "        num_threads ${num_threads}"
+        [[ -n "$worker_script" ]] && \
+            echo "        worker ${worker_script} num_workers ${num_threads}"
+        echo "    }"
+        echo "}"
+        echo ":80 {"
+        echo "    root * ${root}"
+        echo "    encode zstd br gzip"
+        echo "    php_server"
+        echo "}"
+    } > "$file"
+}
+
+for W in 4 8; do
+    # Apps with a public/ subdirectory (regular + worker mode)
+    for APP in raw laravel phalcon; do
+        make_caddyfile /etc/frankenphp/${APP}-${W}w.Caddyfile         ${W} /app/public
+        make_caddyfile /etc/frankenphp/${APP}-${W}w-worker.Caddyfile  ${W} /app/public /app/public/worker.php
+    done
+    # PHP-bench: scripts live directly in /app (no public/ subdir)
+    make_caddyfile /etc/frankenphp/php-bench-${W}w.Caddyfile        ${W} /app
+    make_caddyfile /etc/frankenphp/php-bench-${W}w-worker.Caddyfile ${W} /app /app/worker.php
+done
 
 log "Setup complete!"

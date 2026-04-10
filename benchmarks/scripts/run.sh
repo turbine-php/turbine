@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
-# run.sh — Execute all benchmarks and output JSON results to stdout
+# run.sh — Execute all benchmarks and output a single JSON document to stdout.
 #
 # Usage: bash run.sh [version] [image-tag] [connections] [duration]
 #
-#   version     — label for the results (default: dev)
-#   image-tag   — Docker image tag suffix (default: latest)
-#                 e.g. "latest" → katisuhara/turbine-php:latest-php8.4-{nts,zts}
-#                      "v0.2.0-php8.4-nts" → used directly as NTS tag
-#   connections — wrk concurrent connections (default: 100)
-#   duration    — wrk duration in seconds per run (default: 30)
+# Servers compared per scenario:
+#   turbine_nts  — Turbine process mode (NTS Docker image)
+#   turbine_zts  — Turbine thread  mode (ZTS Docker image)
+#   frankenphp   — FrankenPHP (Docker)
+#   nginx_fpm    — Nginx + PHP 8.4-FPM (native, baseline; not used for Phalcon)
+#
+# HTTP metrics: req/s, latency p50/p99/p999/max (bombardier --print r -o json)
+# System metrics: avg CPU%, peak memory MiB (docker stats streaming)
 
 set -euo pipefail
 
@@ -17,169 +19,461 @@ IMAGE_TAG="${2:-latest}"
 WRK_CONNECTIONS="${3:-100}"
 WRK_DURATION="${4:-30}"
 
-# ── wrk parameters ───────────────────────────────────────────────────────────
-WRK_THREADS=8
-WARMUP_DURATION=5
+WARMUP_CONNECTIONS=20
+WARMUP_REQUESTS=2000
 BENCH_PORT=8080
 
-# Resolve image names: if IMAGE_TAG already contains 'nts'/'zts', use it as-is;
-# otherwise treat it as a prefix for the standard naming convention.
-if echo "$IMAGE_TAG" | grep -q "nts\|zts"; then
+# Per-run staging area: one JSON file per (scenario, server-variant)
+RESULTS_DIR=$(mktemp -d)
+trap 'rm -rf "$RESULTS_DIR"' EXIT
+
+# save_result <scenario> <key> <json-string>
+save_result() { mkdir -p "${RESULTS_DIR}/${1}"; printf '%s' "${3}" > "${RESULTS_DIR}/${1}/${2}.json"; }
+
+# FPM Nginx port for a given app name and worker count (4 or 8)
+fpm_port() {
+    case "${1}-${2}" in
+        raw-4)          echo 8804 ;;
+        raw-8)          echo 8803 ;;
+        laravel-4)      echo 8814 ;;
+        laravel-8)      echo 8813 ;;
+        php-bench-4)    echo 8834 ;;
+        php-bench-8)    echo 8833 ;;
+        *)              echo 8803 ;;
+    esac
+}
+
+# Resolve Docker image names
+if echo "$IMAGE_TAG" | grep -qE "nts|zts"; then
     TURBINE_IMAGE_NTS="katisuhara/turbine-php:${IMAGE_TAG}"
     TURBINE_IMAGE_ZTS="katisuhara/turbine-php:${IMAGE_TAG/nts/zts}"
 else
     TURBINE_IMAGE_NTS="katisuhara/turbine-php:${IMAGE_TAG}-php8.4-nts"
     TURBINE_IMAGE_ZTS="katisuhara/turbine-php:${IMAGE_TAG}-php8.4-zts"
 fi
+FRANKENPHP_IMAGE="dunglas/frankenphp:latest"
+FRANKENPHP_PHALCON_IMAGE="frankenphp-phalcon:bench"
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
 log() { echo "[bench] $*" >&2; }
 
-# Parse wrk text output into a JSON object
-# Fields: rps, latency (avg), transfer
-parse_wrk() {
-    local raw="$1"
-    local rps lat trf reqs
-    rps=$(echo  "$raw" | grep -oP  'Requests/sec:\s+\K[\d.]+' || echo "0")
-    lat=$(echo  "$raw" | grep -oP  'Latency\s+\K\S+'  | head -1 || echo "N/A")
-    trf=$(echo  "$raw" | grep -oP  'Transfer/sec:\s+\K\S+' || echo "0")
-    reqs=$(echo "$raw" | grep -oP  '(\d+) requests in' | grep -oP '^\d+' || echo "0")
-    printf '{"rps":"%s","latency":"%s","transfer":"%s","total_requests":"%s"}' \
-        "$rps" "$lat" "$trf" "$reqs"
-}
-
-# Run wrk and return parsed JSON
-run_wrk() {
-    local label="$1"
-    local url="$2"
-    log "  Warmup   ${label}..."
-    wrk -t4 -c50 -d${WARMUP_DURATION}s "$url" >/dev/null 2>&1 || true
-    log "  Benchmarking ${label} (${WRK_DURATION}s)..."
-    local raw
-    raw=$(wrk -t${WRK_THREADS} -c${WRK_CONNECTIONS} -d${WRK_DURATION}s "$url" 2>&1)
-    log "  $(echo "$raw" | grep 'Requests/sec')"
-    parse_wrk "$raw"
-}
-
-# Start a Turbine Docker container, run benchmark, stop container
-bench_turbine() {
-    local label="$1"
-    local image="$2"
-    local app_dir="$3"
-    local toml="$4"
-    local url="http://127.0.0.1:${BENCH_PORT}/"
-
-    log "Starting ${label} container..."
-    docker run -d --name turbine-bench \
-        -p "${BENCH_PORT}:80" \
-        -e PORT=80 \
-        -v "${app_dir}:/var/www/html:ro" \
-        -v "${toml}:/var/www/html/turbine.toml:ro" \
-        "$image" >/dev/null
-
-    # Wait for port to be accepting connections
-    for i in $(seq 1 20); do
-        curl -sf "$url" >/dev/null 2>&1 && break
+# ── Wait for HTTP ─────────────────────────────────────────────────────────────
+wait_http() {
+    local url="$1"
+    for i in $(seq 1 30); do
+        curl -sf --max-time 2 "$url" >/dev/null 2>&1 && return 0
         sleep 1
     done
-
-    local result
-    result=$(run_wrk "$label" "$url")
-
-    docker stop turbine-bench  >/dev/null
-    docker rm   turbine-bench  >/dev/null
-    echo "$result"
+    log "ERROR: server never became ready at ${url}"
+    return 1
 }
 
-# Benchmark Nginx + PHP-FPM (already running, fixed ports per scenario)
+# ── Collect docker stats while benchmark runs ─────────────────────────────────
+# Writes "cpu%,memMiB" lines to a file; kill the PID when done.
+start_stats() {
+    local container="$1"
+    local outfile="$2"
+    docker stats --format "{{.CPUPerc}},{{.MemUsage}}" "$container" \
+        > "$outfile" 2>/dev/null &
+    echo $!
+}
+
+# Parse stats file → "avg_cpu_pct peak_mem_mib"
+parse_stats() {
+    local file="$1"
+    python3 - "$file" << 'PYEOF'
+import sys, re
+cpus, mems = [], []
+for line in open(sys.argv[1]):
+    line = line.strip()
+    if not line: continue
+    parts = line.split(',', 1)
+    if len(parts) < 2: continue
+    try: cpus.append(float(parts[0].replace('%', '')))
+    except: pass
+    m = re.match(r'([\d.]+)\s*(GiB|MiB|KiB|B)', parts[1].split('/')[0].strip())
+    if m:
+        v, u = float(m.group(1)), m.group(2)
+        if u == 'GiB': v *= 1024
+        elif u == 'KiB': v /= 1024
+        elif u == 'B': v /= 1048576
+        mems.append(v)
+avg_cpu = sum(cpus)/len(cpus) if cpus else 0
+peak_mem = max(mems) if mems else 0
+print(f'{avg_cpu:.1f} {peak_mem:.0f}')
+PYEOF
+}
+
+# ── Parse bombardier JSON output → compact result JSON ───────────────────────
+# Bombardier latency values are in nanoseconds.
+parse_bombardier() {
+    local file="$1"
+    local avg_cpu="$2"
+    local peak_mem="$3"
+    python3 - "$file" "$avg_cpu" "$peak_mem" << 'PYEOF'
+import sys, json
+data = json.load(open(sys.argv[1]))
+avg_cpu  = sys.argv[2]
+peak_mem = sys.argv[3]
+r = data.get('result', {})
+lat = r.get('latency', {})
+rps = r.get('rps', {})
+
+def ns_to_ms(ns):
+    try: return round(int(ns) / 1_000_000, 2)
+    except: return 0
+
+pctiles = lat.get('percentiles', {})
+print(json.dumps({
+    'rps':        round(rps.get('mean', 0)),
+    'latency_p50': ns_to_ms(pctiles.get('50', 0)),
+    'latency_p99': ns_to_ms(pctiles.get('99', 0)),
+    'latency_p999': ns_to_ms(lat.get('max', 0)),
+    'latency_max': ns_to_ms(lat.get('max', 0)),
+    'req_2xx':    r.get('req2xx', 0),
+    'req_errors': r.get('req4xx', 0) + r.get('req5xx', 0),
+    'avg_cpu_pct': avg_cpu,
+    'peak_mem_mib': peak_mem,
+}))
+PYEOF
+}
+
+# ── Benchmark a Docker container ──────────────────────────────────────────────
+# Usage: bench_container <label> <image> [path] [-- docker args...]
+# path defaults to /
+bench_container() {
+    local label="$1"
+    local image="$2"
+    local path="${3:-/}"
+    shift 3
+    local docker_args=("$@")
+    local url="http://127.0.0.1:${BENCH_PORT}${path}"
+    local stats_file="/tmp/stats_${RANDOM}.txt"
+    local result_file="/tmp/result_${RANDOM}.json"
+
+    log "Starting ${label}..."
+    docker run -d --name bench-server \
+        -p "${BENCH_PORT}:80" \
+        "${docker_args[@]}" \
+        "$image" >/dev/null
+
+    wait_http "http://127.0.0.1:${BENCH_PORT}/"
+
+    log "  Warmup ${label}..."
+    bombardier -c "$WARMUP_CONNECTIONS" -n "$WARMUP_REQUESTS" \
+        --timeout 10s "$url" >/dev/null 2>&1 || true
+
+    log "  Benchmarking ${label} (${WRK_DURATION}s, ${WRK_CONNECTIONS} conn)..."
+    local stats_pid
+    stats_pid=$(start_stats bench-server "$stats_file")
+
+    bombardier \
+        -c "$WRK_CONNECTIONS" \
+        -d "${WRK_DURATION}s" \
+        --timeout 10s \
+        -o json \
+        "$url" > "$result_file" 2>/dev/null || true
+
+    kill "$stats_pid" 2>/dev/null || true
+    wait "$stats_pid" 2>/dev/null || true
+
+    docker stop bench-server >/dev/null
+    docker rm   bench-server >/dev/null
+
+    local stats
+    stats=$(parse_stats "$stats_file")
+    local avg_cpu peak_mem
+    avg_cpu=$(echo "$stats" | awk '{print $1}')
+    peak_mem=$(echo "$stats" | awk '{print $2}')
+
+    log "  ${label}: $(python3 -c "import json; d=json.load(open('$result_file')); print(round(d['result']['rps']['mean'])) " 2>/dev/null || echo '?') req/s"
+
+    parse_bombardier "$result_file" "$avg_cpu" "$peak_mem"
+    rm -f "$stats_file" "$result_file"
+}
+
+# ── Benchmark a set of PHP scripts inside one container (start once, N runs) ──
+# Usage: bench_php_scripts <label> <image> [docker args...] -- <script1> [script2 ...]
+# docker args are passed to `docker run`; scripts are the PHP filenames to hit.
+bench_php_scripts() {
+    local label="$1"
+    local image="$2"
+    shift 2
+
+    local docker_args=()
+    while [[ $# -gt 0 && "$1" != "--" ]]; do
+        docker_args+=("$1"); shift
+    done
+    [[ "${1:-}" == "--" ]] && shift
+    local scripts=("$@")
+
+    log "Starting ${label} container for PHP script benchmarks..."
+    docker run -d --name bench-server \
+        -p "${BENCH_PORT}:80" \
+        "${docker_args[@]}" \
+        "$image" >/dev/null
+    wait_http "http://127.0.0.1:${BENCH_PORT}/"
+
+    local results=()
+    for script in "${scripts[@]}"; do
+        local url="http://127.0.0.1:${BENCH_PORT}/${script}"
+        local stats_file="/tmp/stats_${RANDOM}.txt"
+        local result_file="/tmp/result_${RANDOM}.json"
+
+        log "  Warmup ${label}/${script}..."
+        bombardier -c "$WARMUP_CONNECTIONS" -n "$WARMUP_REQUESTS" \
+            --timeout 10s "$url" >/dev/null 2>&1 || true
+
+        log "  Benchmarking ${label}/${script} (${WRK_DURATION}s)..."
+        local stats_pid
+        stats_pid=$(start_stats bench-server "$stats_file")
+        bombardier -c "$WRK_CONNECTIONS" -d "${WRK_DURATION}s" \
+            --timeout 10s -o json "$url" > "$result_file" 2>/dev/null || true
+        kill "$stats_pid" 2>/dev/null || true
+        wait "$stats_pid" 2>/dev/null || true
+
+        local stats avg_cpu peak_mem
+        stats=$(parse_stats "$stats_file")
+        avg_cpu=$(echo "$stats" | awk '{print $1}')
+        peak_mem=$(echo "$stats" | awk '{print $2}')
+        results+=("$(parse_bombardier "$result_file" "$avg_cpu" "$peak_mem")")
+        rm -f "$stats_file" "$result_file"
+    done
+
+    docker stop bench-server >/dev/null
+    docker rm   bench-server >/dev/null
+
+    # Output as JSON array preserving order
+    local joined
+    joined=$(printf '%s,' "${results[@]}")
+    echo "[${joined%,}]"
+}
+
+# ── Benchmark native Nginx + PHP-FPM ─────────────────────────────────────────
 bench_fpm() {
     local label="$1"
     local port="$2"
-    local url="http://127.0.0.1:${port}/"
-    run_wrk "$label" "$url"
+    local path="${3:-/}"
+    local url="http://127.0.0.1:${port}${path}"
+    local result_file="/tmp/result_fpm_${RANDOM}.json"
+
+    log "  Warmup ${label}..."
+    bombardier -c "$WARMUP_CONNECTIONS" -n "$WARMUP_REQUESTS" \
+        --timeout 10s "$url" >/dev/null 2>&1 || true
+
+    log "  Benchmarking ${label} (${WRK_DURATION}s, ${WRK_CONNECTIONS} conn)..."
+    bombardier \
+        -c "$WRK_CONNECTIONS" \
+        -d "${WRK_DURATION}s" \
+        --timeout 10s \
+        -o json \
+        "$url" > "$result_file" 2>/dev/null || true
+
+    log "  ${label}: $(python3 -c "import json; d=json.load(open('$result_file')); print(round(d['result']['rps']['mean'])) " 2>/dev/null || echo '?') req/s"
+
+    # CPU/memory N/A for native FPM (not in a container)
+    parse_bombardier "$result_file" "N/A" "N/A"
+    rm -f "$result_file"
 }
 
-# ── Raw PHP ──────────────────────────────────────────────────────────────────
-log "==> Scenario: Raw PHP (Hello World)"
-RAW_NTS=$(bench_turbine \
-    "turbine-nts/raw" \
-    "$TURBINE_IMAGE_NTS" \
-    "/var/www/raw" \
-    "/etc/turbine/raw.toml")
+# bench_php_scripts_fpm: run 4 scripts against nginx-fpm, returns JSON array
+bench_php_scripts_fpm() {
+    local port="$1"
+    shift
+    local scripts=("$@")
+    local results=()
+    for script in "${scripts[@]}"; do
+        results+=("$(bench_fpm "nginx-fpm/php-bench" "$port" "/${script}")")
+    done
+    local joined
+    joined=$(printf '%s,' "${results[@]}")
+    echo "[${joined%,}]"
+}
 
-RAW_ZTS=$(bench_turbine \
-    "turbine-zts/raw" \
-    "$TURBINE_IMAGE_ZTS" \
-    "/var/www/raw" \
-    "/etc/turbine/raw.toml")
+# ─────────────────────────────────────────────────────────────────────────────
+# Benchmark matrix
+#   Workers:     4 and 8
+#   Turbine NTS: process mode, persistent=false and persistent=true
+#   Turbine ZTS: thread  mode (no persistent variant — threads already share state)
+#   FrankenPHP:  regular mode (num_threads N) and worker mode (N persistent workers)
+#   Nginx+FPM:   4w and 8w static pools
+# ─────────────────────────────────────────────────────────────────────────────
 
-RAW_FPM=$(bench_fpm "nginx-fpm/raw" 8803)
+PHP_SCRIPTS=(hello.php html_50k.php pdf_50k.php random_50k.php)
 
-# ── Laravel ──────────────────────────────────────────────────────────────────
+# ─── Raw PHP ─────────────────────────────────────────────────────────────────
+log "==> Scenario: Raw PHP"
+for W in 4 8; do
+    for P in "" "-p"; do
+        KEY="turbine_nts_${W}w${P//-/_}"
+        save_result raw_php "$KEY" \
+            "$(bench_container "nts${P}/${W}w/raw" "$TURBINE_IMAGE_NTS" "/" \
+                -v /var/www/raw:/var/www/html \
+                -v "/etc/turbine/raw-nts-${W}w${P}.toml:/var/www/html/turbine.toml:ro")"
+    done
+    save_result raw_php "turbine_zts_${W}w" \
+        "$(bench_container "zts/${W}w/raw" "$TURBINE_IMAGE_ZTS" "/" \
+            -v /var/www/raw:/var/www/html \
+            -v "/etc/turbine/raw-zts-${W}w.toml:/var/www/html/turbine.toml:ro")"
+    save_result raw_php "frankenphp_${W}w" \
+        "$(bench_container "frankenphp/${W}w/raw" "$FRANKENPHP_IMAGE" "/" \
+            -v /var/www/raw:/app \
+            -v "/etc/frankenphp/raw-${W}w.Caddyfile:/etc/caddy/Caddyfile")"
+    save_result raw_php "frankenphp_${W}w_worker" \
+        "$(bench_container "frankenphp/${W}w-worker/raw" "$FRANKENPHP_IMAGE" "/" \
+            -v /var/www/raw:/app \
+            -v "/etc/frankenphp/raw-${W}w-worker.Caddyfile:/etc/caddy/Caddyfile")"
+    save_result raw_php "nginx_fpm_${W}w" \
+        "$(bench_fpm "fpm/${W}w/raw" "$(fpm_port raw $W)" "/")"
+done
+
+# ─── PHP Scripts ─────────────────────────────────────────────────────────────
+log "==> Scenario: PHP scripts (hello, html_50k, pdf_50k, random_50k)"
+for W in 4 8; do
+    for P in "" "-p"; do
+        KEY="turbine_nts_${W}w${P//-/_}"
+        save_result php_scripts "$KEY" \
+            "$(bench_php_scripts "nts${P}/${W}w/php-bench" "$TURBINE_IMAGE_NTS" \
+                -v /var/www/php-bench:/var/www/html \
+                -v "/etc/turbine/php-bench-nts-${W}w${P}.toml:/var/www/html/turbine.toml:ro" \
+                -- "${PHP_SCRIPTS[@]}")"
+    done
+    save_result php_scripts "turbine_zts_${W}w" \
+        "$(bench_php_scripts "zts/${W}w/php-bench" "$TURBINE_IMAGE_ZTS" \
+            -v /var/www/php-bench:/var/www/html \
+            -v "/etc/turbine/php-bench-zts-${W}w.toml:/var/www/html/turbine.toml:ro" \
+            -- "${PHP_SCRIPTS[@]}")"
+    save_result php_scripts "frankenphp_${W}w" \
+        "$(bench_php_scripts "frankenphp/${W}w/php-bench" "$FRANKENPHP_IMAGE" \
+            -v /var/www/php-bench:/app \
+            -v "/etc/frankenphp/php-bench-${W}w.Caddyfile:/etc/caddy/Caddyfile" \
+            -- "${PHP_SCRIPTS[@]}")"
+    save_result php_scripts "frankenphp_${W}w_worker" \
+        "$(bench_php_scripts "frankenphp/${W}w-worker/php-bench" "$FRANKENPHP_IMAGE" \
+            -v /var/www/php-bench:/app \
+            -v "/etc/frankenphp/php-bench-${W}w-worker.Caddyfile:/etc/caddy/Caddyfile" \
+            -- "${PHP_SCRIPTS[@]}")"
+    save_result php_scripts "nginx_fpm_${W}w" \
+        "$(bench_php_scripts_fpm "$(fpm_port php-bench $W)" "${PHP_SCRIPTS[@]}")"
+done
+
+# ─── Laravel ─────────────────────────────────────────────────────────────────
 log "==> Scenario: Laravel (JSON endpoint)"
-LARAVEL_NTS=$(bench_turbine \
-    "turbine-nts/laravel" \
-    "$TURBINE_IMAGE_NTS" \
-    "/var/www/laravel" \
-    "/etc/turbine/laravel.toml")
+for W in 4 8; do
+    for P in "" "-p"; do
+        KEY="turbine_nts_${W}w${P//-/_}"
+        save_result laravel "$KEY" \
+            "$(bench_container "nts${P}/${W}w/laravel" "$TURBINE_IMAGE_NTS" "/" \
+                -v /var/www/laravel/public:/var/www/html \
+                -v "/etc/turbine/laravel-nts-${W}w${P}.toml:/var/www/html/turbine.toml:ro")"
+    done
+    save_result laravel "turbine_zts_${W}w" \
+        "$(bench_container "zts/${W}w/laravel" "$TURBINE_IMAGE_ZTS" "/" \
+            -v /var/www/laravel/public:/var/www/html \
+            -v "/etc/turbine/laravel-zts-${W}w.toml:/var/www/html/turbine.toml:ro")"
+    save_result laravel "frankenphp_${W}w" \
+        "$(bench_container "frankenphp/${W}w/laravel" "$FRANKENPHP_IMAGE" "/" \
+            -v /var/www/laravel:/app \
+            -v "/etc/frankenphp/laravel-${W}w.Caddyfile:/etc/caddy/Caddyfile")"
+    save_result laravel "frankenphp_${W}w_worker" \
+        "$(bench_container "frankenphp/${W}w-worker/laravel" "$FRANKENPHP_IMAGE" "/" \
+            -v /var/www/laravel:/app \
+            -v "/etc/frankenphp/laravel-${W}w-worker.Caddyfile:/etc/caddy/Caddyfile")"
+    save_result laravel "nginx_fpm_${W}w" \
+        "$(bench_fpm "fpm/${W}w/laravel" "$(fpm_port laravel $W)" "/")"
+done
 
-LARAVEL_ZTS=$(bench_turbine \
-    "turbine-zts/laravel" \
-    "$TURBINE_IMAGE_ZTS" \
-    "/var/www/laravel" \
-    "/etc/turbine/laravel.toml")
-
-LARAVEL_FPM=$(bench_fpm "nginx-fpm/laravel" 8813)
-
-# ── Phalcon ──────────────────────────────────────────────────────────────────
+# ─── Phalcon (no native FPM — ext lives inside Docker images) ─────────────────
 log "==> Scenario: Phalcon micro app (JSON endpoint)"
-PHALCON_NTS=$(bench_turbine \
-    "turbine-nts/phalcon" \
-    "$TURBINE_IMAGE_NTS" \
-    "/var/www/phalcon" \
-    "/etc/turbine/phalcon-nts.toml")
+for W in 4 8; do
+    for P in "" "-p"; do
+        KEY="turbine_nts_${W}w${P//-/_}"
+        save_result phalcon "$KEY" \
+            "$(bench_container "nts${P}/${W}w/phalcon" "$TURBINE_IMAGE_NTS" "/" \
+                -v /var/www/phalcon:/var/www/html \
+                -v "/etc/turbine/phalcon-nts-${W}w${P}.toml:/var/www/html/turbine.toml:ro")"
+    done
+    save_result phalcon "turbine_zts_${W}w" \
+        "$(bench_container "zts/${W}w/phalcon" "$TURBINE_IMAGE_ZTS" "/" \
+            -v /var/www/phalcon:/var/www/html \
+            -v "/etc/turbine/phalcon-zts-${W}w.toml:/var/www/html/turbine.toml:ro")"
+    save_result phalcon "frankenphp_${W}w" \
+        "$(bench_container "frankenphp/${W}w/phalcon" "$FRANKENPHP_PHALCON_IMAGE" "/" \
+            -v /var/www/phalcon:/app \
+            -v "/etc/frankenphp/phalcon-${W}w.Caddyfile:/etc/caddy/Caddyfile")"
+    save_result phalcon "frankenphp_${W}w_worker" \
+        "$(bench_container "frankenphp/${W}w-worker/phalcon" "$FRANKENPHP_PHALCON_IMAGE" "/" \
+            -v /var/www/phalcon:/app \
+            -v "/etc/frankenphp/phalcon-${W}w-worker.Caddyfile:/etc/caddy/Caddyfile")"
+done
 
-PHALCON_ZTS=$(bench_turbine \
-    "turbine-zts/phalcon" \
-    "$TURBINE_IMAGE_ZTS" \
-    "/var/www/phalcon" \
-    "/etc/turbine/phalcon-zts.toml")
+# ─────────────────────────────────────────────────────────────────────────────
+# JSON output — assembled by Python from per-server result files
+# ─────────────────────────────────────────────────────────────────────────────
+BENCH_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-PHALCON_FPM=$(bench_fpm "nginx-fpm/phalcon" 8823)
+python3 - << PYEOF
+import json, os
 
-# ── Output JSON ──────────────────────────────────────────────────────────────
-cat << JSONEOF
-{
-  "version": "$VERSION",
-  "date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-  "server": "Hetzner CPX41",
-  "tool": "wrk",
-  "parameters": {
-    "threads": $WRK_THREADS,
-    "connections": $WRK_CONNECTIONS,
-    "duration_seconds": $WRK_DURATION,
-    "turbine_image_nts": "$TURBINE_IMAGE_NTS",
-    "turbine_image_zts": "$TURBINE_IMAGE_ZTS"
-  },
-  "scenarios": {
-    "raw_php": {
-      "description": "Single PHP file returning a plain-text Hello World response",
-      "turbine_nts": $RAW_NTS,
-      "turbine_zts": $RAW_ZTS,
-      "nginx_fpm":   $RAW_FPM
+results_dir = '${RESULTS_DIR}'
+
+SERVER_ORDER = [
+    'turbine_nts_4w',        'turbine_nts_8w',
+    'turbine_nts_4w_p',      'turbine_nts_8w_p',
+    'turbine_zts_4w',        'turbine_zts_8w',
+    'frankenphp_4w',         'frankenphp_8w',
+    'frankenphp_4w_worker',  'frankenphp_8w_worker',
+    'nginx_fpm_4w',          'nginx_fpm_8w',
+]
+
+SCENARIO_META = {
+    'raw_php': {
+        'description': 'Single PHP file returning plain-text Hello World',
     },
-    "laravel": {
-      "description": "Laravel application returning a JSON response (no database)",
-      "turbine_nts": $LARAVEL_NTS,
-      "turbine_zts": $LARAVEL_ZTS,
-      "nginx_fpm":   $LARAVEL_FPM
+    'php_scripts': {
+        'description': 'Individual scripts: Hello World, 50 KB HTML, 50 KB PDF binary, 50 KB random (incompressible)',
+        'scripts': ['hello.php', 'html_50k.php', 'pdf_50k.php', 'random_50k.php'],
     },
-    "phalcon": {
-      "description": "Phalcon micro application returning a JSON response",
-      "turbine_nts": $PHALCON_NTS,
-      "turbine_zts": $PHALCON_ZTS,
-      "nginx_fpm":   $PHALCON_FPM
-    }
-  }
+    'laravel': {
+        'description': 'Laravel framework, single JSON route, no database',
+    },
+    'phalcon': {
+        'description': 'Phalcon micro application, single JSON route',
+        'note': 'Nginx+FPM excluded — Phalcon extension lives inside Docker images',
+    },
 }
-JSONEOF
+
+scenarios = {}
+for sname, meta in SCENARIO_META.items():
+    sdir = os.path.join(results_dir, sname)
+    if not os.path.isdir(sdir):
+        continue
+    s = dict(meta)
+    for key in SERVER_ORDER:
+        fpath = os.path.join(sdir, key + '.json')
+        if os.path.exists(fpath):
+            with open(fpath) as f:
+                s[key] = json.load(f)
+    scenarios[sname] = s
+
+doc = {
+    'version': '${VERSION}',
+    'date':    '${BENCH_DATE}',
+    'server':  'Hetzner CPX41 (8 vCPU / 16 GB RAM / NVMe)',
+    'tool':    'bombardier v1.2.6',
+    'images': {
+        'turbine_nts': '${TURBINE_IMAGE_NTS}',
+        'turbine_zts': '${TURBINE_IMAGE_ZTS}',
+        'frankenphp':  '${FRANKENPHP_IMAGE}',
+    },
+    'parameters': {
+        'connections':             int('${WRK_CONNECTIONS}'),
+        'duration_seconds':        int('${WRK_DURATION}'),
+        'workers_4w':              4,
+        'workers_8w':              8,
+        'memory_limit_mb':         256,
+        'max_requests_per_worker': 50000,
+    },
+    'scenarios': scenarios,
+}
+print(json.dumps(doc, indent=2))
+PYEOF
