@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# setup.sh — One-time server setup on Hetzner CPX41 (Ubuntu 24.04)
+# setup.sh — One-time server setup on Hetzner CCX33 (Ubuntu 24.04)
 #
 # Strategy:
-#   - All PHP servers run as Docker containers (Turbine NTS/ZTS, FrankenPHP)
-#   - Nginx + PHP-FPM run natively as the classic baseline (raw + Laravel only)
-#   - No Phalcon compilation — FrankenPHP+Phalcon image is built using
-#     install-php-extensions (same mechanism the Turbine image uses)
+#   - Turbine NTS/ZTS and FrankenPHP run as Docker containers
+#   - FrankenPHP requires ZTS PHP — tested with NTS/ZTS Turbine images separately
+#   - Phalcon tested only on Turbine and Nginx+FPM (Phalcon is incompatible with FrankenPHP)
+#   - Nginx + PHP-FPM (with Phalcon extension) runs natively as the classic baseline
 #   - bombardier provides HTTP metrics including latency percentiles
 
 set -euo pipefail
@@ -13,7 +13,6 @@ set -euo pipefail
 TURBINE_IMAGE_NTS="katisuhara/turbine-php:latest-php8.4-nts"
 TURBINE_IMAGE_ZTS="katisuhara/turbine-php:latest-php8.4-zts"
 FRANKENPHP_IMAGE="dunglas/frankenphp:latest"
-FRANKENPHP_PHALCON_IMAGE="frankenphp-phalcon:bench"
 PHALCON_VERSION="5.11.1"
 BOMBARDIER_VERSION="1.2.6"
 
@@ -31,16 +30,9 @@ log "Pulling Turbine images..."
 docker pull "$TURBINE_IMAGE_NTS"
 docker pull "$TURBINE_IMAGE_ZTS"
 
-# ── 3. Pull + build FrankenPHP images ────────────────────────────────────────
-log "Pulling FrankenPHP image..."
+# ── 3. Pull FrankenPHP image ─────────────────────────────────────────────────
+log "Pulling FrankenPHP image (ZTS-based)..."
 docker pull "$FRANKENPHP_IMAGE"
-
-log "Building FrankenPHP + Phalcon image (uses pre-built binaries, ~2 min)..."
-docker build -t "$FRANKENPHP_PHALCON_IMAGE" - << DOCKERFILE
-FROM ${FRANKENPHP_IMAGE}
-RUN install-php-extensions phalcon-${PHALCON_VERSION}
-DOCKERFILE
-log "FrankenPHP + Phalcon image ready."
 
 # ── 4. bombardier ─────────────────────────────────────────────────────────────
 log "Installing bombardier..."
@@ -56,13 +48,19 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
 add-apt-repository -y ppa:ondrej/php
 apt-get update -qq
 
-log "Installing Nginx, PHP 8.4-FPM, Composer..."
+log "Installing Nginx, PHP 8.4-FPM, Composer, Phalcon..."
 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     nginx \
     php8.4-fpm php8.4-cli php8.4-mbstring php8.4-xml php8.4-curl php8.4-zip \
     php8.4-intl php8.4-bcmath php8.4-gd php8.4-sqlite3 \
-    php8.4-tokenizer php8.4-fileinfo php8.4-opcache \
-    composer git unzip jq
+    php8.4-tokenizer php8.4-fileinfo php8.4-opcache php8.4-dev \
+    composer git unzip jq build-essential
+
+log "Installing Phalcon ${PHALCON_VERSION} extension for native FPM..."
+pecl install phalcon-${PHALCON_VERSION}
+echo "extension=phalcon.so" > /etc/php/8.4/mods-available/phalcon.ini
+phpenmod -v 8.4 phalcon
+php8.4-fpm -m | grep -i phalcon && log "Phalcon loaded in FPM."
 
 # ── 6. Application directories ───────────────────────────────────────────────
 log "Creating raw PHP application..."
@@ -184,9 +182,25 @@ server {
 }
 NGINXEOF
 
+    # phalcon
+    PHAL_PORT=$([[ $NW -eq 4 ]] && echo 8824 || echo 8823)
+    cat > /etc/nginx/sites-available/bench-phalcon-${NW}w << NGINXEOF
+server {
+    listen ${PHAL_PORT};
+    root /var/www/phalcon;
+    location / { try_files \$uri \$uri/ /index.php?\$query_string; }
+    location ~ \.php\$ {
+        fastcgi_pass ${SOCK};
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        include fastcgi_params;
+    }
+}
+NGINXEOF
+
     ln -sf /etc/nginx/sites-available/bench-raw-${NW}w         /etc/nginx/sites-enabled/
     ln -sf /etc/nginx/sites-available/bench-php-scripts-${NW}w /etc/nginx/sites-enabled/
     ln -sf /etc/nginx/sites-available/bench-laravel-${NW}w     /etc/nginx/sites-enabled/
+    ln -sf /etc/nginx/sites-available/bench-phalcon-${NW}w     /etc/nginx/sites-enabled/
 done
 
 nginx -t
@@ -242,7 +256,7 @@ for W in 4 8; do
     make_turbine_toml /etc/turbine/phalcon-zts-${W}w.toml   ${W} thread  false '["phalcon.so"]'
 done
 
-# ── 10. FrankenPHP worker scripts ─────────────────────────────────────────────
+# ── 10. FrankenPHP worker scripts ──────────────────────────────────────────────
 log "Creating FrankenPHP worker scripts..."
 
 # Raw PHP worker — handler stays in memory, avoids per-request PHP startup
@@ -308,9 +322,11 @@ $handler = static function () use ($app): void {
 while (\frankenphp_handle_request($handler));
 PHPEOF
 
+# NOTE: phalcon worker.php is kept for reference but NOT used in benchmarks
+# since Phalcon is incompatible with FrankenPHP's ZTS threading model.
+
 # ── 11. FrankenPHP Caddyfile templates ────────────────────────────────────────
-# Mounted at /etc/caddy/Caddyfile inside the container.
-# Variants: {app}-{N}w.Caddyfile (regular) and {app}-{N}w-worker.Caddyfile (worker mode)
+# Only for apps that run on FrankenPHP: raw, laravel, php-bench (NOT phalcon)
 log "Creating FrankenPHP Caddyfile templates..."
 mkdir -p /etc/frankenphp
 
@@ -333,8 +349,8 @@ make_caddyfile() {
 }
 
 for W in 4 8; do
-    # Apps with a public/ subdirectory (regular + worker mode)
-    for APP in raw laravel phalcon; do
+    # Apps that run on FrankenPHP (raw, laravel, php-bench — NOT phalcon)
+    for APP in raw laravel; do
         make_caddyfile /etc/frankenphp/${APP}-${W}w.Caddyfile         ${W} /app/public
         make_caddyfile /etc/frankenphp/${APP}-${W}w-worker.Caddyfile  ${W} /app/public /app/public/worker.php
     done

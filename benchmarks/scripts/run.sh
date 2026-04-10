@@ -6,10 +6,10 @@
 # Servers compared per scenario:
 #   turbine_nts  — Turbine process mode (NTS Docker image)
 #   turbine_zts  — Turbine thread  mode (ZTS Docker image)
-#   frankenphp   — FrankenPHP (Docker)
-#   nginx_fpm    — Nginx + PHP 8.4-FPM (native, baseline; not used for Phalcon)
+#   frankenphp   — FrankenPHP (ZTS-based Docker image; NOT used for Phalcon)
+#   nginx_fpm    — Nginx + PHP 8.4-FPM native, with Phalcon extension installed
 #
-# HTTP metrics: req/s, latency p50/p99/p999/max (bombardier --print r -o json)
+# HTTP metrics: req/s, latency p50/p99/p999/max (bombardier --format json)
 # System metrics: avg CPU%, peak memory MiB (docker stats streaming)
 
 set -euo pipefail
@@ -39,6 +39,8 @@ fpm_port() {
         laravel-8)      echo 8813 ;;
         php-bench-4)    echo 8834 ;;
         php-bench-8)    echo 8833 ;;
+        phalcon-4)      echo 8824 ;;
+        phalcon-8)      echo 8823 ;;
         *)              echo 8803 ;;
     esac
 }
@@ -52,7 +54,7 @@ else
     TURBINE_IMAGE_ZTS="katisuhara/turbine-php:${IMAGE_TAG}-php8.4-zts"
 fi
 FRANKENPHP_IMAGE="dunglas/frankenphp:latest"
-FRANKENPHP_PHALCON_IMAGE="frankenphp-phalcon:bench"
+# Note: FrankenPHP is ZTS-based. Phalcon is NOT supported on FrankenPHP.
 
 log() { echo "[bench] $*" >&2; }
 
@@ -170,7 +172,7 @@ bench_container() {
         -c "$WRK_CONNECTIONS" \
         -d "${WRK_DURATION}s" \
         --timeout 10s \
-        -o json \
+        --format json \
         "$url" > "$result_file" 2>/dev/null || true
 
     kill "$stats_pid" 2>/dev/null || true
@@ -227,7 +229,7 @@ bench_php_scripts() {
         local stats_pid
         stats_pid=$(start_stats bench-server "$stats_file")
         bombardier -c "$WRK_CONNECTIONS" -d "${WRK_DURATION}s" \
-            --timeout 10s -o json "$url" > "$result_file" 2>/dev/null || true
+            --timeout 10s --format json "$url" > "$result_file" 2>/dev/null || true
         kill "$stats_pid" 2>/dev/null || true
         wait "$stats_pid" 2>/dev/null || true
 
@@ -265,7 +267,7 @@ bench_fpm() {
         -c "$WRK_CONNECTIONS" \
         -d "${WRK_DURATION}s" \
         --timeout 10s \
-        -o json \
+        --format json \
         "$url" > "$result_file" 2>/dev/null || true
 
     log "  ${label}: $(python3 -c "import json; d=json.load(open('$result_file')); print(round(d['result']['rps']['mean'])) " 2>/dev/null || echo '?') req/s"
@@ -382,7 +384,7 @@ for W in 4 8; do
         "$(bench_fpm "fpm/${W}w/laravel" "$(fpm_port laravel $W)" "/")"
 done
 
-# ─── Phalcon (no native FPM — ext lives inside Docker images) ─────────────────
+# ─── Phalcon (Turbine only + Nginx+FPM — Phalcon incompatible with FrankenPHP) ───────
 log "==> Scenario: Phalcon micro app (JSON endpoint)"
 for W in 4 8; do
     for P in "" "-p"; do
@@ -396,14 +398,8 @@ for W in 4 8; do
         "$(bench_container "zts/${W}w/phalcon" "$TURBINE_IMAGE_ZTS" "/" \
             -v /var/www/phalcon:/var/www/html \
             -v "/etc/turbine/phalcon-zts-${W}w.toml:/var/www/html/turbine.toml:ro")"
-    save_result phalcon "frankenphp_${W}w" \
-        "$(bench_container "frankenphp/${W}w/phalcon" "$FRANKENPHP_PHALCON_IMAGE" "/" \
-            -v /var/www/phalcon:/app \
-            -v "/etc/frankenphp/phalcon-${W}w.Caddyfile:/etc/caddy/Caddyfile")"
-    save_result phalcon "frankenphp_${W}w_worker" \
-        "$(bench_container "frankenphp/${W}w-worker/phalcon" "$FRANKENPHP_PHALCON_IMAGE" "/" \
-            -v /var/www/phalcon:/app \
-            -v "/etc/frankenphp/phalcon-${W}w-worker.Caddyfile:/etc/caddy/Caddyfile")"
+    save_result phalcon "nginx_fpm_${W}w" \
+        "$(bench_fpm "fpm/${W}w/phalcon" "$(fpm_port phalcon $W)" "/")"
 done
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -438,7 +434,7 @@ SCENARIO_META = {
     },
     'phalcon': {
         'description': 'Phalcon micro application, single JSON route',
-        'note': 'Nginx+FPM excluded — Phalcon extension lives inside Docker images',
+        'note': 'FrankenPHP excluded — Phalcon is incompatible with FrankenPHP (ZTS threading)',
     },
 }
 
