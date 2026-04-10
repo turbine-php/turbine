@@ -76,6 +76,7 @@ RUN curl -fSL "https://www.php.net/distributions/php-${PHP_VERSION}.tar.xz" -o p
         $([ "${ZTS}" = "1" ] && echo "--enable-zts" || true) \
     && make -j"$(nproc)" \
     && make install \
+    && make install-headers \
     && echo "PHP embed built OK (ZTS=${ZTS})"
 
 # ── Build Phalcon extension ──────────────────────────────────────────────────
