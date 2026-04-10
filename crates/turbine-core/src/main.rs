@@ -3450,11 +3450,12 @@ async fn handle_request_inner(
                 &[],
             )),
         }
-    } else if state.thread_dispatch.is_some()
-        && find_pool(&state, &clean_path).is_some_and(|r| r.pool_index.is_none())
+    } else if let Some(td) = state
+        .thread_dispatch
+        .as_ref()
+        .filter(|_| find_pool(&state, &clean_path).is_some_and(|r| r.pool_index.is_none()))
     {
         // ── Thread-mode classic dispatch (lock-free) ─────────────────
-        let td = state.thread_dispatch.as_ref().unwrap();
         let timeout_dur = if state.max_wait_time > 0 {
             std::time::Duration::from_secs(state.max_wait_time)
         } else if state.request_timeout.is_zero() {
