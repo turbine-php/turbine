@@ -68,12 +68,26 @@ jobs:
         env:
           HCLOUD_TOKEN: ${{ secrets.HETZNER_API_TOKEN }}
         run: |
-          RESP=$(curl -fsSL -X POST \
+          KEY_NAME="bench-${{ github.run_id }}"
+          RESP=$(curl -sSL -X POST \
             -H "Authorization: Bearer $HCLOUD_TOKEN" \
             -H "Content-Type: application/json" \
-            -d "{\"name\":\"bench-${{ github.run_id }}\",\"public_key\":\"$(cat /tmp/bench_key.pub)\"}" \
+            -d "{\"name\":\"${KEY_NAME}\",\"public_key\":\"$(cat /tmp/bench_key.pub)\"}" \
             https://api.hetzner.cloud/v1/ssh_keys)
-          echo "id=$(echo "$RESP" | jq -r '.ssh_key.id')" >> "$GITHUB_OUTPUT"
+          ERR_CODE=$(echo "$RESP" | jq -r '.error.code // empty')
+          if [[ "$ERR_CODE" == "uniqueness_error" ]]; then
+            # Key with this name already exists (leftover from a previous run) — fetch its ID
+            RESP=$(curl -sSL \
+              -H "Authorization: Bearer $HCLOUD_TOKEN" \
+              "https://api.hetzner.cloud/v1/ssh_keys?name=${KEY_NAME}")
+          elif [[ -n "$ERR_CODE" ]]; then
+            echo "Hetzner SSH key error: $(echo "$RESP" | jq -r '.error.message')"
+            echo "Full response: $RESP"
+            exit 1
+          fi
+          KEY_ID=$(echo "$RESP" | jq -r '.ssh_key.id // .ssh_keys[0].id')
+          echo "id=${KEY_ID}" >> "$GITHUB_OUTPUT"
+          echo "KEY_ID=${KEY_ID}" >> "$GITHUB_ENV"
 
       - name: Create Hetzner CCX33 server
         id: server
