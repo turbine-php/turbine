@@ -303,13 +303,6 @@ crates/
 
 ## License
 
-Turbine is **dual-licensed**:
+Turbine is licensed under the [Apache License 2.0](LICENSE).
 
-| Use case | License |
-|----------|---------|
-| Open-source projects (AGPL-compliant) | [AGPL-3.0](LICENSE) — free |
-| Proprietary / SaaS / no source-disclosure | [Commercial License](LICENSE-COMMERCIAL) — contact for pricing |
-
-If your application is open source and you can comply with the AGPL-3.0 copyleft terms (network use triggers source disclosure), the AGPL license is free. If you are building a proprietary product or SaaS platform where the AGPL is not acceptable, purchase a commercial license.
-
-**Commercial license enquiries:** dener.php@gmail.com
+You are free to use, modify, and distribute this software in both open-source and proprietary projects, subject to the terms of the Apache 2.0 License.
