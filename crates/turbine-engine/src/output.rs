@@ -22,7 +22,7 @@ thread_local! {
     static HEADER_BUFFER: RefCell<Vec<(String, String)>> = RefCell::new(Vec::with_capacity(16));
 
     /// HTTP response status code set by PHP (via http_response_code() or header("HTTP/...")).
-    static RESPONSE_CODE: RefCell<u16> = RefCell::new(200);
+    static RESPONSE_CODE: RefCell<u16> = const { RefCell::new(200) };
 }
 
 /// The original ub_write callback (saved so we can restore it if needed).
