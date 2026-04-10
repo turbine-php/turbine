@@ -1,0 +1,47 @@
+name: OSSF Scorecard
+
+on:
+  push:
+    branches: ["main", "master"]
+  schedule:
+    # Weekly scan — every Monday at 06:15 UTC
+    - cron: "15 6 * * 1"
+  workflow_dispatch:
+
+permissions: read-all
+
+jobs:
+  scorecard:
+    name: Scorecard analysis
+    runs-on: ubuntu-latest
+
+    permissions:
+      security-events: write  # upload SARIF results to Security tab
+      id-token: write         # publish results to OSSF REST API
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Run OSSF Scorecard
+        uses: ossf/scorecard-action@v2.4.0
+        with:
+          results_file: scorecard.sarif
+          results_format: sarif
+          # Publish to https://securityscorecards.dev (public repos only)
+          publish_results: true
+
+      - name: Upload SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: scorecard.sarif
+          category: ossf-scorecard
+
+      - name: Upload scorecard artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: scorecard-results
+          path: scorecard.sarif
+          retention-days: 14

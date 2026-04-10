@@ -19,6 +19,11 @@ jobs:
       ${{ matrix.zts == '1' && 'ZTS' || 'NTS' }}
     runs-on: ubuntu-latest
 
+    permissions:
+      contents: read
+      id-token: write      # required for OIDC token (provenance signing)
+      attestations: write  # required to push attestation to registry
+
     strategy:
       fail-fast: false
       matrix:
@@ -61,10 +66,11 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       # Tag strategy:
-      #   {version}-php{major}-{nts|zts}            e.g. 0.2.0-php8.4-nts
-      #   latest-php{major}-{nts|zts}               e.g. latest-php8.4-nts
+      #   {version}-php{major}-{nts|zts}   e.g. 0.2.0-php8.4-nts
+      #   latest-php{major}-{nts|zts}      e.g. latest-php8.4-nts
       #   latest (only for 8.4-nts — the default variant)
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -86,6 +92,14 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
             turbine.php.version=${{ matrix.php_version }}
             turbine.php.thread-safety=${{ matrix.thread_safety }}
+
+      # Sign and attach SLSA build provenance attestation to the image
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
 
   # Update Docker Hub README after all images are pushed
   update-hub-description:

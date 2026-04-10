@@ -12,7 +12,7 @@ env:
 
 jobs:
   test:
-    name: cargo test (PHP ${{ env.PHP_VERSION }} NTS)
+    name: cargo test (PHP 8.4 NTS)
     runs-on: ubuntu-latest
 
     steps:

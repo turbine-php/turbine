@@ -80,6 +80,7 @@ RUN curl -fSL "https://www.php.net/distributions/php-${PHP_VERSION}.tar.xz" -o p
 
 # ── Build Phalcon extension ──────────────────────────────────────────────────
 RUN EXT_DIR=$(/opt/php-embed/bin/php-config --extension-dir) \
+    && mkdir -p "${EXT_DIR}" \
     && curl -fsSL "https://github.com/phalcon/cphalcon/archive/refs/tags/v${PHALCON_VERSION}.tar.gz" -o phalcon.tar.gz \
     && mkdir -p cphalcon && tar xf phalcon.tar.gz -C cphalcon --strip-components=1 \
     && cd cphalcon/ext \
@@ -91,6 +92,7 @@ RUN EXT_DIR=$(/opt/php-embed/bin/php-config --extension-dir) \
 
 # ── Build Redis extension ────────────────────────────────────────────────────
 RUN EXT_DIR=$(/opt/php-embed/bin/php-config --extension-dir) \
+    && mkdir -p "${EXT_DIR}" \
     && curl -fsSL "https://github.com/phpredis/phpredis/archive/refs/tags/${PHPREDIS_VERSION}.tar.gz" -o phpredis.tar.gz \
     && mkdir -p phpredis && tar xf phpredis.tar.gz -C phpredis --strip-components=1 \
     && cd phpredis \
