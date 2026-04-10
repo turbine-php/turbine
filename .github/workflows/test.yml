@@ -18,13 +18,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # ubuntu-latest already has: autoconf, automake, bison, make, pkg-config,
+      # curl, ca-certificates, libsqlite3-dev, libssl-dev, Rust, Cargo, Rustfmt
       - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential autoconf automake bison re2c pkg-config \
-            curl ca-certificates \
-            libxml2-dev libsqlite3-dev libssl-dev zlib1g-dev \
+            re2c \
+            libxml2-dev zlib1g-dev \
             libcurl4-openssl-dev libpng-dev libonig-dev libzip-dev \
             libicu-dev libsodium-dev libgmp-dev libffi-dev \
             libjpeg-dev libwebp-dev libfreetype-dev \
@@ -69,9 +70,6 @@ jobs:
             --disable-phpdbg
           make -j"$(nproc)"
           sudo make install
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Rust build
         uses: actions/cache@v4
