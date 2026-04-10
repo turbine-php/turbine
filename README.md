@@ -18,7 +18,7 @@ Turbine replaces the traditional **Nginx + PHP-FPM + OPcache** stack with a sing
 
 - **Single binary** — no Nginx, no PHP-FPM, no reverse proxy
 - **Persistent workers** — process and thread modes with automatic scaling
-- **Zero-copy IPC** — in-memory channels for thread mode (ZTS), up to **67k req/s** on Apple M1 Pro
+- **Zero-copy IPC** — in-memory channels for thread mode (ZTS), minimal overhead for high-throughput workloads
 - **OWASP security guards** — SQL injection, code injection, path traversal, behaviour analysis — all in Rust, ~500 ns overhead, zero external WAF needed
 - **ACME auto-TLS** — automatic Let's Encrypt certificates
 - **Virtual hosting** — multiple domains on one server, SNI per-host TLS
@@ -255,21 +255,6 @@ turbine serve --tls-cert cert.pem --tls-key key.pem
 ```
 
 See [docs/tls.md](docs/tls.md) for ACME auto-TLS setup.
-
-## Benchmarks
-
-> Apple M1 Pro, 10 cores, PHP 8.5.4, `wrk -t4 -c100 -d30s`. Full results in `dev/tideways-bench/results/`.
-
-| Server | Hello World (req/s) | HTML 50 KB (req/s) | HTML 50 KB p99 latency |
-|--------|--------------------:|--------------------|------------------------|
-| **Turbine thread, 8w (ZTS)** | **67,467** | **46,390** | **438 µs** |
-| **Turbine process, 8w (NTS)** | **64,023** | **45,143** | 421 µs |
-| PHP-FPM + nginx | 51,353 | 21,686 | **165 ms** (spikes) |
-| FrankenPHP (worker mode) | 41,123 | 17,714 | 738 µs |
-
-Turbine thread mode peaks at **67k req/s** (Hello World) and **46k req/s** (50 KB HTML). For larger real-world responses, PHP-FPM's p99 latency spikes to hundreds of milliseconds under load; Turbine stays sub-millisecond.
-
-See [docs/performance.md](docs/performance.md) for tuning guidance and persistent worker benchmarks.
 
 ## Documentation
 

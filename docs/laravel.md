@@ -178,13 +178,3 @@ level = "warn"
 enabled = false
 ```
 
-## Benchmarks: Laravel
-
-Turbine's persistent workers eliminate per-request `fork()` overhead and keep OPcache warm, resulting in faster response times compared to cold PHP-FPM setups.
-
-Run your own benchmarks:
-
-```bash
-./target/release/turbine serve --root ./my-laravel-app --workers 8
-wrk -t4 -c50 -d15s http://127.0.0.1:8080/
-```

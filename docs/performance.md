@@ -1,4 +1,4 @@
-# Performance & Benchmarks
+# Performance & Tuning
 
 ## Architecture Advantages
 
@@ -34,7 +34,7 @@ All workers share the same OPcache with JIT compilation. Bytecode is compiled on
 | Thread + non-persistent | **In-memory channel (zero syscalls)** | ~2–5 MB (TSRM) | **Highest** |
 | Thread + persistent | `pipe(2)` per request | ~2–5 MB (TSRM) | Higher (no bootstrap) |
 
-Thread + non-persistent is the fastest mode for simple scripts: it uses lock-free `std::sync::mpsc` channels with zero pipe syscalls and returns responses as Rust structs (zero-copy). Thread + persistent still uses pipes for the binary protocol but benefits from bootstrap-once execution. In benchmarks on lightweight endpoints, thread mode shows 5–8% higher req/s at high concurrency with ~40% less memory than process mode.
+Thread + non-persistent is the fastest mode for simple scripts: it uses lock-free `std::sync::mpsc` channels with zero pipe syscalls and returns responses as Rust structs (zero-copy). Thread + persistent still uses pipes for the binary protocol but benefits from bootstrap-once execution.
 
 > Thread mode requires PHP compiled with `--enable-zts`. Run `./build.sh` → select **Thread mode (ZTS)**. See [Worker Mode](worker.md) for the full guide.
 
@@ -142,16 +142,6 @@ tokio_worker_threads = 6  # Default: CPU core count
 | ≥8 | Default (CPU cores) | More PHP workers need more async capacity |
 
 Reducing Tokio threads below 4 can bottleneck connection handling (−30% throughput). Test with your workload to find the optimum.
-
-## Running Benchmarks
-
-```bash
-# Start Turbine
-./target/release/turbine serve --root ./test-app --workers 8
-
-# Run wrk
-wrk -t4 -c50 -d15s http://127.0.0.1:8080/
-```
 
 ## Production Checklist
 

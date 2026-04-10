@@ -1,0 +1,71 @@
+# Turbine Docker Configuration
+# PORT and APP_ROOT are substituted at container startup from env vars.
+# Adjust [php] extensions / extension_dir for your stack.
+
+[server]
+workers = 8
+listen = "0.0.0.0:${PORT}"
+worker_mode = "process"
+persistent_workers = true
+request_timeout = 30
+worker_max_requests = 50000
+
+[server.tls]
+enabled = false
+
+[php]
+extension_dir = "/opt/php-embed/lib/php/extensions/no-debug-non-zts-20240924"
+extensions = ["redis.so", "phalcon.so"]
+memory_limit = "512M"
+max_execution_time = 30
+upload_max_filesize = "64M"
+post_max_size = "64M"
+opcache_memory = 128
+jit_buffer_size = "64M"
+
+[php.ini]
+error_reporting = "E_ALL"
+display_errors = "Off"
+display_startup_errors = "Off"
+log_errors = "On"
+"date.timezone" = "Europe/Lisbon"
+"phalcon.orm.cast_on_hydrate" = "1"
+"phalcon.orm.cast_last_insert_id_to_int" = "1"
+"pdo_mysql.default_socket" = ""
+"mysqli.default_socket" = ""
+
+[security]
+enabled = true
+sql_guard = true
+code_injection_guard = true
+path_traversal_guard = true
+behaviour_guard = true
+
+[sandbox]
+execution_mode = "framework"
+data_directories = ["cache/", "temp/", "logs/", "data/"]
+disabled_functions = ["exec", "system", "passthru", "shell_exec", "proc_open", "popen", "pcntl_exec", "dl", "putenv"]
+enforce_open_basedir = true
+
+[logging]
+level = "warn"
+
+[compression]
+enabled = true
+min_size = 1024
+level = 6
+algorithms = ["br", "zstd", "gzip"]
+
+[session]
+enabled = true
+save_path = "/tmp/turbine-sessions"
+cookie_name = "PHPSESSID"
+cookie_lifetime = 0
+cookie_httponly = true
+cookie_secure = false
+cookie_samesite = "Lax"
+gc_maxlifetime = 1440
+
+[dashboard]
+enabled = false
+statistics = false

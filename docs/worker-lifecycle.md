@@ -1,8 +1,8 @@
 # Worker Lifecycle (Lightweight Boot)
 
-> **The biggest performance win in Turbine.** When enabled, framework boot
-> happens **once per worker** instead of once per request — giving up to
-> 8–12× throughput improvement over PHP-FPM.
+When enabled, framework boot happens **once per worker** instead of once per
+request — eliminating per-request bootstrap overhead for framework-based
+applications.
 
 ## Overview
 

@@ -27,7 +27,7 @@ Before anything else, choose your worker backend and execution model. These are 
 - **Per-request** (`persistent_workers = false`): Each request runs `php_execute_script` with full lifecycle. Still benefits from embedded SAPI and OPcache (faster than PHP-FPM).
 - **Persistent** (`persistent_workers = true`): Workers bootstrap once and handle thousands of requests. Eliminates framework boot overhead from every request.
 
-See [Worker Mode](worker.md) for the full guide, benchmarks, and decision flow.
+See [Worker Mode](worker.md) for the full guide and decision flow.
 See [Worker Lifecycle](worker-lifecycle.md) for the lightweight boot/handler system (`worker_boot` + `worker_handler`).
 
 ## Key Features
@@ -138,7 +138,7 @@ Settings:
 | [Phalcon](phalcon.md) | Phalcon native support with persistent workers |
 | [WordPress](wordpress.md) | WordPress native support with auto-security |
 | [Laravel](laravel.md) | Laravel integration and Octane comparison |
-| [Performance](performance.md) | Benchmarks, tuning, optimization |
+| [Performance](performance.md) | Tuning, optimization |
 | [Compile from Source](compile.md) | Building PHP embed and Turbine |
 | [Early Hints](early-hints.md) | HTTP 103 Early Hints support |
 | [X-Sendfile](x-sendfile.md) | Efficient file serving |

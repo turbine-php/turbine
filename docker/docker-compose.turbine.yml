@@ -1,0 +1,23 @@
+# Turbine Docker — local development stack
+#
+# PORT is the single source of truth for the listen port.
+# It flows into turbine.toml at startup via the entrypoint.
+#
+# Usage:
+#   PORT=8080 docker compose -f docker/docker-compose.turbine.yml up -d
+#   or create a .env file with PORT=8080
+
+services:
+  turbine:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        PORT: "${PORT:-80}"
+    environment:
+      PORT: "${PORT:-80}"
+    volumes:
+      - ../app:/var/www/html
+      - ./turbine.toml:/var/www/html/turbine.toml:ro
+    ports:
+      - "${PORT:-80}:${PORT:-80}"
