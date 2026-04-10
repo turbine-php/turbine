@@ -20,7 +20,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 ARG PHP_VERSION=8.4.6
 ARG PHALCON_VERSION=5.11.1
-ARG PHPREDIS_VERSION=6.1.0
+ARG PHPREDIS_VERSION=6.3.0
 # ZTS=1 enables --enable-zts (thread-safe PHP)
 ARG ZTS=0
 
@@ -101,7 +101,7 @@ RUN EXT_DIR=$(/opt/php-embed/bin/php-config --extension-dir) \
     && ./configure --with-php-config=/opt/php-embed/bin/php-config \
     && make -j"$(nproc)" \
     && cp modules/redis.so "${EXT_DIR}/" \
-    && echo "Redis extension built OK"
+    && echo "Redis extension built OK (${PHPREDIS_VERSION})"
 
 # Bake the extension dir path into an env so runtime stage and entrypoint can use it
 RUN /opt/php-embed/bin/php-config --extension-dir > /opt/php-embed/ext-dir.txt
