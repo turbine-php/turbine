@@ -106,6 +106,10 @@ workers = 8
 worker_mode = "process"
 # Enable persistent workers (bootstrap once, handle many requests)
 persistent_workers = true
+# Boot script: executed ONCE per worker at startup (lightweight lifecycle)
+worker_boot = "turbine-boot.php"
+# Handler script: included on EVERY request (lightweight lifecycle)
+worker_handler = "turbine-handler.php"
 # Max requests per worker before respawn (prevents memory leaks)
 worker_max_requests = 10000
 # Request timeout in seconds
@@ -120,12 +124,16 @@ max_wait_time = 5
 
 When `persistent_workers = true`, workers bootstrap the application (autoloader, framework, service container) **once** and then handle thousands of requests without re-initialization. This eliminates the framework boot overhead on every request.
 
-Without `persistent_workers` (or when set to `false`), each request runs `php_execute_script` with full PHP lifecycle (startup → execute → shutdown). This is faster than PHP-FPM (no FastCGI, shared OPcache) but still boots the framework on every request.
+For the **maximum performance gain**, pair `persistent_workers` with `worker_boot` and `worker_handler` to enable the lightweight lifecycle — see [Worker Lifecycle (Lightweight Boot)](worker-lifecycle.md) for full details.
+
+Without `worker_boot`/`worker_handler`, persistent workers still share OPcache across requests but run the full `php_request_startup`/`php_request_shutdown` cycle.
 
 ```toml
 [server]
 persistent_workers = true
-worker_max_requests = 10000  # Recycle after 10K requests
+worker_boot = "turbine-boot.php"       # boot script (once per worker)
+worker_handler = "turbine-handler.php"  # handler (every request)
+worker_max_requests = 10000             # recycle after 10K requests
 ```
 
 > **Important**: Persistent workers should always use `worker_max_requests > 0`. Without recycling, PHP state accumulates over time and throughput degrades. A value of 10,000–50,000 is recommended.

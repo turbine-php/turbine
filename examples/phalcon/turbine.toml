@@ -2,11 +2,14 @@
 # Optimized for Phalcon PHP framework
 
 [server]
-workers = 0
+workers = 8
 listen = "127.0.0.1:8080"
 worker_mode = "process"
+persistent_workers = true
+worker_boot = "turbine-boot.php"
+worker_handler = "turbine-handler.php"
 request_timeout = 30
-worker_max_requests = 10000
+worker_max_requests = 50000
 auto_scale = false
 
 [server.tls]
@@ -26,18 +29,12 @@ upload_tmp_dir = "/tmp/turbine-uploads"
 
 [php.ini]
 error_reporting = "E_ALL"
-date.timezone = "UTC"
+"date.timezone" = "UTC"
 "phalcon.orm.cast_on_hydrate" = "1"
 "phalcon.orm.cast_last_insert_id_to_int" = "1"
 
 [security]
-enabled = true
-sql_guard = true
-code_injection_guard = true
-path_traversal_guard = true
-behaviour_guard = true
-max_requests_per_second = 100
-rate_limit_window = 60
+enabled = false
 
 [sandbox]
 execution_mode = "framework"

@@ -346,17 +346,22 @@ fn write_all_fd(fd: RawFd, data: &[u8]) -> io::Result<()> {
 
 /// Entry point for persistent worker processes.
 ///
-/// When `persistent_workers = true` and a Laravel-style app is detected
-/// (vendor/autoload.php + bootstrap/app.php), the worker boots the
-/// framework once and reuses the application kernel across requests
-/// using a lightweight per-request lifecycle that skips extension
-/// RINIT/RSHUTDOWN.  This preserves database connections, the autoloader,
-/// and all compiled classes between requests.
+/// When `worker_boot` and `worker_handler` are provided (via `turbine.toml`),
+/// the worker executes the boot script once and then includes the handler
+/// script for every request using a lightweight per-request lifecycle that
+/// skips extension RINIT/RSHUTDOWN.  This preserves database connections,
+/// the autoloader, and all compiled classes between requests.
 ///
-/// For non-Laravel apps (or when detection fails), falls back to the
-/// full php_request_startup/shutdown per request — identical to the
-/// previous behaviour.
-pub fn worker_event_loop_persistent(cmd_fd: RawFd, resp_fd: RawFd, app_root: &str) {
+/// When no boot/handler scripts are configured, falls back to the full
+/// `php_request_startup`/`php_request_shutdown` per request — identical to
+/// the previous behaviour.
+pub fn worker_event_loop_persistent(
+    cmd_fd: RawFd,
+    resp_fd: RawFd,
+    app_root: &str,
+    worker_boot: Option<&str>,
+    worker_handler: Option<&str>,
+) {
     debug!(pid = std::process::id(), app_root = app_root, "Persistent worker started (native SAPI)");
 
     use crate::pool::safe_cstring;
@@ -381,26 +386,34 @@ pub fn worker_event_loop_persistent(cmd_fd: RawFd, resp_fd: RawFd, app_root: &st
         turbine_php_sys::turbine_sapi_install_hooks();
     }
 
-    // ── Detect Laravel and attempt lightweight boot ─────────────────
-    let base = std::path::Path::new(app_root);
-    let is_laravel = base.join("vendor/autoload.php").exists()
-        && base.join("bootstrap/app.php").exists()
-        && base.join("artisan").exists();
-
-    let lightweight_mode = if is_laravel {
-        match unsafe { perform_laravel_boot(app_root) } {
+    // ── Attempt lightweight boot if worker_boot + worker_handler configured ──
+    let lightweight = if let (Some(boot), Some(_handler)) = (worker_boot, worker_handler) {
+        // Resolve boot script path (relative to app_root or absolute).
+        let boot_path = resolve_worker_script(app_root, boot);
+        match unsafe { perform_worker_boot(&boot_path) } {
             true => {
-                info!(pid = std::process::id(), "Laravel boot OK — using lightweight lifecycle");
+                info!(
+                    pid = std::process::id(),
+                    boot = %boot_path,
+                    "Worker boot OK — using lightweight lifecycle"
+                );
                 true
             }
             false => {
-                warn!(pid = std::process::id(), "Laravel boot failed — falling back to full lifecycle");
+                warn!(pid = std::process::id(), "Worker boot failed — falling back to full lifecycle");
                 false
             }
         }
     } else {
-        debug!(pid = std::process::id(), "Not a Laravel app — using full lifecycle");
+        debug!(pid = std::process::id(), "No worker_boot/worker_handler configured — using full lifecycle");
         false
+    };
+
+    // Resolve handler path once (used in the request loop).
+    let handler_abs = if lightweight {
+        Some(resolve_worker_script(app_root, worker_handler.unwrap()))
+    } else {
+        None
     };
 
     // Install initial output capture (for both modes).
@@ -505,23 +518,21 @@ pub fn worker_event_loop_persistent(cmd_fd: RawFd, resp_fd: RawFd, app_root: &st
                 if val_ptrs.is_empty() { std::ptr::null() } else { val_ptrs.as_ptr() },
             );
 
-            let (result, body, headers, status) = if lightweight_mode {
-                // ── Lightweight path: reuse booted $kernel ──────────
+            let (result, body, headers, status) = if lightweight {
+                // ── Lightweight path: include worker_handler per request ──
                 turbine_php_sys::turbine_worker_request_startup();
 
                 output::install_output_capture();
                 output::clear_output_buffer();
 
-                let handler = std::ffi::CString::new(
-                    "$request = \\Illuminate\\Http\\Request::capture();\
-                     $response = $GLOBALS['__turbine_kernel']->handle($request);\
-                     $response->send();\
-                     $GLOBALS['__turbine_kernel']->terminate($request, $response);\
-                     gc_collect_cycles();"
-                ).unwrap();
-                let eval_name = safe_cstring(b"turbine_handler");
+                let handler_code = format!(
+                    "include '{}';",
+                    handler_abs.as_ref().unwrap()
+                );
+                let c_handler = safe_cstring(handler_code.as_bytes());
+                let eval_name = safe_cstring(b"turbine_worker_handler");
                 let r = turbine_php_sys::zend_eval_string(
-                    handler.as_ptr(),
+                    c_handler.as_ptr(),
                     std::ptr::null_mut(),
                     eval_name.as_ptr(),
                 );
@@ -560,19 +571,35 @@ pub fn worker_event_loop_persistent(cmd_fd: RawFd, resp_fd: RawFd, app_root: &st
     }
 
     // Clean up before exiting.
-    if lightweight_mode {
+    if lightweight {
         unsafe { turbine_php_sys::turbine_worker_shutdown(); }
     }
     debug!(pid = std::process::id(), "Persistent worker exited");
 }
 
-/// Boot a Laravel application once (autoloader + kernel).
+/// Resolve a worker script path: absolute paths are used as-is,
+/// relative paths are resolved from `app_root`.
+fn resolve_worker_script(app_root: &str, script: &str) -> String {
+    let path = std::path::Path::new(script);
+    if path.is_absolute() {
+        script.to_string()
+    } else {
+        std::path::Path::new(app_root)
+            .join(script)
+            .display()
+            .to_string()
+    }
+}
+
+/// Boot a PHP application using the configured `worker_boot` script.
 ///
-/// After this call, `$GLOBALS['__turbine_kernel']` holds a reusable HTTP kernel
-/// and all Composer-autoloaded classes are in the class table.
+/// The boot script is expected to set up the application and store it
+/// in `$GLOBALS` (or any convention the handler uses).
+/// The per-request handler file (`worker_handler`) is included for
+/// every request using the lightweight lifecycle.
 ///
 /// Returns `true` on success.
-unsafe fn perform_laravel_boot(app_root: &str) -> bool {
+unsafe fn perform_worker_boot(boot_path: &str) -> bool {
     use crate::pool::safe_cstring;
     use turbine_engine::output;
 
@@ -582,22 +609,11 @@ unsafe fn perform_laravel_boot(app_root: &str) -> bool {
         return false;
     }
 
-    // 2. Eval bootstrap code: load autoloader, create app + kernel.
-    let base = std::path::Path::new(app_root);
-    let vendor   = base.join("vendor/autoload.php");
-    let bootstrap = base.join("bootstrap/app.php");
-
-    let boot_code = format!(
-        "define('LARAVEL_START', microtime(true));\
-         require '{}';\
-         $GLOBALS['__turbine_app'] = require_once '{}';\
-         $GLOBALS['__turbine_kernel'] = $GLOBALS['__turbine_app']->make(\\Illuminate\\Contracts\\Http\\Kernel::class);",
-        vendor.display(),
-        bootstrap.display(),
-    );
+    // 2. Include the boot script.
+    let boot_code = format!("require '{}';", boot_path);
 
     let c_boot = safe_cstring(boot_code.as_bytes());
-    let c_name = safe_cstring(b"turbine_boot");
+    let c_name = safe_cstring(b"turbine_worker_boot");
 
     // Capture and discard boot output.
     output::install_output_capture();
@@ -613,14 +629,14 @@ unsafe fn perform_laravel_boot(app_root: &str) -> bool {
     let _ = output::take_output();
 
     if result != turbine_php_sys::SUCCESS {
-        error!(pid = std::process::id(), "Laravel bootstrap eval failed");
+        error!(pid = std::process::id(), boot = boot_path, "Worker boot script eval failed");
         return false;
     }
 
-    // 3. Lightweight shutdown — preserve $kernel, autoloader, classes.
+    // 3. Lightweight shutdown — preserve globals, classes, app state.
     turbine_php_sys::turbine_worker_request_shutdown();
 
-    info!(pid = std::process::id(), "Laravel kernel booted and cached in $GLOBALS['__turbine_kernel']");
+    info!(pid = std::process::id(), boot = boot_path, "Worker booted via boot script");
     true
 }
 
@@ -632,14 +648,23 @@ use crate::pool::WorkerPool;
 
 impl WorkerPool {
     /// Spawn persistent PHP workers (bootstrap-once model).
-    pub fn spawn_persistent_workers(&mut self, app_root: &str) -> Result<bool, WorkerError> {
+    pub fn spawn_persistent_workers(
+        &mut self,
+        app_root: &str,
+        worker_boot: Option<&str>,
+        worker_handler: Option<&str>,
+    ) -> Result<bool, WorkerError> {
         let count = self.config().workers;
         info!(count = count, app_root = app_root, "Spawning persistent workers");
         let owned_root = app_root.to_string();
+        let owned_boot = worker_boot.map(|s| s.to_string());
+        let owned_handler = worker_handler.map(|s| s.to_string());
 
         for i in 0..count {
             let root = owned_root.clone();
-            let is_master = self.spawn_one_persistent(i, root)?;
+            let boot = owned_boot.clone();
+            let handler = owned_handler.clone();
+            let is_master = self.spawn_one_persistent(i, root, boot, handler)?;
             if !is_master {
                 return Ok(false);
             }
@@ -649,7 +674,13 @@ impl WorkerPool {
         Ok(true)
     }
 
-    fn spawn_one_persistent(&mut self, index: usize, app_root: String) -> Result<bool, WorkerError> {
+    fn spawn_one_persistent(
+        &mut self,
+        index: usize,
+        app_root: String,
+        worker_boot: Option<String>,
+        worker_handler: Option<String>,
+    ) -> Result<bool, WorkerError> {
         let mut cmd_pipe  = [0i32; 2];
         let mut resp_pipe = [0i32; 2];
 
@@ -680,14 +711,25 @@ impl WorkerPool {
                     libc::close(cmd_write);
                     libc::close(resp_read);
                 }
-                worker_event_loop_persistent(cmd_read, resp_write, &app_root);
+                worker_event_loop_persistent(
+                    cmd_read,
+                    resp_write,
+                    &app_root,
+                    worker_boot.as_deref(),
+                    worker_handler.as_deref(),
+                );
                 std::process::exit(0);
             }
         }
     }
 
     /// Reap dead persistent workers and respawn them.
-    pub fn reap_and_respawn_persistent(&mut self, app_root: &str) -> Result<(), WorkerError> {
+    pub fn reap_and_respawn_persistent(
+        &mut self,
+        app_root: &str,
+        worker_boot: Option<&str>,
+        worker_handler: Option<&str>,
+    ) -> Result<(), WorkerError> {
         let mut to_respawn = Vec::new();
 
         for (idx, worker) in self.workers_mut().iter_mut().enumerate() {
@@ -702,14 +744,25 @@ impl WorkerPool {
         }
 
         for idx in to_respawn {
-            self.respawn_persistent_at(idx, app_root.to_string())?;
+            self.respawn_persistent_at(
+                idx,
+                app_root.to_string(),
+                worker_boot.map(|s| s.to_string()),
+                worker_handler.map(|s| s.to_string()),
+            )?;
         }
 
         Ok(())
     }
 
     /// Respawn a persistent worker at a specific index (replacing a dead one).
-    pub fn respawn_persistent_at(&mut self, index: usize, app_root: String) -> Result<bool, WorkerError> {
+    pub fn respawn_persistent_at(
+        &mut self,
+        index: usize,
+        app_root: String,
+        worker_boot: Option<String>,
+        worker_handler: Option<String>,
+    ) -> Result<bool, WorkerError> {
         let mut cmd_pipe  = [0i32; 2];
         let mut resp_pipe = [0i32; 2];
 
@@ -752,7 +805,13 @@ impl WorkerPool {
                     libc::close(cmd_write);
                     libc::close(resp_read);
                 }
-                worker_event_loop_persistent(cmd_read, resp_write, &app_root);
+                worker_event_loop_persistent(
+                    cmd_read,
+                    resp_write,
+                    &app_root,
+                    worker_boot.as_deref(),
+                    worker_handler.as_deref(),
+                );
                 std::process::exit(0);
             }
         }
@@ -766,7 +825,12 @@ impl WorkerPool {
     ///
     /// Each thread bootstraps the application once and handles N requests.
     /// Requires PHP compiled with ZTS.
-    pub fn spawn_persistent_workers_threaded(&mut self, app_root: &str) -> Result<(), WorkerError> {
+    pub fn spawn_persistent_workers_threaded(
+        &mut self,
+        app_root: &str,
+        worker_boot: Option<&str>,
+        worker_handler: Option<&str>,
+    ) -> Result<(), WorkerError> {
         let count = self.config().workers;
         info!(count = count, app_root = app_root, mode = "thread", "Spawning persistent worker threads");
 
@@ -777,14 +841,25 @@ impl WorkerPool {
         }
 
         for i in 0..count {
-            self.spawn_one_persistent_thread(i, app_root.to_string())?;
+            self.spawn_one_persistent_thread(
+                i,
+                app_root.to_string(),
+                worker_boot.map(|s| s.to_string()),
+                worker_handler.map(|s| s.to_string()),
+            )?;
         }
 
         info!(spawned = self.worker_count(), "All persistent worker threads spawned");
         Ok(())
     }
 
-    fn spawn_one_persistent_thread(&mut self, index: usize, app_root: String) -> Result<(), WorkerError> {
+    fn spawn_one_persistent_thread(
+        &mut self,
+        index: usize,
+        app_root: String,
+        worker_boot: Option<String>,
+        worker_handler: Option<String>,
+    ) -> Result<(), WorkerError> {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -821,7 +896,13 @@ impl WorkerPool {
                 }
 
                 // Run the persistent event loop (same as process mode)
-                worker_event_loop_persistent(cmd_read, resp_write, &app_root);
+                worker_event_loop_persistent(
+                    cmd_read,
+                    resp_write,
+                    &app_root,
+                    worker_boot.as_deref(),
+                    worker_handler.as_deref(),
+                );
 
                 // Clean up
                 unsafe { turbine_php_sys::turbine_thread_cleanup(); }
@@ -843,7 +924,12 @@ impl WorkerPool {
     }
 
     /// Reap dead persistent thread workers and respawn them.
-    pub fn reap_and_respawn_persistent_threaded(&mut self, app_root: &str) -> Result<(), WorkerError> {
+    pub fn reap_and_respawn_persistent_threaded(
+        &mut self,
+        app_root: &str,
+        worker_boot: Option<&str>,
+        worker_handler: Option<&str>,
+    ) -> Result<(), WorkerError> {
         let mut to_respawn = Vec::new();
 
         for (idx, worker) in self.workers_mut().iter_mut().enumerate() {
@@ -854,13 +940,24 @@ impl WorkerPool {
         }
 
         for idx in to_respawn {
-            self.respawn_persistent_thread_at(idx, app_root.to_string())?;
+            self.respawn_persistent_thread_at(
+                idx,
+                app_root.to_string(),
+                worker_boot.map(|s| s.to_string()),
+                worker_handler.map(|s| s.to_string()),
+            )?;
         }
 
         Ok(())
     }
 
-    fn respawn_persistent_thread_at(&mut self, index: usize, app_root: String) -> Result<(), WorkerError> {
+    fn respawn_persistent_thread_at(
+        &mut self,
+        index: usize,
+        app_root: String,
+        worker_boot: Option<String>,
+        worker_handler: Option<String>,
+    ) -> Result<(), WorkerError> {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -893,7 +990,13 @@ impl WorkerPool {
                     }
                     return;
                 }
-                worker_event_loop_persistent(cmd_read, resp_write, &app_root);
+                worker_event_loop_persistent(
+                    cmd_read,
+                    resp_write,
+                    &app_root,
+                    worker_boot.as_deref(),
+                    worker_handler.as_deref(),
+                );
                 unsafe { turbine_php_sys::turbine_thread_cleanup(); }
                 unsafe {
                     libc::close(cmd_read);

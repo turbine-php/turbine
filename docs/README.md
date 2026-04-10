@@ -28,6 +28,7 @@ Before anything else, choose your worker backend and execution model. These are 
 - **Persistent** (`persistent_workers = true`): Workers bootstrap once and handle thousands of requests. Eliminates framework boot overhead from every request.
 
 See [Worker Mode](worker.md) for the full guide, benchmarks, and decision flow.
+See [Worker Lifecycle](worker-lifecycle.md) for the lightweight boot/handler system (`worker_boot` + `worker_handler`).
 
 ## Key Features
 

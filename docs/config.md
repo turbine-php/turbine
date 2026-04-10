@@ -31,6 +31,12 @@ worker_mode = "process"
 # When true, workers load the autoloader once and handle requests without re-initialization
 # When false (default), each request executes php_execute_script with full lifecycle
 # persistent_workers = true
+# Boot script: executed ONCE per worker at startup (enables lightweight lifecycle)
+# Path relative to app root, or absolute. Requires persistent_workers = true.
+# worker_boot = "turbine-boot.php"
+# Handler script: included on EVERY request (lightweight lifecycle)
+# Requires persistent_workers = true and worker_boot to be set.
+# worker_handler = "turbine-handler.php"
 # Number of Tokio async I/O threads (default = number of CPU cores)
 # Increase for more concurrent connections; decrease to leave cores for PHP workers
 # tokio_worker_threads = 6
@@ -243,6 +249,8 @@ statistics = true
 | `listen` | string | `"127.0.0.1:9000"` | Bind address |
 | `worker_mode` | string | `"process"` | Worker backend: `"process"` (fork) or `"thread"` (ZTS) |
 | `persistent_workers` | bool | none | Enable persistent workers (bootstrap once, handle many) |
+| `worker_boot` | string | none | Boot script path (once per worker). See [worker-lifecycle.md](worker-lifecycle.md) |
+| `worker_handler` | string | none | Handler script path (per request). See [worker-lifecycle.md](worker-lifecycle.md) |
 | `tokio_worker_threads` | integer | CPU cores | Number of Tokio async I/O threads |
 | `request_timeout` | integer | `30` | Request timeout in seconds (0 = unlimited) |
 | `worker_max_requests` | integer | `10000` | Requests per worker before respawn |

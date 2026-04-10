@@ -249,7 +249,13 @@ impl WorkerPool {
     /// Sends the persistent-protocol shutdown byte (`0xFF`) via the cmd pipe
     /// so the worker exits cleanly (no SIGTERM), then forks a replacement
     /// immediately so the worker slot is never left empty.
-    pub fn return_worker_persistent(&mut self, index: usize, app_root: &str) {
+    pub fn return_worker_persistent(
+        &mut self,
+        index: usize,
+        app_root: &str,
+        worker_boot: Option<&str>,
+        worker_handler: Option<&str>,
+    ) {
         if index < self.workers.len() {
             let should_recycle = self.workers[index].mark_idle();
             if should_recycle {
@@ -285,7 +291,12 @@ impl WorkerPool {
                     let _ = self.workers[index].terminate();
                     let _ = nix::sys::wait::waitpid(pid, None);
                 }
-                if let Err(e) = self.respawn_persistent_at(index, app_root.to_string()) {
+                if let Err(e) = self.respawn_persistent_at(
+                    index,
+                    app_root.to_string(),
+                    worker_boot.map(|s| s.to_string()),
+                    worker_handler.map(|s| s.to_string()),
+                ) {
                     error!(index = index, error = %e, "Failed to inline respawn persistent worker");
                 }
             } else {

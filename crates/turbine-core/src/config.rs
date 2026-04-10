@@ -92,10 +92,24 @@ pub struct ServerConfig {
     #[serde(default = "default_scale_down_idle")]
     pub scale_down_idle_secs: u64,
     /// Enable persistent workers (bootstrap-once, handle many requests).
-    /// When enabled, workers load the autoloader and optional `turbine-worker.php`
-    /// once, then handle requests via include or custom handler.
+    /// When enabled, workers handle thousands of requests without
+    /// re-initialization.  Pair with `worker_boot` and `worker_handler`
+    /// to enable the lightweight lifecycle.
     #[serde(default)]
     pub persistent_workers: Option<bool>,
+    /// PHP script executed **once** per worker at boot time.
+    /// The script should bootstrap the application (autoloader, framework,
+    /// service container) and store the app instance in `$GLOBALS`.
+    /// Requires `persistent_workers = true`.  Relative paths are resolved
+    /// from the application root (`-r` / `--root`).
+    #[serde(default)]
+    pub worker_boot: Option<String>,
+    /// PHP script included on **every request** using the lightweight
+    /// lifecycle (skips full php_request_startup/shutdown).
+    /// Requires `persistent_workers = true` and `worker_boot` to be set.
+    /// Relative paths are resolved from the application root.
+    #[serde(default)]
+    pub worker_handler: Option<String>,
     /// Number of Tokio async I/O threads (default = number of CPU cores).
     /// Increase to handle more concurrent connections; decrease to leave more
     /// cores for PHP worker processes.
@@ -701,6 +715,8 @@ impl Default for ServerConfig {
             max_workers: default_max_workers(),
             scale_down_idle_secs: default_scale_down_idle(),
             persistent_workers: None,
+            worker_boot: None,
+            worker_handler: None,
             tokio_worker_threads: None,
         }
     }
