@@ -1,0 +1,99 @@
+name: Tests
+
+on:
+  pull_request:
+    branches: ["main", "master"]
+  push:
+    branches: ["main", "master"]
+
+env:
+  CARGO_TERM_COLOR: always
+  PHP_VERSION: "8.4.6"
+
+jobs:
+  test:
+    name: cargo test (PHP ${{ env.PHP_VERSION }} NTS)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential autoconf automake bison re2c pkg-config \
+            curl ca-certificates \
+            libxml2-dev libsqlite3-dev libssl-dev zlib1g-dev \
+            libcurl4-openssl-dev libpng-dev libonig-dev libzip-dev \
+            libicu-dev libsodium-dev libgmp-dev libffi-dev \
+            libjpeg62-turbo-dev libwebp-dev libfreetype-dev \
+            libc++-dev libc++abi-dev
+
+      - name: Cache PHP embed build
+        id: cache-php
+        uses: actions/cache@v4
+        with:
+          path: /opt/php-embed
+          key: php-embed-${{ env.PHP_VERSION }}-nts-${{ runner.os }}-${{ hashFiles('crates/turbine-php-sys/build.rs') }}
+
+      - name: Build PHP embed SAPI
+        if: steps.cache-php.outputs.cache-hit != 'true'
+        run: |
+          curl -fSL "https://www.php.net/distributions/php-${PHP_VERSION}.tar.xz" -o php.tar.xz
+          tar xf php.tar.xz
+          cd php-${PHP_VERSION}
+          ./configure \
+            --prefix=/opt/php-embed \
+            --enable-embed=shared \
+            --enable-opcache \
+            --enable-mbstring \
+            --enable-intl \
+            --enable-bcmath \
+            --enable-sockets \
+            --enable-pcntl \
+            --with-openssl \
+            --with-zlib \
+            --with-curl \
+            --with-pdo-mysql=mysqlnd \
+            --with-mysqli=mysqlnd \
+            --with-pdo-sqlite \
+            --with-sqlite3 \
+            --with-zip \
+            --with-libxml \
+            --with-sodium \
+            --with-gmp \
+            --with-ffi \
+            --with-config-file-path=/opt/php-embed/etc \
+            --disable-cgi \
+            --disable-phpdbg
+          make -j"$(nproc)"
+          sudo make install
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Run tests
+        env:
+          PHP_CONFIG: /opt/php-embed/bin/php-config
+          LD_LIBRARY_PATH: /opt/php-embed/lib
+        run: cargo test --workspace --verbose
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        env:
+          PHP_CONFIG: /opt/php-embed/bin/php-config
+          LD_LIBRARY_PATH: /opt/php-embed/lib
+        run: cargo clippy --workspace -- -D warnings

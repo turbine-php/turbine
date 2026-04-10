@@ -1,18 +1,28 @@
 # Turbine Runtime — Docker image
-# Multi-stage build: compile PHP embed + Phalcon + Redis + Turbine, then run
+# Multi-stage build: compile PHP embed + extensions + Turbine, then run
 #
-# Build:  docker build -t turbine:latest -f docker/Dockerfile .
-# Run:    docker run -e PORT=8080 -p 8080:8080 -v ./app:/var/www/html turbine:latest
+# Build (NTS):  docker build -t turbine:latest -f docker/Dockerfile .
+# Build (ZTS):  docker build -t turbine:latest-zts -f docker/Dockerfile --build-arg ZTS=1 .
+# Run:          docker run -e PORT=8080 -p 8080:8080 -v ./app:/var/www/html turbine:latest
 #
-# PORT env var drives [server] listen in turbine.toml at startup (default 80).
+# Build ARGs:
+#   PHP_VERSION   — full PHP version (e.g. 8.4.6, 8.5.1)
+#   ZTS           — 1 = thread-safe build, 0 = NTS (default)
+#   PHALCON_VERSION, PHPREDIS_VERSION — extension versions
+#   PORT          — default port exposed (default 80)
+#
+# PORT env var drives [server] listen in turbine.toml at startup.
 
 # ── Stage 1: Build PHP embed SAPI + extensions + Turbine binary ──────────────
 FROM debian:bookworm-slim AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
-ENV PHP_VERSION=8.4.6
-ENV PHALCON_VERSION=5.11.1
-ENV PHPREDIS_VERSION=6.1.0
+
+ARG PHP_VERSION=8.4.6
+ARG PHALCON_VERSION=5.11.1
+ARG PHPREDIS_VERSION=6.1.0
+# ZTS=1 enables --enable-zts (thread-safe PHP)
+ARG ZTS=0
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -63,29 +73,35 @@ RUN curl -fSL "https://www.php.net/distributions/php-${PHP_VERSION}.tar.xz" -o p
         --with-config-file-path=/opt/php-embed/etc \
         --disable-cgi \
         --disable-phpdbg \
+        $([ "${ZTS}" = "1" ] && echo "--enable-zts" || true) \
     && make -j"$(nproc)" \
     && make install \
-    && echo "PHP embed built OK"
+    && echo "PHP embed built OK (ZTS=${ZTS})"
 
 # ── Build Phalcon extension ──────────────────────────────────────────────────
-RUN curl -fsSL "https://github.com/phalcon/cphalcon/archive/refs/tags/v${PHALCON_VERSION}.tar.gz" -o phalcon.tar.gz \
+RUN EXT_DIR=$(/opt/php-embed/bin/php-config --extension-dir) \
+    && curl -fsSL "https://github.com/phalcon/cphalcon/archive/refs/tags/v${PHALCON_VERSION}.tar.gz" -o phalcon.tar.gz \
     && mkdir -p cphalcon && tar xf phalcon.tar.gz -C cphalcon --strip-components=1 \
     && cd cphalcon/ext \
     && /opt/php-embed/bin/phpize \
     && ./configure --with-php-config=/opt/php-embed/bin/php-config \
     && make -j"$(nproc)" \
-    && cp modules/phalcon.so /opt/php-embed/lib/php/extensions/no-debug-non-zts-20240924/ \
+    && cp modules/phalcon.so "${EXT_DIR}/" \
     && echo "Phalcon built OK"
 
 # ── Build Redis extension ────────────────────────────────────────────────────
-RUN curl -fsSL "https://github.com/phpredis/phpredis/archive/refs/tags/${PHPREDIS_VERSION}.tar.gz" -o phpredis.tar.gz \
+RUN EXT_DIR=$(/opt/php-embed/bin/php-config --extension-dir) \
+    && curl -fsSL "https://github.com/phpredis/phpredis/archive/refs/tags/${PHPREDIS_VERSION}.tar.gz" -o phpredis.tar.gz \
     && mkdir -p phpredis && tar xf phpredis.tar.gz -C phpredis --strip-components=1 \
     && cd phpredis \
     && /opt/php-embed/bin/phpize \
     && ./configure --with-php-config=/opt/php-embed/bin/php-config \
     && make -j"$(nproc)" \
-    && cp modules/redis.so /opt/php-embed/lib/php/extensions/no-debug-non-zts-20240924/ \
+    && cp modules/redis.so "${EXT_DIR}/" \
     && echo "Redis extension built OK"
+
+# Bake the extension dir path into an env so runtime stage and entrypoint can use it
+RUN /opt/php-embed/bin/php-config --extension-dir > /opt/php-embed/ext-dir.txt
 
 # ── Build Turbine ────────────────────────────────────────────────────────────
 COPY Cargo.toml Cargo.lock* /build/turbine/
@@ -113,6 +129,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Copy PHP embed SAPI
 COPY --from=builder /opt/php-embed /opt/php-embed
+
+# Expose extension dir path to the entrypoint for turbine.toml substitution
+RUN cat /opt/php-embed/ext-dir.txt
 
 # Copy Turbine binary
 COPY --from=builder /build/turbine/target/release/turbine /usr/local/bin/turbine

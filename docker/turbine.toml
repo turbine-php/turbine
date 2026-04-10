@@ -14,7 +14,7 @@ worker_max_requests = 50000
 enabled = false
 
 [php]
-extension_dir = "/opt/php-embed/lib/php/extensions/no-debug-non-zts-20240924"
+extension_dir = "${PHP_EXTENSION_DIR}"
 extensions = ["redis.so", "phalcon.so"]
 memory_limit = "512M"
 max_execution_time = 30
