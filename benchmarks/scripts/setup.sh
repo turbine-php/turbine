@@ -45,7 +45,7 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     cp /tmp/wrk-src/wrk /usr/local/bin/wrk
     rm -rf /tmp/wrk-src
 }
-wrk --version 2>&1 | head -1
+wrk --version 2>&1 | head -1 || true   # wrk exits 1 on --version but still prints info
 
 # ── 5. Native Nginx + PHP 8.4-FPM (baseline for raw + laravel) ───────────────
 log "Adding ondrej/php PPA..."
