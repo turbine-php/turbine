@@ -32,21 +32,6 @@ trap 'rm -rf "$RESULTS_DIR"' EXIT
 # save_result <scenario> <key> <json-string>
 save_result() { mkdir -p "${RESULTS_DIR}/${1}"; printf '%s' "${3}" > "${RESULTS_DIR}/${1}/${2}.json"; }
 
-# FPM Nginx port for a given app name and worker count (4 or 8)
-fpm_port() {
-    case "${1}-${2}" in
-        raw-4)          echo 8804 ;;
-        raw-8)          echo 8803 ;;
-        laravel-4)      echo 8814 ;;
-        laravel-8)      echo 8813 ;;
-        php-bench-4)    echo 8834 ;;
-        php-bench-8)    echo 8833 ;;
-        phalcon-4)      echo 8824 ;;
-        phalcon-8)      echo 8823 ;;
-        *)              echo 8803 ;;
-    esac
-}
-
 # Resolve Docker image names
 if echo "$IMAGE_TAG" | grep -qE "nts|zts"; then
     TURBINE_IMAGE_NTS="katisuhara/turbine-php:${IMAGE_TAG}"
@@ -56,6 +41,7 @@ else
     TURBINE_IMAGE_ZTS="katisuhara/turbine-php:${IMAGE_TAG}-php8.4-zts"
 fi
 FRANKENPHP_IMAGE="dunglas/frankenphp:latest"
+FPM_IMAGE="bench-fpm:latest"   # locally built nginx+php8.4-fpm+phalcon image
 # Note: FrankenPHP is ZTS-based. Phalcon is NOT supported on FrankenPHP.
 
 log() { echo "[bench] $*" >&2; }
@@ -275,57 +261,13 @@ bench_php_scripts() {
     echo "[${joined%,}]"
 }
 
-# ── Benchmark native Nginx + PHP-FPM ─────────────────────────────────────────
-bench_fpm() {
-    local label="$1"
-    local port="$2"
-    local path="${3:-/}"
-    local url="http://127.0.0.1:${port}${path}"
-    local result_file="/tmp/result_fpm_${RANDOM}.json"
-
-    log "  Warmup ${label}..."
-    wrk -c "$WARMUP_CONNECTIONS" -d "${WARMUP_DURATION}s" -t 2 \
-        "$url" >/dev/null 2>&1 || true
-
-    log "  Benchmarking ${label} (${WRK_DURATION}s, ${WRK_CONNECTIONS} conn)..."
-    local wrk_raw="/tmp/wrk_raw_fpm_${RANDOM}.txt"
-    wrk \
-        -c "$WRK_CONNECTIONS" \
-        -d "${WRK_DURATION}s" \
-        -t "$WRK_THREADS" \
-        -s "$WRK_LUA" \
-        "$url" > "$wrk_raw" 2>/dev/null || true
-    grep '^{' "$wrk_raw" > "$result_file" 2>/dev/null || echo '{}' > "$result_file"
-    rm -f "$wrk_raw"
-
-    log "  ${label}: $(python3 -c "import json; d=json.load(open('$result_file')); print(d.get('rps',0))" 2>/dev/null || echo '?') req/s"
-
-    # CPU/memory N/A for native FPM (not in a container)
-    parse_wrk "$result_file" "N/A" "N/A"
-    rm -f "$result_file"
-}
-
-# bench_php_scripts_fpm: run 4 scripts against nginx-fpm, returns JSON array
-bench_php_scripts_fpm() {
-    local port="$1"
-    shift
-    local scripts=("$@")
-    local results=()
-    for script in "${scripts[@]}"; do
-        results+=("$(bench_fpm "nginx-fpm/php-bench" "$port" "/${script}")")
-    done
-    local joined
-    joined=$(printf '%s,' "${results[@]}")
-    echo "[${joined%,}]"
-}
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Benchmark matrix
 #   Workers:     4 and 8
 #   Turbine NTS: process mode, persistent=false and persistent=true
 #   Turbine ZTS: thread  mode (no persistent variant — threads already share state)
 #   FrankenPHP:  regular mode (num_threads N) and worker mode (N persistent workers)
-#   Nginx+FPM:   4w and 8w static pools
+#   Nginx+FPM:   bench-fpm Docker image, 4w and 8w (equal overhead to all others)
 # ─────────────────────────────────────────────────────────────────────────────
 
 PHP_SCRIPTS=(hello.php html_50k.php pdf_50k.php random_50k.php)
@@ -353,7 +295,10 @@ for W in 4 8; do
             -v /var/www/raw:/app \
             -v "/etc/frankenphp/raw-${W}w-worker.Caddyfile:/etc/caddy/Caddyfile")"
     save_result raw_php "nginx_fpm_${W}w" \
-        "$(bench_fpm "fpm/${W}w/raw" "$(fpm_port raw $W)" "/")"
+        "$(bench_container "fpm/${W}w/raw" "$FPM_IMAGE" "/" \
+            -e WORKERS=${W} \
+            -e APP_ROOT=/var/www/html \
+            -v /var/www/raw:/var/www/html)"
 done
 
 # ─── PHP Scripts ─────────────────────────────────────────────────────────────
@@ -383,7 +328,11 @@ for W in 4 8; do
             -v "/etc/frankenphp/php-bench-${W}w-worker.Caddyfile:/etc/caddy/Caddyfile" \
             -- "${PHP_SCRIPTS[@]}")"
     save_result php_scripts "nginx_fpm_${W}w" \
-        "$(bench_php_scripts_fpm "$(fpm_port php-bench $W)" "${PHP_SCRIPTS[@]}")"
+        "$(bench_php_scripts "fpm/${W}w/php-bench" "$FPM_IMAGE" \
+            -e WORKERS=${W} \
+            -e APP_ROOT=/var/www/html \
+            -v /var/www/php-bench:/var/www/html \
+            -- "${PHP_SCRIPTS[@]}")"
 done
 
 # ─── Laravel ─────────────────────────────────────────────────────────────────
@@ -409,7 +358,10 @@ for W in 4 8; do
             -v /var/www/laravel:/app \
             -v "/etc/frankenphp/laravel-${W}w-worker.Caddyfile:/etc/caddy/Caddyfile")"
     save_result laravel "nginx_fpm_${W}w" \
-        "$(bench_fpm "fpm/${W}w/laravel" "$(fpm_port laravel $W)" "/")"
+        "$(bench_container "fpm/${W}w/laravel" "$FPM_IMAGE" "/" \
+            -e WORKERS=${W} \
+            -e APP_ROOT=/var/www/html/public \
+            -v /var/www/laravel:/var/www/html)"
 done
 
 # ─── Laravel note: full app dir is mounted (not just public/) so autoloader works ───
@@ -430,7 +382,10 @@ for W in 4 8; do
             -v /var/www/phalcon:/var/www/html \
             -v "/etc/turbine/phalcon-zts-${W}w.toml:/var/www/html/turbine.toml:ro")"
     save_result phalcon "nginx_fpm_${W}w" \
-        "$(bench_fpm "fpm/${W}w/phalcon" "$(fpm_port phalcon $W)" "/")"
+        "$(bench_container "fpm/${W}w/phalcon" "$FPM_IMAGE" "/" \
+            -e WORKERS=${W} \
+            -e APP_ROOT=/var/www/html \
+            -v /var/www/phalcon:/var/www/html)"
 done
 
 # ─────────────────────────────────────────────────────────────────────────────

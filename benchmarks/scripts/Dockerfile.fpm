@@ -1,0 +1,56 @@
+# Dockerfile.fpm — Nginx + PHP 8.4-FPM + Phalcon benchmark image
+#
+# Single image used for all FPM scenarios. The app root and worker count are
+# configured at runtime via environment variables:
+#   APP_ROOT   — document root served by Nginx (default: /var/www/html/public)
+#   FPM_SOCKET — path to the FPM socket (default: /run/php/fpm.sock)
+#   WORKERS    — pm.max_children for the FPM pool (default: 4)
+#
+# Usage:
+#   docker run -d -p 8080:80 \
+#     -e WORKERS=8 \
+#     -e APP_ROOT=/var/www/html/public \
+#     -v /var/www/laravel:/var/www/html \
+#     bench-fpm:latest
+
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PHALCON_VERSION=5.11.1
+
+# ── System packages ────────────────────────────────────────────────────────────
+RUN apt-get update -qq && \
+    apt-get install -y --no-install-recommends \
+        ca-certificates curl gnupg software-properties-common && \
+    add-apt-repository -y ppa:ondrej/php && \
+    apt-get update -qq && \
+    apt-get install -y --no-install-recommends \
+        nginx \
+        php8.4-fpm php8.4-cli \
+        php8.4-mbstring php8.4-xml php8.4-curl php8.4-zip \
+        php8.4-intl php8.4-bcmath php8.4-gd php8.4-sqlite3 \
+        php8.4-tokenizer php8.4-fileinfo php8.4-opcache php8.4-dev \
+        php-pear build-essential && \
+    rm -rf /var/lib/apt/lists/*
+
+# ── Phalcon extension ──────────────────────────────────────────────────────────
+RUN pecl install phalcon-${PHALCON_VERSION} && \
+    echo "extension=phalcon.so" > /etc/php/8.4/mods-available/phalcon.ini && \
+    phpenmod -v 8.4 phalcon && \
+    php8.4 -m | grep -q phalcon
+
+# ── PHP-FPM: single pool configured at container startup ──────────────────────
+# The entrypoint writes /etc/php/8.4/fpm/pool.d/bench.conf from env vars.
+RUN rm -f /etc/php/8.4/fpm/pool.d/www.conf
+
+# ── Nginx: minimal config — app root injected at runtime ──────────────────────
+RUN rm -f /etc/nginx/sites-enabled/default
+COPY fpm-nginx.conf /etc/nginx/sites-available/bench
+RUN ln -s /etc/nginx/sites-available/bench /etc/nginx/sites-enabled/bench
+
+# ── entrypoint ─────────────────────────────────────────────────────────────────
+COPY fpm-entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+EXPOSE 80
+ENTRYPOINT ["/entrypoint.sh"]
