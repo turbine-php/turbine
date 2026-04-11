@@ -106,14 +106,21 @@ PYEOF
 }
 
 # ── Parse bombardier JSON output → compact result JSON ───────────────────────
-# Bombardier latency values are in nanoseconds.
+# Bombardier v1.2.6 JSON structure: {"spec":{...},"result":{"rps":{"mean":...},"latency":{"percentiles":{"50":...},...},...}}
 parse_bombardier() {
     local file="$1"
     local avg_cpu="$2"
     local peak_mem="$3"
     python3 - "$file" "$avg_cpu" "$peak_mem" << 'PYEOF'
 import sys, json
-data = json.load(open(sys.argv[1]))
+try:
+    data = json.load(open(sys.argv[1]))
+except Exception:
+    # Empty or invalid file (server failed to start)
+    print(json.dumps({'rps':0,'latency_p50':0,'latency_p99':0,'latency_p999':0,'latency_max':0,
+                      'req_2xx':0,'req_errors':0,'avg_cpu_pct':sys.argv[2],'peak_mem_mib':sys.argv[3],
+                      'error':'no_data'}))
+    sys.exit(0)
 avg_cpu  = sys.argv[2]
 peak_mem = sys.argv[3]
 r = data.get('result', {})
@@ -126,21 +133,21 @@ def ns_to_ms(ns):
 
 pctiles = lat.get('percentiles', {})
 print(json.dumps({
-    'rps':        round(rps.get('mean', 0)),
-    'latency_p50': ns_to_ms(pctiles.get('50', 0)),
-    'latency_p99': ns_to_ms(pctiles.get('99', 0)),
+    'rps':          round(rps.get('mean', 0)),
+    'latency_p50':  ns_to_ms(pctiles.get('50', 0)),
+    'latency_p99':  ns_to_ms(pctiles.get('99', 0)),
     'latency_p999': ns_to_ms(lat.get('max', 0)),
-    'latency_max': ns_to_ms(lat.get('max', 0)),
-    'req_2xx':    r.get('req2xx', 0),
-    'req_errors': r.get('req4xx', 0) + r.get('req5xx', 0),
-    'avg_cpu_pct': avg_cpu,
+    'latency_max':  ns_to_ms(lat.get('max', 0)),
+    'req_2xx':      r.get('req2xx', 0),
+    'req_errors':   r.get('req4xx', 0) + r.get('req5xx', 0),
+    'avg_cpu_pct':  avg_cpu,
     'peak_mem_mib': peak_mem,
 }))
 PYEOF
 }
 
 # ── Benchmark a Docker container ──────────────────────────────────────────────
-# Usage: bench_container <label> <image> [path] [-- docker args...]
+# Usage: bench_container <label> <image> [path] [docker args...]
 # path defaults to /
 bench_container() {
     local label="$1"
@@ -158,7 +165,13 @@ bench_container() {
         "${docker_args[@]}" \
         "$image" >/dev/null
 
-    wait_http "http://127.0.0.1:${BENCH_PORT}/"
+    if ! wait_http "http://127.0.0.1:${BENCH_PORT}/"; then
+        log "  SKIP ${label}: server never became ready (check image/config)"
+        docker stop bench-server >/dev/null 2>&1 || true
+        docker rm   bench-server >/dev/null 2>&1 || true
+        parse_bombardier /dev/null "N/A" "N/A"
+        return 0
+    fi
 
     log "  Warmup ${label}..."
     bombardier -c "$WARMUP_CONNECTIONS" -n "$WARMUP_REQUESTS" \
@@ -168,11 +181,14 @@ bench_container() {
     local stats_pid
     stats_pid=$(start_stats bench-server "$stats_file")
 
+    # -p r  → print result only (suppresses progress bar from stdout)
+    # -o j  → JSON format
+    # -l    → include latency percentiles in output
     bombardier \
         -c "$WRK_CONNECTIONS" \
         -d "${WRK_DURATION}s" \
         --timeout 10s \
-        --format json \
+        -p r -o j -l \
         "$url" > "$result_file" 2>/dev/null || true
 
     kill "$stats_pid" 2>/dev/null || true
@@ -213,7 +229,20 @@ bench_php_scripts() {
         -p "${BENCH_PORT}:80" \
         "${docker_args[@]}" \
         "$image" >/dev/null
-    wait_http "http://127.0.0.1:${BENCH_PORT}/"
+
+    if ! wait_http "http://127.0.0.1:${BENCH_PORT}/"; then
+        log "  SKIP ${label}: server never became ready"
+        docker stop bench-server >/dev/null 2>&1 || true
+        docker rm   bench-server >/dev/null 2>&1 || true
+        local null_result
+        null_result=$(parse_bombardier /dev/null "N/A" "N/A")
+        local joined=""
+        for _ in "${scripts[@]}"; do
+            joined+="${null_result},"
+        done
+        echo "[${joined%,}]"
+        return 0
+    fi
 
     local results=()
     for script in "${scripts[@]}"; do
@@ -229,7 +258,7 @@ bench_php_scripts() {
         local stats_pid
         stats_pid=$(start_stats bench-server "$stats_file")
         bombardier -c "$WRK_CONNECTIONS" -d "${WRK_DURATION}s" \
-            --timeout 10s --format json "$url" > "$result_file" 2>/dev/null || true
+            --timeout 10s -p r -o j -l "$url" > "$result_file" 2>/dev/null || true
         kill "$stats_pid" 2>/dev/null || true
         wait "$stats_pid" 2>/dev/null || true
 
@@ -267,10 +296,10 @@ bench_fpm() {
         -c "$WRK_CONNECTIONS" \
         -d "${WRK_DURATION}s" \
         --timeout 10s \
-        --format json \
+        -p r -o j -l \
         "$url" > "$result_file" 2>/dev/null || true
 
-    log "  ${label}: $(python3 -c "import json; d=json.load(open('$result_file')); print(round(d['result']['rps']['mean'])) " 2>/dev/null || echo '?') req/s"
+    log "  ${label}: $(python3 -c "import json; d=json.load(open('$result_file')); print(round(d['result']['rps']['mean']))" 2>/dev/null || echo '?') req/s"
 
     # CPU/memory N/A for native FPM (not in a container)
     parse_bombardier "$result_file" "N/A" "N/A"
