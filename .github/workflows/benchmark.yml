@@ -38,7 +38,7 @@ permissions:
 
 jobs:
   benchmark:
-    name: Run benchmarks on Hetzner CPX41
+    name: Run benchmarks on Hetzner CCX33
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
@@ -154,6 +154,7 @@ jobs:
         run: |
           TAG="${{ steps.meta.outputs.tag }}"
           DATE="${{ steps.meta.outputs.date }}"
+          mkdir -p benchmarks/results/history
           cp /tmp/bench-report.md benchmarks/results/README.md
           cp /tmp/bench-report.md "benchmarks/results/history/${DATE}-${TAG}.md"
           git config user.name  "github-actions[bot]"

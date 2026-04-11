@@ -5,11 +5,14 @@
 -- Latency values are in microseconds internally; we convert to milliseconds.
 
 done = function(summary, latency, requests)
-    local errors = summary.errors.connect
-                 + summary.errors.read
-                 + summary.errors.write
-                 + summary.errors.timeout
-                 + (summary.errors.status or 0)
+    -- Only count hard network failures as errors.
+    -- summary.errors.read in wrk 4.1 counts EOF/close events on keep-alive cycling
+    -- (incremented for every response read), NOT actual failures. Including it would
+    -- make req_errors ≈ total_requests and req_2xx = 0 even on a healthy server.
+    local req_errors = summary.errors.connect + summary.errors.timeout
+
+    -- summary.requests = total HTTP requests that completed (all status codes)
+    local req_2xx = summary.requests - req_errors
 
     -- summary.duration is in microseconds; convert to seconds for rps
     local rps = math.floor(summary.requests / (summary.duration / 1e6))
@@ -19,11 +22,8 @@ done = function(summary, latency, requests)
     local p99 = latency:percentile(99) / 1000
     local pmax = latency.max / 1000
 
-    -- req_2xx: wrk has no summary["2xx"]; compute from total minus all error types
-    local req_2xx = summary.requests - errors
-
     print(string.format(
         '{"rps":%d,"latency_p50_ms":%.2f,"latency_p99_ms":%.2f,"latency_max_ms":%.2f,"req_2xx":%d,"req_errors":%d}',
-        rps, p50, p99, pmax, req_2xx, errors
+        rps, p50, p99, pmax, req_2xx, req_errors
     ))
 end

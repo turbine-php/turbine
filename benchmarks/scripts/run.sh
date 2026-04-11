@@ -133,8 +133,8 @@ print(json.dumps({
     'latency_max':  round(float(data.get('latency_max_ms', 0)), 2),
     'req_2xx':      int(data.get('req_2xx', 0)),
     'req_errors':   int(data.get('req_errors', 0)),
-    'avg_cpu_pct':  sys.argv[2],
-    'peak_mem_mib': sys.argv[3],
+    'avg_cpu_pct':  round(float(sys.argv[2]), 1) if sys.argv[2] not in ('N/A', '') else None,
+    'peak_mem_mib': round(float(sys.argv[3]))     if sys.argv[3] not in ('N/A', '') else None,
 }))
 PYEOF
 }
