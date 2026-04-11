@@ -9,7 +9,7 @@
 #   frankenphp   — FrankenPHP (ZTS-based Docker image; NOT used for Phalcon)
 #   nginx_fpm    — Nginx + PHP 8.4-FPM native, with Phalcon extension installed
 #
-# HTTP metrics: req/s, latency p50/p99/p999/max (bombardier --format json)
+# HTTP metrics: req/s, latency p50/p99/max (wrk + Lua JSON)
 # System metrics: avg CPU%, peak memory MiB (docker stats streaming)
 
 set -euo pipefail
@@ -20,7 +20,9 @@ WRK_CONNECTIONS="${3:-100}"
 WRK_DURATION="${4:-30}"
 
 WARMUP_CONNECTIONS=20
-WARMUP_REQUESTS=2000
+WARMUP_DURATION=5
+WRK_THREADS=4          # wrk loader threads (independent of PHP worker count)
+WRK_LUA="/root/bench/wrk-report.lua"
 BENCH_PORT=8080
 
 # Per-run staging area: one JSON file per (scenario, server-variant)
@@ -58,11 +60,13 @@ FRANKENPHP_IMAGE="dunglas/frankenphp:latest"
 
 log() { echo "[bench] $*" >&2; }
 
-# ── Wait for HTTP ─────────────────────────────────────────────────────────────
+# ── Wait for HTTP (accepts any response, 2xx to 4xx — just confirms server is up) ──
 wait_http() {
     local url="$1"
-    for i in $(seq 1 30); do
-        curl -sf --max-time 2 "$url" >/dev/null 2>&1 && return 0
+    for i in $(seq 1 40); do
+        local code
+        code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 "$url" 2>/dev/null)
+        [[ -n "$code" && "$code" != "000" && "$code" -lt 500 ]] && return 0
         sleep 1
     done
     log "ERROR: server never became ready at ${url}"
@@ -105,9 +109,10 @@ print(f'{avg_cpu:.1f} {peak_mem:.0f}')
 PYEOF
 }
 
-# ── Parse bombardier JSON output → compact result JSON ───────────────────────
-# Bombardier v1.2.6 JSON structure: {"spec":{...},"result":{"rps":{"mean":...},"latency":{"percentiles":{"50":...},...},...}}
-parse_bombardier() {
+# ── Parse wrk+Lua JSON output → compact result JSON ─────────────────────────
+# wrk-report.lua outputs: {"rps":N,"latency_p50_ms":X,"latency_p99_ms":X,"latency_max_ms":X,
+#                          "req_2xx":N,"req_errors":N}
+parse_wrk() {
     local file="$1"
     local avg_cpu="$2"
     local peak_mem="$3"
@@ -116,32 +121,20 @@ import sys, json
 try:
     data = json.load(open(sys.argv[1]))
 except Exception:
-    # Empty or invalid file (server failed to start)
-    print(json.dumps({'rps':0,'latency_p50':0,'latency_p99':0,'latency_p999':0,'latency_max':0,
-                      'req_2xx':0,'req_errors':0,'avg_cpu_pct':sys.argv[2],'peak_mem_mib':sys.argv[3],
+    print(json.dumps({'rps':0,'latency_p50':0,'latency_p99':0,'latency_max':0,
+                      'req_2xx':0,'req_errors':0,
+                      'avg_cpu_pct':sys.argv[2],'peak_mem_mib':sys.argv[3],
                       'error':'no_data'}))
     sys.exit(0)
-avg_cpu  = sys.argv[2]
-peak_mem = sys.argv[3]
-r = data.get('result', {})
-lat = r.get('latency', {})
-rps = r.get('rps', {})
-
-def ns_to_ms(ns):
-    try: return round(int(ns) / 1_000_000, 2)
-    except: return 0
-
-pctiles = lat.get('percentiles', {})
 print(json.dumps({
-    'rps':          round(rps.get('mean', 0)),
-    'latency_p50':  ns_to_ms(pctiles.get('50', 0)),
-    'latency_p99':  ns_to_ms(pctiles.get('99', 0)),
-    'latency_p999': ns_to_ms(lat.get('max', 0)),
-    'latency_max':  ns_to_ms(lat.get('max', 0)),
-    'req_2xx':      r.get('req2xx', 0),
-    'req_errors':   r.get('req4xx', 0) + r.get('req5xx', 0),
-    'avg_cpu_pct':  avg_cpu,
-    'peak_mem_mib': peak_mem,
+    'rps':          int(data.get('rps', 0)),
+    'latency_p50':  round(float(data.get('latency_p50_ms', 0)), 2),
+    'latency_p99':  round(float(data.get('latency_p99_ms', 0)), 2),
+    'latency_max':  round(float(data.get('latency_max_ms', 0)), 2),
+    'req_2xx':      int(data.get('req_2xx', 0)),
+    'req_errors':   int(data.get('req_errors', 0)),
+    'avg_cpu_pct':  sys.argv[2],
+    'peak_mem_mib': sys.argv[3],
 }))
 PYEOF
 }
@@ -169,27 +162,27 @@ bench_container() {
         log "  SKIP ${label}: server never became ready (check image/config)"
         docker stop bench-server >/dev/null 2>&1 || true
         docker rm   bench-server >/dev/null 2>&1 || true
-        parse_bombardier /dev/null "N/A" "N/A"
+        parse_wrk /dev/null "N/A" "N/A"
         return 0
     fi
 
     log "  Warmup ${label}..."
-    bombardier -c "$WARMUP_CONNECTIONS" -n "$WARMUP_REQUESTS" \
-        --timeout 10s "$url" >/dev/null 2>&1 || true
+    wrk -c "$WARMUP_CONNECTIONS" -d "${WARMUP_DURATION}s" -t 2 \
+        "$url" >/dev/null 2>&1 || true
 
     log "  Benchmarking ${label} (${WRK_DURATION}s, ${WRK_CONNECTIONS} conn)..."
     local stats_pid
     stats_pid=$(start_stats bench-server "$stats_file")
 
-    # -p r  → print result only (suppresses progress bar from stdout)
-    # -o j  → JSON format
-    # -l    → include latency percentiles in output
-    bombardier \
+    local wrk_raw="/tmp/wrk_raw_${RANDOM}.txt"
+    wrk \
         -c "$WRK_CONNECTIONS" \
         -d "${WRK_DURATION}s" \
-        --timeout 10s \
-        -p r -o j -l \
-        "$url" > "$result_file" 2>/dev/null || true
+        -t "$WRK_THREADS" \
+        -s "$WRK_LUA" \
+        "$url" > "$wrk_raw" 2>/dev/null || true
+    grep '^{' "$wrk_raw" > "$result_file" 2>/dev/null || echo '{}' > "$result_file"
+    rm -f "$wrk_raw"
 
     kill "$stats_pid" 2>/dev/null || true
     wait "$stats_pid" 2>/dev/null || true
@@ -203,9 +196,9 @@ bench_container() {
     avg_cpu=$(echo "$stats" | awk '{print $1}')
     peak_mem=$(echo "$stats" | awk '{print $2}')
 
-    log "  ${label}: $(python3 -c "import json; d=json.load(open('$result_file')); print(round(d['result']['rps']['mean'])) " 2>/dev/null || echo '?') req/s"
+    log "  ${label}: $(python3 -c "import json; d=json.load(open('$result_file')); print(d.get('rps',0))" 2>/dev/null || echo '?') req/s"
 
-    parse_bombardier "$result_file" "$avg_cpu" "$peak_mem"
+    parse_wrk "$result_file" "$avg_cpu" "$peak_mem"
     rm -f "$stats_file" "$result_file"
 }
 
@@ -235,7 +228,7 @@ bench_php_scripts() {
         docker stop bench-server >/dev/null 2>&1 || true
         docker rm   bench-server >/dev/null 2>&1 || true
         local null_result
-        null_result=$(parse_bombardier /dev/null "N/A" "N/A")
+        null_result=$(parse_wrk /dev/null "N/A" "N/A")
         local joined=""
         for _ in "${scripts[@]}"; do
             joined+="${null_result},"
@@ -251,14 +244,17 @@ bench_php_scripts() {
         local result_file="/tmp/result_${RANDOM}.json"
 
         log "  Warmup ${label}/${script}..."
-        bombardier -c "$WARMUP_CONNECTIONS" -n "$WARMUP_REQUESTS" \
-            --timeout 10s "$url" >/dev/null 2>&1 || true
+        wrk -c "$WARMUP_CONNECTIONS" -d "${WARMUP_DURATION}s" -t 2 \
+            "$url" >/dev/null 2>&1 || true
 
         log "  Benchmarking ${label}/${script} (${WRK_DURATION}s)..."
         local stats_pid
         stats_pid=$(start_stats bench-server "$stats_file")
-        bombardier -c "$WRK_CONNECTIONS" -d "${WRK_DURATION}s" \
-            --timeout 10s -p r -o j -l "$url" > "$result_file" 2>/dev/null || true
+        local wrk_raw="/tmp/wrk_raw_${RANDOM}.txt"
+        wrk -c "$WRK_CONNECTIONS" -d "${WRK_DURATION}s" -t "$WRK_THREADS" \
+            -s "$WRK_LUA" "$url" > "$wrk_raw" 2>/dev/null || true
+        grep '^{' "$wrk_raw" > "$result_file" 2>/dev/null || echo '{}' > "$result_file"
+        rm -f "$wrk_raw"
         kill "$stats_pid" 2>/dev/null || true
         wait "$stats_pid" 2>/dev/null || true
 
@@ -266,7 +262,7 @@ bench_php_scripts() {
         stats=$(parse_stats "$stats_file")
         avg_cpu=$(echo "$stats" | awk '{print $1}')
         peak_mem=$(echo "$stats" | awk '{print $2}')
-        results+=("$(parse_bombardier "$result_file" "$avg_cpu" "$peak_mem")")
+        results+=("$(parse_wrk "$result_file" "$avg_cpu" "$peak_mem")")
         rm -f "$stats_file" "$result_file"
     done
 
@@ -288,21 +284,24 @@ bench_fpm() {
     local result_file="/tmp/result_fpm_${RANDOM}.json"
 
     log "  Warmup ${label}..."
-    bombardier -c "$WARMUP_CONNECTIONS" -n "$WARMUP_REQUESTS" \
-        --timeout 10s "$url" >/dev/null 2>&1 || true
+    wrk -c "$WARMUP_CONNECTIONS" -d "${WARMUP_DURATION}s" -t 2 \
+        "$url" >/dev/null 2>&1 || true
 
     log "  Benchmarking ${label} (${WRK_DURATION}s, ${WRK_CONNECTIONS} conn)..."
-    bombardier \
+    local wrk_raw="/tmp/wrk_raw_fpm_${RANDOM}.txt"
+    wrk \
         -c "$WRK_CONNECTIONS" \
         -d "${WRK_DURATION}s" \
-        --timeout 10s \
-        -p r -o j -l \
-        "$url" > "$result_file" 2>/dev/null || true
+        -t "$WRK_THREADS" \
+        -s "$WRK_LUA" \
+        "$url" > "$wrk_raw" 2>/dev/null || true
+    grep '^{' "$wrk_raw" > "$result_file" 2>/dev/null || echo '{}' > "$result_file"
+    rm -f "$wrk_raw"
 
-    log "  ${label}: $(python3 -c "import json; d=json.load(open('$result_file')); print(round(d['result']['rps']['mean']))" 2>/dev/null || echo '?') req/s"
+    log "  ${label}: $(python3 -c "import json; d=json.load(open('$result_file')); print(d.get('rps',0))" 2>/dev/null || echo '?') req/s"
 
     # CPU/memory N/A for native FPM (not in a container)
-    parse_bombardier "$result_file" "N/A" "N/A"
+    parse_wrk "$result_file" "N/A" "N/A"
     rm -f "$result_file"
 }
 
@@ -394,12 +393,12 @@ for W in 4 8; do
         KEY="turbine_nts_${W}w${P//-/_}"
         save_result laravel "$KEY" \
             "$(bench_container "nts${P}/${W}w/laravel" "$TURBINE_IMAGE_NTS" "/" \
-                -v /var/www/laravel/public:/var/www/html \
+                -v /var/www/laravel:/var/www/html \
                 -v "/etc/turbine/laravel-nts-${W}w${P}.toml:/var/www/html/turbine.toml:ro")"
     done
     save_result laravel "turbine_zts_${W}w" \
         "$(bench_container "zts/${W}w/laravel" "$TURBINE_IMAGE_ZTS" "/" \
-            -v /var/www/laravel/public:/var/www/html \
+            -v /var/www/laravel:/var/www/html \
             -v "/etc/turbine/laravel-zts-${W}w.toml:/var/www/html/turbine.toml:ro")"
     save_result laravel "frankenphp_${W}w" \
         "$(bench_container "frankenphp/${W}w/laravel" "$FRANKENPHP_IMAGE" "/" \
@@ -412,6 +411,9 @@ for W in 4 8; do
     save_result laravel "nginx_fpm_${W}w" \
         "$(bench_fpm "fpm/${W}w/laravel" "$(fpm_port laravel $W)" "/")"
 done
+
+# ─── Laravel note: full app dir is mounted (not just public/) so autoloader works ───
+# Turbine uses [sandbox] front_controller=true to route to public/index.php
 
 # ─── Phalcon (Turbine only + Nginx+FPM — Phalcon incompatible with FrankenPHP) ───────
 log "==> Scenario: Phalcon micro app (JSON endpoint)"
@@ -484,7 +486,7 @@ doc = {
     'version': '${VERSION}',
     'date':    '${BENCH_DATE}',
     'server':  'Hetzner CCX33 (8 vCPU dedicated / 32 GB RAM / NVMe)',
-    'tool':    'bombardier v1.2.6',
+    'tool':    'wrk',
     'images': {
         'turbine_nts': '${TURBINE_IMAGE_NTS}',
         'turbine_zts': '${TURBINE_IMAGE_ZTS}',

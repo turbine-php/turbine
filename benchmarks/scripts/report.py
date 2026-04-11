@@ -149,7 +149,7 @@ def render_report(data: dict, version: str, date: str) -> str:
     mem_mb    = params.get("memory_limit_mb", 256)
     max_req   = params.get("max_requests_per_worker", 50000)
     server    = data.get("server", "Hetzner CPX41")
-    tool      = data.get("tool", "bombardier")
+    tool      = data.get("tool", "wrk")
     images    = data.get("images", {})
     scenarios = data.get("scenarios", {})
 
@@ -169,7 +169,7 @@ def render_report(data: dict, version: str, date: str) -> str:
         f"| **Version** | {version} |",
         f"| **Date** | {date} |",
         f"| **Server** | {server} |",
-        f"| **Tool** | [{tool}](https://github.com/codesenberg/bombardier) |",
+        f"| **Tool** | [{tool}](https://github.com/wg/wrk) |",
         f"| **Parameters** | {duration}s · {conns} connections |",
         f"| **Workers** | {workers_4}w and {workers_8}w variants (Turbine + FPM) |",
         f"| **Memory limit** | {mem_mb} MB per worker |",

@@ -6,7 +6,7 @@
 #   - FrankenPHP requires ZTS PHP — tested with NTS/ZTS Turbine images separately
 #   - Phalcon tested only on Turbine and Nginx+FPM (Phalcon is incompatible with FrankenPHP)
 #   - Nginx + PHP-FPM (with Phalcon extension) runs natively as the classic baseline
-#   - bombardier provides HTTP metrics including latency percentiles
+#   - wrk provides HTTP metrics including latency percentiles (via Lua done() callback)
 
 set -euo pipefail
 
@@ -14,7 +14,7 @@ TURBINE_IMAGE_NTS="katisuhara/turbine-php:latest-php8.4-nts"
 TURBINE_IMAGE_ZTS="katisuhara/turbine-php:latest-php8.4-zts"
 FRANKENPHP_IMAGE="dunglas/frankenphp:latest"
 PHALCON_VERSION="5.11.1"
-BOMBARDIER_VERSION="1.2.6"
+WRK_VERSION="master"
 
 log() { echo "[setup] $*"; }
 
@@ -34,12 +34,18 @@ docker pull "$TURBINE_IMAGE_ZTS"
 log "Pulling FrankenPHP image (ZTS-based)..."
 docker pull "$FRANKENPHP_IMAGE"
 
-# ── 4. bombardier ─────────────────────────────────────────────────────────────
-log "Installing bombardier..."
-curl -fsSL "https://github.com/codesenberg/bombardier/releases/download/v${BOMBARDIER_VERSION}/bombardier-linux-amd64" \
-    -o /usr/local/bin/bombardier
-chmod +x /usr/local/bin/bombardier
-bombardier --version
+# ── 4. wrk HTTP benchmarking tool ──────────────────────────────────────────────
+log "Installing wrk..."
+DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    wrk || {
+    # Fallback: build from source if not in apt
+    apt-get install -y --no-install-recommends libssl-dev build-essential git
+    git clone --depth 1 https://github.com/wg/wrk.git /tmp/wrk-src
+    make -C /tmp/wrk-src -j$(nproc)
+    cp /tmp/wrk-src/wrk /usr/local/bin/wrk
+    rm -rf /tmp/wrk-src
+}
+wrk --version 2>&1 | head -1
 
 # ── 5. Native Nginx + PHP 8.4-FPM (baseline for raw + laravel) ───────────────
 log "Adding ondrej/php PPA..."
@@ -90,6 +96,8 @@ ln -sf /var/www/phalcon/index.php /var/www/phalcon/public/index.php
 log "Copying PHP benchmark scripts..."
 mkdir -p /var/www/php-bench
 cp /root/bench/php/*.php /var/www/php-bench/
+# Minimal index for health-check (wait_http hits /)
+echo '<?php http_response_code(200);' > /var/www/php-bench/index.php
 
 log "Creating Laravel project (this may take a few minutes)..."
 COMPOSER_ALLOW_SUPERUSER=1 composer create-project laravel/laravel /var/www/laravel \
@@ -108,6 +116,29 @@ chown -R www-data:www-data \
 chmod -R ug+rw \
     /var/www/laravel/storage \
     /var/www/laravel/bootstrap/cache
+
+# Turbine persistent-worker files for Laravel
+# turbine-boot.php: runs ONCE per worker at startup — bootstraps Laravel
+cat > /var/www/laravel/turbine-boot.php << 'PHPEOF'
+<?php
+declare(strict_types=1);
+define('LARAVEL_START', microtime(true));
+require __DIR__.'/vendor/autoload.php';
+$GLOBALS['__turbine_app'] = require_once __DIR__.'/bootstrap/app.php';
+$GLOBALS['__turbine_kernel'] = $GLOBALS['__turbine_app']
+    ->make(\Illuminate\Contracts\Http\Kernel::class);
+PHPEOF
+
+# turbine-handler.php: runs on EVERY request in persistent mode
+cat > /var/www/laravel/turbine-handler.php << 'PHPEOF'
+<?php
+declare(strict_types=1);
+$request  = \Illuminate\Http\Request::capture();
+$response = $GLOBALS['__turbine_kernel']->handle($request);
+$response->send();
+$GLOBALS['__turbine_kernel']->terminate($request, $response);
+gc_collect_cycles();
+PHPEOF
 
 # ── 7. PHP-FPM: two static pools (4w and 8w) ─────────────────────────────────
 # VPS: 8 vCPU / 16 GB RAM  →  memory_limit=256M, max_requests=50000
@@ -218,6 +249,8 @@ make_turbine_toml() {
     local file="$1" workers="$2" mode="$3" persistent="$4"
     local extensions="${5:-[]}"
     local extra_ini="${6:-}"
+    local extra_server="${7:-}"      # additional [server] keys (worker_boot, etc.)
+    local extra_sections="${8:-}"    # additional TOML sections ([sandbox], etc.)
     cat > "$file" << TOML
 [server]
 listen = "0.0.0.0:80"
@@ -226,6 +259,7 @@ worker_mode = "${mode}"
 worker_max_requests = 50000
 persistent_workers = ${persistent}
 request_timeout = 30
+${extra_server}
 [php]
 memory_limit = "256M"
 opcache_memory = 128
@@ -233,22 +267,25 @@ extensions = ${extensions}
 ${extra_ini}
 [logging]
 level = "error"
+${extra_sections}
 TOML
 }
 
 for W in 4 8; do
-    # Raw PHP + PHP-bench scripts (stateless — persistent mode is safe)
+    # Raw PHP + PHP-bench scripts (stateless)
     for APP in raw php-bench; do
-        make_turbine_toml /etc/turbine/${APP}-nts-${W}w.toml    ${W} process false
-        make_turbine_toml /etc/turbine/${APP}-nts-${W}w-p.toml  ${W} process true
-        make_turbine_toml /etc/turbine/${APP}-zts-${W}w.toml    ${W} thread  false
+        make_turbine_toml /etc/turbine/${APP}-nts-${W}w.toml   ${W} process false
+        make_turbine_toml /etc/turbine/${APP}-nts-${W}w-p.toml ${W} process true
+        make_turbine_toml /etc/turbine/${APP}-zts-${W}w.toml   ${W} thread  false
     done
 
-    # Laravel (stateful framework — include persistent variant for comparison)
+    # Laravel — needs [sandbox] for framework detection and full app dir
     LARAVEL_INI=$'[php.ini]\nerror_reporting = "0"\ndisplay_errors = "Off"\n"date.timezone" = "UTC"'
-    make_turbine_toml /etc/turbine/laravel-nts-${W}w.toml   ${W} process false "[]" "$LARAVEL_INI"
-    make_turbine_toml /etc/turbine/laravel-nts-${W}w-p.toml ${W} process true  "[]" "$LARAVEL_INI"
-    make_turbine_toml /etc/turbine/laravel-zts-${W}w.toml   ${W} thread  false "[]" "$LARAVEL_INI"
+    LARAVEL_SANDBOX=$'[sandbox]\nexecution_mode = "framework"\nfront_controller = true'
+    LARAVEL_BOOT=$'worker_boot = "turbine-boot.php"\nworker_handler = "turbine-handler.php"'
+    make_turbine_toml /etc/turbine/laravel-nts-${W}w.toml   ${W} process false "[]" "$LARAVEL_INI" "" "$LARAVEL_SANDBOX"
+    make_turbine_toml /etc/turbine/laravel-nts-${W}w-p.toml ${W} process true  "[]" "$LARAVEL_INI" "$LARAVEL_BOOT" "$LARAVEL_SANDBOX"
+    make_turbine_toml /etc/turbine/laravel-zts-${W}w.toml   ${W} thread  false "[]" "$LARAVEL_INI" "" "$LARAVEL_SANDBOX"
 
     # Phalcon (requires phalcon extension)
     make_turbine_toml /etc/turbine/phalcon-nts-${W}w.toml   ${W} process false '["phalcon.so"]'
