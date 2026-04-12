@@ -84,8 +84,13 @@ cat > /var/www/phalcon/index.php << 'PHPEOF'
 use Phalcon\Mvc\Micro;
 $app = new Micro();
 $app->get('/', function () {
-    header('Content-Type: application/json');
-    echo json_encode(['status' => 'ok']);
+    http_response_code(200);
+});
+$app->get('/user/{id}', function ($id) {
+    echo $id;
+});
+$app->post('/user', function () {
+    http_response_code(200);
 });
 $app->handle($_SERVER['REQUEST_URI'] ?? '/');
 PHPEOF
@@ -113,11 +118,14 @@ sed -i 's/DB_CONNECTION=.*/DB_CONNECTION=sqlite/'        /var/www/laravel/.env
 # Ensure SQLite DB file exists (migrations may need it)
 touch /var/www/laravel/database/database.sqlite
 
-# Minimal benchmark route: no DB, no session, pure JSON
+# Standard benchmark routes: GET /, GET /user/:id, POST /user
 cat > /var/www/laravel/routes/web.php << 'PHPEOF'
 <?php
 use Illuminate\Support\Facades\Route;
-Route::get('/', fn() => response()->json(['status' => 'ok']));
+
+Route::get('/', fn() => response('', 200));
+Route::get('/user/{id}', fn(string $id) => response($id, 200));
+Route::post('/user', fn() => response('', 200));
 PHPEOF
 
 # Override bootstrap/app.php — strip session/CSRF middleware for stateless benchmark
@@ -313,8 +321,13 @@ cat > /var/www/phalcon/public/worker.php << 'PHPEOF'
 use Phalcon\Mvc\Micro;
 $app = new Micro();
 $app->get('/', static function (): void {
-    header('Content-Type: application/json');
-    echo json_encode(['status' => 'ok']);
+    http_response_code(200);
+});
+$app->get('/user/{id}', static function ($id): void {
+    echo $id;
+});
+$app->post('/user', static function (): void {
+    http_response_code(200);
 });
 $handler = static function () use ($app): void {
     $app->handle($_SERVER['REQUEST_URI'] ?? '/');

@@ -23,6 +23,7 @@ WARMUP_CONNECTIONS=20
 WARMUP_DURATION=5
 WRK_THREADS=4          # wrk loader threads (independent of PHP worker count)
 WRK_LUA="/root/bench/wrk-report.lua"
+WRK_LUA_FRAMEWORK="/root/bench/wrk-framework.lua"
 BENCH_PORT=8080
 
 # Per-run staging area: one JSON file per (scenario, server-variant)
@@ -161,12 +162,15 @@ PYEOF
 }
 
 # ── Benchmark a Docker container ──────────────────────────────────────────────
-# Usage: bench_container <label> <image> [path] [docker args...]
-# path defaults to /
+# Usage: bench_container <label> <image> <path> [docker args...]
+# For framework scenarios, set BENCH_LUA_SCRIPT before calling.
+BENCH_LUA_SCRIPT=""   # if set, overrides WRK_LUA for the next bench_container call
 bench_container() {
     local label="$1"
     local image="$2"
     local path="${3:-/}"
+    local lua_script="${BENCH_LUA_SCRIPT:-$WRK_LUA}"
+    BENCH_LUA_SCRIPT=""   # reset after use
     shift 3
     local docker_args=("$@")
     local url="http://127.0.0.1:${BENCH_PORT}${path}"
@@ -205,7 +209,7 @@ bench_container() {
         -c "$WRK_CONNECTIONS" \
         -d "${WRK_DURATION}s" \
         -t "$WRK_THREADS" \
-        -s "$WRK_LUA" \
+        -s "$lua_script" \
         "$url" > "$wrk_raw" 2>/dev/null || true
     grep '^{' "$wrk_raw" > "$result_file" 2>/dev/null || echo '{}' > "$result_file"
     rm -f "$wrk_raw"
@@ -417,19 +421,22 @@ done
 # Turbine uses [sandbox] front_controller=true to route to public/index.php
 
 # ─── Phalcon (Turbine only + Nginx+FPM — Phalcon incompatible with FrankenPHP) ───────
-log "==> Scenario: Phalcon micro app (JSON endpoint)"
+log "==> Scenario: Phalcon (GET /, GET /user/:id, POST /user)"
 for W in 4 8; do
     for P in "" "-p"; do
         KEY="turbine_nts_${W}w${P//-/_}"
+        BENCH_LUA_SCRIPT="$WRK_LUA_FRAMEWORK"
         save_result phalcon "$KEY" \
             "$(bench_container "nts${P}/${W}w/phalcon" "$TURBINE_IMAGE_NTS" "/" \
                 -v /var/www/phalcon:/var/www/html \
                 -v "/etc/turbine/phalcon-nts-${W}w${P}.toml:/var/www/html/turbine.toml:ro")"
     done
+    BENCH_LUA_SCRIPT="$WRK_LUA_FRAMEWORK"
     save_result phalcon "turbine_zts_${W}w" \
         "$(bench_container "zts/${W}w/phalcon" "$TURBINE_IMAGE_ZTS" "/" \
             -v /var/www/phalcon:/var/www/html \
             -v "/etc/turbine/phalcon-zts-${W}w.toml:/var/www/html/turbine.toml:ro")"
+    BENCH_LUA_SCRIPT="$WRK_LUA_FRAMEWORK"
     save_result phalcon "nginx_fpm_${W}w" \
         "$(bench_container "fpm/${W}w/phalcon" "$FPM_IMAGE" "/" \
             -e WORKERS=${W} \
@@ -465,10 +472,10 @@ SCENARIO_META = {
         'scripts': ['html_50k.php', 'pdf_50k.php', 'random_50k.php'],
     },
     'laravel': {
-        'description': 'Laravel framework, single JSON route, no database',
+        'description': 'Laravel 13 — mixed routes: GET /, GET /user/:id, POST /user (no database)',
     },
     'phalcon': {
-        'description': 'Phalcon micro application, single JSON route',
+        'description': 'Phalcon Micro — mixed routes: GET /, GET /user/:id, POST /user',
         'note': 'FrankenPHP excluded — Phalcon is incompatible with FrankenPHP (ZTS threading)',
     },
 }
