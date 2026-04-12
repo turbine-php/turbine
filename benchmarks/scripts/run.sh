@@ -206,8 +206,8 @@ bench_container() {
     kill "$stats_pid" 2>/dev/null || true
     wait "$stats_pid" 2>/dev/null || true
 
-    docker stop bench-server >/dev/null
-    docker rm   bench-server >/dev/null
+    docker stop bench-server >/dev/null 2>&1 || true
+    docker rm   bench-server >/dev/null 2>&1 || true
 
     local stats
     stats=$(parse_stats "$stats_file")
@@ -288,8 +288,8 @@ bench_php_scripts() {
         rm -f "$stats_file" "$result_file"
     done
 
-    docker stop bench-server >/dev/null
-    docker rm   bench-server >/dev/null
+    docker stop bench-server >/dev/null 2>&1 || true
+    docker rm   bench-server >/dev/null 2>&1 || true
 
     # Output as JSON array preserving order
     local joined
@@ -454,8 +454,8 @@ SCENARIO_META = {
         'description': 'Single PHP file returning plain-text Hello World',
     },
     'php_scripts': {
-        'description': 'Individual scripts: Hello World, 50 KB HTML, 50 KB PDF binary, 50 KB random (incompressible)',
-        'scripts': ['hello.php', 'html_50k.php', 'pdf_50k.php', 'random_50k.php'],
+        'description': 'Individual scripts: 50 KB HTML, 50 KB PDF binary, 50 KB random (incompressible)',
+        'scripts': ['html_50k.php', 'pdf_50k.php', 'random_50k.php'],
     },
     'laravel': {
         'description': 'Laravel framework, single JSON route, no database',

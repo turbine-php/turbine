@@ -128,7 +128,6 @@ def render_table(scenario: dict) -> str:
 
 
 PHP_SCRIPT_LABELS = {
-    "hello.php":      ("Hello World",        "Minimal `echo 'Hello World!'` response."),
     "html_50k.php":   ("HTML 50 KB",         "50 KB HTML response — SSR page simulation."),
     "pdf_50k.php":    ("PDF Binary 50 KB",   "50 KB `application/pdf` binary response."),
     "random_50k.php": ("Random 50 KB",       "50 KB incompressible random data — stress-tests compression bypass."),
