@@ -168,6 +168,9 @@ extensions = ${extensions}
 ${extra_ini}
 [logging]
 level = "error"
+
+[cache]
+enabled = false
 ${extra_sections}
 TOML
 }
@@ -206,7 +209,8 @@ $handler = static function (): void {
 };
 while (\frankenphp_handle_request($handler));
 PHPEOF
-ln -sf /var/www/raw/worker.php /var/www/raw/public/worker.php
+# Copy (not symlink) — symlinks break across Docker mount boundaries
+cp /var/www/raw/worker.php /var/www/raw/public/worker.php
 
 # PHP-bench worker — dispatches to the requested .php file via URI
 cat > /var/www/php-bench/worker.php << 'PHPEOF'

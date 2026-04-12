@@ -26,6 +26,12 @@ php_admin_value[opcache.enable]             = 1
 php_admin_value[opcache.validate_timestamps]= 0
 EOF
 
+# ── Fix permissions for Laravel (storage + bootstrap/cache need to be writable) ──
+if [ -d /var/www/html/storage ]; then
+    chown -R www-data:www-data /var/www/html/storage /var/www/html/bootstrap/cache 2>/dev/null || true
+    chmod -R ug+rw /var/www/html/storage /var/www/html/bootstrap/cache 2>/dev/null || true
+fi
+
 # ── Inject document root into Nginx config ─────────────────────────────────────
 sed -i "s|APP_ROOT_PLACEHOLDER|${APP_ROOT}|g" /etc/nginx/sites-available/bench
 
