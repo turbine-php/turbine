@@ -321,10 +321,12 @@ for W in 4 8; do
             -v "/etc/turbine/raw-zts-${W}w.toml:/var/www/html/turbine.toml:ro")"
     save_result raw_php "frankenphp_${W}w" \
         "$(bench_container "frankenphp/${W}w/raw" "$FRANKENPHP_IMAGE" "/" \
+            -e SERVER_NAME=:80 \
             -v /var/www/raw:/app \
             -v "/etc/frankenphp/raw-${W}w.Caddyfile:/etc/caddy/Caddyfile")"
     save_result raw_php "frankenphp_${W}w_worker" \
         "$(bench_container "frankenphp/${W}w-worker/raw" "$FRANKENPHP_IMAGE" "/" \
+            -e SERVER_NAME=:80 \
             -v /var/www/raw:/app \
             -v "/etc/frankenphp/raw-${W}w-worker.Caddyfile:/etc/caddy/Caddyfile")"
     save_result raw_php "nginx_fpm_${W}w" \
@@ -352,11 +354,13 @@ for W in 4 8; do
             -- "${PHP_SCRIPTS[@]}")"
     save_result php_scripts "frankenphp_${W}w" \
         "$(bench_php_scripts "frankenphp/${W}w/php-bench" "$FRANKENPHP_IMAGE" \
+            -e SERVER_NAME=:80 \
             -v /var/www/php-bench:/app \
             -v "/etc/frankenphp/php-bench-${W}w.Caddyfile:/etc/caddy/Caddyfile" \
             -- "${PHP_SCRIPTS[@]}")"
     save_result php_scripts "frankenphp_${W}w_worker" \
         "$(bench_php_scripts "frankenphp/${W}w-worker/php-bench" "$FRANKENPHP_IMAGE" \
+            -e SERVER_NAME=:80 \
             -v /var/www/php-bench:/app \
             -v "/etc/frankenphp/php-bench-${W}w-worker.Caddyfile:/etc/caddy/Caddyfile" \
             -- "${PHP_SCRIPTS[@]}")"
@@ -384,10 +388,12 @@ for W in 4 8; do
             -v "/etc/turbine/laravel-zts-${W}w.toml:/var/www/html/turbine.toml:ro")"
     save_result laravel "frankenphp_${W}w" \
         "$(bench_container "frankenphp/${W}w/laravel" "$FRANKENPHP_IMAGE" "/" \
+            -e SERVER_NAME=:80 \
             -v /var/www/laravel:/app \
             -v "/etc/frankenphp/laravel-${W}w.Caddyfile:/etc/caddy/Caddyfile")"
     save_result laravel "frankenphp_${W}w_worker" \
         "$(bench_container "frankenphp/${W}w-worker/laravel" "$FRANKENPHP_IMAGE" "/" \
+            -e SERVER_NAME=:80 \
             -v /var/www/laravel:/app \
             -v "/etc/frankenphp/laravel-${W}w-worker.Caddyfile:/etc/caddy/Caddyfile")"
     save_result laravel "nginx_fpm_${W}w" \
