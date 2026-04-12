@@ -97,6 +97,8 @@ SERVER_ORDER = [
 def render_table(scenario: dict) -> str:
     # Determine which servers are present in this scenario
     servers = [s for s in SERVER_ORDER if s in scenario]
+    if not servers:
+        return "_No data available._"
     # Use 8w FPM as baseline (closest to classic nginx+fpm baseline)
     for _bk in ("nginx_fpm_8w", "nginx_fpm_4w", "nginx_fpm"):
         if _bk in scenario:
@@ -150,9 +152,7 @@ def render_php_scripts_section(php_scenario: dict) -> str:
             arr = php_scenario.get(key)
             if isinstance(arr, list) and idx < len(arr):
                 single[key] = arr[idx]
-        single["description"] = desc
-
-        if single:
+        if any(k for k in single if k in SERVER_ORDER):
             lines += [render_table(single), ""]
 
     return "\n".join(lines)
