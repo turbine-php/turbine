@@ -74,8 +74,8 @@ cat > /var/www/raw/index.php << 'PHPEOF'
 header('Content-Type: text/plain');
 echo "Hello, World!";
 PHPEOF
-# FrankenPHP reads from public/ by default
-ln -sf /var/www/raw/index.php /var/www/raw/public/index.php
+# Copy to public/ for FrankenPHP (symlinks break across Docker mount boundaries)
+cp /var/www/raw/index.php /var/www/raw/public/index.php
 
 log "Creating Phalcon micro application..."
 mkdir -p /var/www/phalcon/public
@@ -89,7 +89,7 @@ $app->get('/', function () {
 });
 $app->handle($_SERVER['REQUEST_URI'] ?? '/');
 PHPEOF
-ln -sf /var/www/phalcon/index.php /var/www/phalcon/public/index.php
+cp /var/www/phalcon/index.php /var/www/phalcon/public/index.php
 
 log "Copying PHP benchmark scripts..."
 mkdir -p /var/www/php-bench
