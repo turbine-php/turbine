@@ -238,18 +238,23 @@ cp /var/www/php-bench/worker.php /var/www/php-bench/public/worker.php
 cat > /var/www/laravel/public/worker.php << 'PHPEOF'
 <?php
 use Illuminate\Http\Request;
+use Illuminate\Contracts\Http\Kernel as KernelContract;
 
 require_once __DIR__ . '/../vendor/autoload.php';
 $app    = require_once __DIR__ . '/../bootstrap/app.php';
-$kernel = $app->make(Illuminate\Contracts\Http\Kernel::class);
+$kernel = $app->make(KernelContract::class);
+$kernel->bootstrap();
 
-$handler = static function () use ($kernel): void {
+$handler = static function () use ($kernel, $app): void {
     $request  = Request::capture();
     $response = $kernel->handle($request);
     $response->send();
     $kernel->terminate($request, $response);
+    $app->forgetScopedInstances();
 };
-while (\frankenphp_handle_request($handler));
+while (\frankenphp_handle_request($handler)) {
+    gc_collect_cycles();
+}
 PHPEOF
 
 # Phalcon worker — Micro app persists between requests

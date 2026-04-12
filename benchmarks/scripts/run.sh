@@ -306,7 +306,7 @@ bench_php_scripts() {
 #   Nginx+FPM:   bench-fpm Docker image, 4w and 8w (equal overhead to all others)
 # ─────────────────────────────────────────────────────────────────────────────
 
-PHP_SCRIPTS=(hello.php html_50k.php pdf_50k.php random_50k.php)
+PHP_SCRIPTS=(html_50k.php pdf_50k.php random_50k.php)
 
 # ─── Raw PHP ─────────────────────────────────────────────────────────────────
 log "==> Scenario: Raw PHP"

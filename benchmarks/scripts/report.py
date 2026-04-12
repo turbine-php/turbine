@@ -201,6 +201,11 @@ def render_report(data: dict, version: str, date: str) -> str:
         "> All servers (including FPM) run inside Docker containers for equal overhead.",
         "> CPU and memory metrics are collected via `docker stats --no-stream` during benchmark.",
         "",
+        "> **⚠️ Disclaimer:** These benchmarks are synthetic and may not reflect real-world performance. "
+        "Results depend heavily on architecture, application design, dependencies, stack, "
+        "and workload characteristics. The goal is **not** to declare any runtime better or worse — "
+        "choosing the right tool depends on many factors beyond raw throughput.",
+        "",
         "---",
         "",
         "## Raw PHP",
