@@ -53,9 +53,16 @@ wait_http() {
         local code
         code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 "$url" 2>/dev/null)
         [[ -n "$code" && "$code" != "000" && "$code" -lt 500 ]] && return 0
+        if [[ "$i" -ge 10 && $(( i % 5 )) -eq 0 ]]; then
+            log "  wait_http: attempt ${i}/40, last code=${code:-none} — ${url}"
+        fi
         sleep 1
     done
-    log "ERROR: server never became ready at ${url}"
+    local final_code
+    final_code=$(curl -s -o /tmp/wait_body.txt -w "%{http_code}" --max-time 5 "$url" 2>/dev/null)
+    log "ERROR: server never became ready at ${url} (last code=${final_code:-none})"
+    log "  Response body: $(head -c 300 /tmp/wait_body.txt 2>/dev/null || echo 'empty')"
+    rm -f /tmp/wait_body.txt
     return 1
 }
 

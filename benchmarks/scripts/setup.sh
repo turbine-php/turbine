@@ -110,6 +110,17 @@ use Illuminate\Support\Facades\Route;
 Route::get('/', fn() => response()->json(['status' => 'ok']));
 PHPEOF
 
+# Ensure sessions use file driver (default 'database' requires migrations)
+sed -i 's/SESSION_DRIVER=database/SESSION_DRIVER=file/' /var/www/laravel/.env
+# Disable unused services to avoid DB dependency
+sed -i 's/DB_CONNECTION=.*/DB_CONNECTION=sqlite/' /var/www/laravel/.env
+
+# Cache config and routes for maximum performance (all servers benefit equally)
+cd /var/www/laravel
+php artisan config:cache
+php artisan route:cache
+cd /
+
 chown -R www-data:www-data \
     /var/www/laravel/storage \
     /var/www/laravel/bootstrap/cache
@@ -235,24 +246,22 @@ PHPEOF
 cp /var/www/php-bench/worker.php /var/www/php-bench/public/worker.php
 
 # Laravel worker — bootstrap once, handle many requests
+# Pattern matches the proven local config in dev/laravel-test/public/frankenphp-worker.php
 cat > /var/www/laravel/public/worker.php << 'PHPEOF'
 <?php
-use Illuminate\Http\Request;
-use Illuminate\Contracts\Http\Kernel as KernelContract;
+require __DIR__ . '/../vendor/autoload.php';
 
-require_once __DIR__ . '/../vendor/autoload.php';
-$app    = require_once __DIR__ . '/../bootstrap/app.php';
-$kernel = $app->make(KernelContract::class);
-$kernel->bootstrap();
+$app = require __DIR__ . '/../bootstrap/app.php';
+$kernel = $app->make(Illuminate\Contracts\Http\Kernel::class);
 
-$handler = static function () use ($kernel, $app): void {
-    $request  = Request::capture();
+$running = true;
+
+while ($running && ($running = \frankenphp_handle_request(function () use ($kernel) {
+    $request = Illuminate\Http\Request::capture();
     $response = $kernel->handle($request);
     $response->send();
     $kernel->terminate($request, $response);
-    $app->forgetScopedInstances();
-};
-while (\frankenphp_handle_request($handler)) {
+}))) {
     gc_collect_cycles();
 }
 PHPEOF
@@ -285,21 +294,24 @@ make_caddyfile() {
     {
         echo "{"
         echo "    auto_https off"
-        echo "    frankenphp {"
-        echo "        num_threads ${num_threads}"
-        echo "    }"
+        echo "    admin off"
+        echo "    order php_server before file_server"
+        if [[ -n "$worker_script" ]]; then
+            # Worker mode: declare worker in global frankenphp block
+            # (matches proven local config in dev/laravel-test/Caddyfile.worker)
+            echo "    frankenphp {"
+            echo "        worker ${worker_script} ${num_threads}"
+            echo "    }"
+        else
+            # Non-worker mode: limit PHP threads to N
+            echo "    frankenphp {"
+            echo "        num_threads ${num_threads}"
+            echo "    }"
+        fi
         echo "}"
         echo "http://:80 {"
         echo "    root * ${root}"
-        if [[ -n "$worker_script" ]]; then
-            echo "    php_server {"
-            echo "        worker ${worker_script} {"
-            echo "            num ${num_threads}"
-            echo "        }"
-            echo "    }"
-        else
-            echo "    php_server"
-        fi
+        echo "    php_server"
         echo "}"
     } > "$file"
 }
