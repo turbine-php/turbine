@@ -99,8 +99,8 @@ cp /root/bench/php/*.php /var/www/php-bench/public/
 echo '<?php http_response_code(200);' > /var/www/php-bench/index.php
 cp /var/www/php-bench/index.php /var/www/php-bench/public/index.php
 
-log "Creating Laravel project (this may take a few minutes)..."
-COMPOSER_ALLOW_SUPERUSER=1 composer create-project laravel/laravel /var/www/laravel \
+log "Creating Laravel 13 project (this may take a few minutes)..."
+COMPOSER_ALLOW_SUPERUSER=1 composer create-project "laravel/laravel:^13.0" /var/www/laravel \
     --quiet --no-interaction --prefer-dist
 
 # ── Fix .env BEFORE anything else ────────────────────────────────────────────
@@ -113,25 +113,15 @@ sed -i 's/DB_CONNECTION=.*/DB_CONNECTION=sqlite/'        /var/www/laravel/.env
 # Ensure SQLite DB file exists (migrations may need it)
 touch /var/www/laravel/database/database.sqlite
 
-# Disable session middleware entirely for the benchmark route
-# (no cookie, no DB — pure stateless JSON)
+# Minimal benchmark route: no DB, no session, pure JSON
 cat > /var/www/laravel/routes/web.php << 'PHPEOF'
 <?php
 use Illuminate\Support\Facades\Route;
 Route::get('/', fn() => response()->json(['status' => 'ok']));
 PHPEOF
 
-# Remove StartSession and VerifyCsrfToken middleware for benchmarks
-# This avoids session driver issues entirely
-cat > /var/www/laravel/app/Http/Middleware/BenchmarkTrimming.php << 'PHPEOF'
-<?php
-namespace App\Http\Middleware;
-class BenchmarkTrimming {
-    // marker class — not used directly
-}
-PHPEOF
-
-# For Laravel 11+: override bootstrap/app.php to strip session middleware
+# Override bootstrap/app.php — strip session/CSRF middleware for stateless benchmark
+# Uses Laravel 13 $middleware->web(remove: [...]) syntax
 cat > /var/www/laravel/bootstrap/app.php << 'PHPEOF'
 <?php
 use Illuminate\Foundation\Application;
@@ -143,10 +133,13 @@ return Application::configure(basePath: dirname(__DIR__))
         web: __DIR__.'/../routes/web.php',
     )
     ->withMiddleware(function (Middleware $middleware) {
-        // Remove session and CSRF middleware — pure stateless benchmark
-        $middleware->remove(\Illuminate\Session\Middleware\StartSession::class);
-        $middleware->remove(\Illuminate\View\Middleware\ShareErrorsFromSession::class);
-        $middleware->remove(\Illuminate\Foundation\Http\Middleware\ValidateCsrfToken::class);
+        $middleware->web(remove: [
+            \Illuminate\Session\Middleware\StartSession::class,
+            \Illuminate\View\Middleware\ShareErrorsFromSession::class,
+            \Illuminate\Foundation\Http\Middleware\PreventRequestForgery::class,
+            \Illuminate\Cookie\Middleware\EncryptCookies::class,
+            \Illuminate\Cookie\Middleware\AddQueuedCookiesToResponse::class,
+        ]);
     })
     ->withExceptions(function (Exceptions $exceptions) {
         //
@@ -161,7 +154,6 @@ php artisan config:clear  2>/dev/null || true
 php artisan route:clear   2>/dev/null || true
 php artisan view:clear    2>/dev/null || true
 php artisan cache:clear   2>/dev/null || true
-# Regenerate package discovery (paths are relative class names, not absolute paths)
 php artisan package:discover --ansi 2>/dev/null || true
 cd /
 
