@@ -115,11 +115,10 @@ sed -i 's/SESSION_DRIVER=database/SESSION_DRIVER=file/' /var/www/laravel/.env
 # Disable unused services to avoid DB dependency
 sed -i 's/DB_CONNECTION=.*/DB_CONNECTION=sqlite/' /var/www/laravel/.env
 
-# Cache config and routes for maximum performance (all servers benefit equally)
-cd /var/www/laravel
-php artisan config:cache
-php artisan route:cache
-cd /
+# NOTE: Do NOT run config:cache or route:cache here.
+# Setup runs at /var/www/laravel but containers mount it at /var/www/html.
+# Cached config bakes absolute paths (/var/www/laravel/resources/...) that
+# break inside the container where open_basedir restricts to /var/www/html.
 
 chown -R www-data:www-data \
     /var/www/laravel/storage \
