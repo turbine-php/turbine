@@ -47,7 +47,8 @@ RUN rm -f /etc/php/8.4/fpm/pool.d/www.conf
 RUN rm -f /etc/nginx/sites-enabled/default
 COPY fpm-nginx.conf /etc/nginx/sites-available/bench
 RUN ln -s /etc/nginx/sites-available/bench /etc/nginx/sites-enabled/bench
-
+# ── Ensure socket directory exists ──────────────────────────────────────────
+RUN mkdir -p /run/php && chown www-data:www-data /run/php
 # ── entrypoint ─────────────────────────────────────────────────────────────────
 COPY fpm-entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh

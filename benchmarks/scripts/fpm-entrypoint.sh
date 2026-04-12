@@ -33,9 +33,21 @@ if [ -d /var/www/html/storage ]; then
 fi
 
 # ── Inject document root into Nginx config ─────────────────────────────────────
-sed -i "s|APP_ROOT_PLACEHOLDER|${APP_ROOT}|g" /etc/nginx/sites-available/bench
+# Use a temp copy so the original stays intact for debugging
+cp /etc/nginx/sites-available/bench /etc/nginx/sites-available/bench-active
+sed -i "s|APP_ROOT_PLACEHOLDER|${APP_ROOT}|g" /etc/nginx/sites-available/bench-active
+ln -sf /etc/nginx/sites-available/bench-active /etc/nginx/sites-enabled/bench
+
+# ── Ensure socket directory exists ──────────────────────────────────────────
+mkdir -p /run/php
+chown www-data:www-data /run/php
 
 # ── Start PHP-FPM ──────────────────────────────────────────────────────────────
+echo "[fpm-entry] APP_ROOT=${APP_ROOT} WORKERS=${WORKERS}" >&2
+echo "[fpm-entry] Nginx config root:" >&2
+grep 'root ' /etc/nginx/sites-available/bench-active >&2 || true
+echo "[fpm-entry] Testing PHP-FPM config..." >&2
+php-fpm8.4 -t 2>&1 || { echo "[fpm-entry] FPM config test FAILED" >&2; exit 1; }
 php-fpm8.4 --nodaemonize &
 FPM_PID=$!
 
@@ -44,6 +56,13 @@ for i in $(seq 1 15); do
     [ -S /run/php/fpm.sock ] && break
     sleep 0.5
 done
+if [ ! -S /run/php/fpm.sock ]; then
+    echo "[fpm-entry] ERROR: FPM socket never appeared at /run/php/fpm.sock" >&2
+    ls -la /run/php/ >&2 || true
+fi
+
+echo "[fpm-entry] Testing Nginx config..." >&2
+nginx -t 2>&1 || { echo "[fpm-entry] Nginx config test FAILED" >&2; exit 1; }
 
 # ── Start Nginx in foreground ──────────────────────────────────────────────────
 exec nginx -g "daemon off;"

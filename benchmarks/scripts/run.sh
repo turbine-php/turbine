@@ -174,6 +174,9 @@ bench_container() {
 
     if ! wait_http "http://127.0.0.1:${BENCH_PORT}/"; then
         log "  SKIP ${label}: server never became ready (check image/config)"
+        log "  --- Container logs (last 30 lines) ---"
+        docker logs --tail 30 bench-server >&2 2>&1 || true
+        log "  --- End container logs ---"
         docker stop bench-server >/dev/null 2>&1 || true
         docker rm   bench-server >/dev/null 2>&1 || true
         parse_wrk /dev/null "N/A" "N/A"

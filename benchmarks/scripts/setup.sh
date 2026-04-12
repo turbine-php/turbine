@@ -279,13 +279,19 @@ make_caddyfile() {
         echo "    auto_https off"
         echo "    frankenphp {"
         echo "        num_threads ${num_threads}"
-        [[ -n "$worker_script" ]] && \
-            echo "        worker ${worker_script} num_workers ${num_threads}"
         echo "    }"
         echo "}"
         echo "http://:80 {"
         echo "    root * ${root}"
-        echo "    php_server"
+        if [[ -n "$worker_script" ]]; then
+            echo "    php_server {"
+            echo "        worker ${worker_script} {"
+            echo "            num ${num_threads}"
+            echo "        }"
+            echo "    }"
+        else
+            echo "    php_server"
+        fi
         echo "}"
     } > "$file"
 }
