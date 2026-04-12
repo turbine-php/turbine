@@ -38,9 +38,26 @@ def fmt_mem(value) -> str:
 
 def fmt_cpu(value) -> str:
     try:
-        return f"{float(value):.1f}%"
+        v = float(value)
+        if v == 0:
+            return "—"
+        return f"{v:.1f}%"
     except (ValueError, TypeError):
         return str(value) if value and value != "N/A" else "—"
+
+
+def fmt_errors(value) -> str:
+    try:
+        v = int(value)
+        if v == 0:
+            return "0"
+        if v >= 1_000_000:
+            return f"{v/1_000_000:.1f}M"
+        if v >= 1_000:
+            return f"{v/1_000:.1f}k"
+        return str(v)
+    except (ValueError, TypeError):
+        return "—"
 
 
 def speedup(a_rps, b_rps) -> str:
@@ -89,8 +106,8 @@ def render_table(scenario: dict) -> str:
         baseline_key = servers[-1]
     baseline_rps = scenario.get(baseline_key, {}).get("rps", 0)
 
-    header = "| Server | Req/s | vs baseline | p50 | p99 | Avg CPU | Peak Mem |"
-    sep    = "|--------|------:|:-----------:|----:|----:|:-------:|---------:|"
+    header = "| Server | Req/s | vs baseline | p50 | p99 | Avg CPU | Peak Mem | Errors |"
+    sep    = "|--------|------:|:-----------:|----:|----:|:-------:|---------:|-------:|"
     rows   = [header, sep]
 
     for key in servers:
@@ -101,8 +118,9 @@ def render_table(scenario: dict) -> str:
         p99   = fmt_ms(data.get("latency_p99"))
         cpu   = fmt_cpu(data.get("avg_cpu_pct"))
         mem   = fmt_mem(data.get("peak_mem_mib"))
+        errs  = fmt_errors(data.get("req_errors"))
         vs    = speedup(data.get("rps", 0), baseline_rps) if key != baseline_key else "baseline"
-        rows.append(f"| {label} | {rps} | {vs} | {p50} | {p99} | {cpu} | {mem} |")
+        rows.append(f"| {label} | {rps} | {vs} | {p50} | {p99} | {cpu} | {mem} | {errs} |")
 
     return "\n".join(rows)
 
@@ -180,8 +198,8 @@ def render_report(data: dict, version: str, date: str) -> str:
         "> **Baseline**: Nginx + PHP-FPM · 8 workers.",
         "> **Persistent**: PHP worker process stays alive across requests (same as FrankenPHP worker mode).",
         "> **FrankenPHP** uses ZTS PHP internally and does **not** support Phalcon.",
-        "> CPU and memory metrics are collected via `docker stats` during the benchmark run.",
-        "> Nginx + PHP-FPM runs natively (no docker stats).",
+        "> All servers (including FPM) run inside Docker containers for equal overhead.",
+        "> CPU and memory metrics are collected via `docker stats --no-stream` during benchmark.",
         "",
         "---",
         "",

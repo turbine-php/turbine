@@ -47,10 +47,18 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
 }
 wrk --version 2>&1 | head -1 || true   # wrk exits 1 on --version but still prints info
 
-# ── 5. Composer (for Laravel project creation on the host) ───────────────────
-log "Installing Composer and dependencies..."
+# ── 5. PHP 8.4 CLI + Composer (for Laravel project creation on the host) ─────
+# Need full PHP 8.4 with extensions from ondrej/php for `composer create-project`
+log "Installing PHP 8.4 CLI + Composer from ondrej/php..."
 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    php-cli composer git unzip jq
+    software-properties-common
+add-apt-repository -y ppa:ondrej/php
+apt-get update -qq
+DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    php8.4-cli php8.4-mbstring php8.4-xml php8.4-curl php8.4-zip \
+    php8.4-intl php8.4-bcmath php8.4-gd php8.4-sqlite3 \
+    php8.4-tokenizer php8.4-fileinfo \
+    composer git unzip jq
 
 # ── 5b. Build bench-fpm Docker image (nginx + php8.4-fpm + phalcon) ─────────
 log "Building bench-fpm Docker image (nginx+php8.4-fpm+phalcon)..."

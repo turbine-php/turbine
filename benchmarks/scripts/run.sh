@@ -60,12 +60,17 @@ wait_http() {
 }
 
 # ── Collect docker stats while benchmark runs ─────────────────────────────────
-# Writes "cpu%,memMiB" lines to a file; kill the PID when done.
+# Uses --no-stream in a loop to produce clean newline-delimited output.
+# Streaming mode uses \r (carriage return) which corrupts the stats file.
 start_stats() {
     local container="$1"
     local outfile="$2"
-    docker stats --format "{{.CPUPerc}},{{.MemUsage}}" "$container" \
-        > "$outfile" 2>/dev/null &
+    (
+        while docker inspect "$container" >/dev/null 2>&1; do
+            docker stats --no-stream --format "{{.CPUPerc}},{{.MemUsage}}" "$container" 2>/dev/null
+            sleep 1
+        done
+    ) > "$outfile" &
     echo $!
 }
 
@@ -76,7 +81,8 @@ parse_stats() {
 import sys, re
 cpus, mems = [], []
 for line in open(sys.argv[1]):
-    line = line.strip()
+    # strip ANSI escape sequences and whitespace
+    line = re.sub(r'\x1b\[[0-9;]*m', '', line).strip()
     if not line: continue
     parts = line.split(',', 1)
     if len(parts) < 2: continue
@@ -89,6 +95,9 @@ for line in open(sys.argv[1]):
         elif u == 'KiB': v /= 1024
         elif u == 'B': v /= 1048576
         mems.append(v)
+# Skip first 2 samples (startup noise with 0.00%)
+if len(cpus) > 3:
+    cpus = cpus[2:]
 avg_cpu = sum(cpus)/len(cpus) if cpus else 0
 peak_mem = max(mems) if mems else 0
 print(f'{avg_cpu:.1f} {peak_mem:.0f}')
