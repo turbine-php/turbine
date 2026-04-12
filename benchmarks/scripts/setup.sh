@@ -92,10 +92,12 @@ PHPEOF
 cp /var/www/phalcon/index.php /var/www/phalcon/public/index.php
 
 log "Copying PHP benchmark scripts..."
-mkdir -p /var/www/php-bench
+mkdir -p /var/www/php-bench/public
 cp /root/bench/php/*.php /var/www/php-bench/
+cp /root/bench/php/*.php /var/www/php-bench/public/
 # Minimal index for health-check (wait_http hits /)
 echo '<?php http_response_code(200);' > /var/www/php-bench/index.php
+cp /var/www/php-bench/index.php /var/www/php-bench/public/index.php
 
 log "Creating Laravel project (this may take a few minutes)..."
 COMPOSER_ALLOW_SUPERUSER=1 composer create-project laravel/laravel /var/www/laravel \
@@ -230,6 +232,7 @@ $handler = static function (): void {
 };
 while (\frankenphp_handle_request($handler));
 PHPEOF
+cp /var/www/php-bench/worker.php /var/www/php-bench/public/worker.php
 
 # Laravel worker — bootstrap once, handle many requests
 cat > /var/www/laravel/public/worker.php << 'PHPEOF'
@@ -302,9 +305,9 @@ for W in 4 8; do
         make_caddyfile /etc/frankenphp/${APP}-${W}w.Caddyfile         ${W} /app/public
         make_caddyfile /etc/frankenphp/${APP}-${W}w-worker.Caddyfile  ${W} /app/public /app/public/worker.php
     done
-    # PHP-bench: scripts live directly in /app (no public/ subdir)
-    make_caddyfile /etc/frankenphp/php-bench-${W}w.Caddyfile        ${W} /app
-    make_caddyfile /etc/frankenphp/php-bench-${W}w-worker.Caddyfile ${W} /app /app/worker.php
+    # PHP-bench: uses public/ subdir like other apps for FrankenPHP compatibility
+    make_caddyfile /etc/frankenphp/php-bench-${W}w.Caddyfile        ${W} /app/public
+    make_caddyfile /etc/frankenphp/php-bench-${W}w-worker.Caddyfile ${W} /app/public /app/public/worker.php
 done
 
 log "Setup complete!"
