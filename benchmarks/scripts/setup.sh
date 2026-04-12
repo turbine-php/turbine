@@ -272,15 +272,15 @@ make_caddyfile() {
     local file="$1" num_threads="$2" root="$3" worker_script="${4:-}"
     {
         echo "{"
+        echo "    auto_https off"
         echo "    frankenphp {"
         echo "        num_threads ${num_threads}"
         [[ -n "$worker_script" ]] && \
             echo "        worker ${worker_script} num_workers ${num_threads}"
         echo "    }"
         echo "}"
-        echo ":80 {"
+        echo "http://:80 {"
         echo "    root * ${root}"
-        echo "    encode zstd br gzip"
         echo "    php_server"
         echo "}"
     } > "$file"
