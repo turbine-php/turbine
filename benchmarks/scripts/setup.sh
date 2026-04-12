@@ -103,17 +103,67 @@ log "Creating Laravel project (this may take a few minutes)..."
 COMPOSER_ALLOW_SUPERUSER=1 composer create-project laravel/laravel /var/www/laravel \
     --quiet --no-interaction --prefer-dist
 
-# Minimal benchmark route: no DB, no session, pure JSON
+# ── Fix .env BEFORE anything else ────────────────────────────────────────────
+# Default Laravel uses SESSION_DRIVER=database which requires migrations to
+# create the sessions table. Use file driver to avoid DB dependency entirely.
+sed -i 's/SESSION_DRIVER=database/SESSION_DRIVER=file/' /var/www/laravel/.env
+sed -i 's/SESSION_DRIVER=cookie/SESSION_DRIVER=file/'   /var/www/laravel/.env
+sed -i 's/DB_CONNECTION=.*/DB_CONNECTION=sqlite/'        /var/www/laravel/.env
+
+# Ensure SQLite DB file exists (migrations may need it)
+touch /var/www/laravel/database/database.sqlite
+
+# Disable session middleware entirely for the benchmark route
+# (no cookie, no DB — pure stateless JSON)
 cat > /var/www/laravel/routes/web.php << 'PHPEOF'
 <?php
 use Illuminate\Support\Facades\Route;
 Route::get('/', fn() => response()->json(['status' => 'ok']));
 PHPEOF
 
-# Ensure sessions use file driver (default 'database' requires migrations)
-sed -i 's/SESSION_DRIVER=database/SESSION_DRIVER=file/' /var/www/laravel/.env
-# Disable unused services to avoid DB dependency
-sed -i 's/DB_CONNECTION=.*/DB_CONNECTION=sqlite/' /var/www/laravel/.env
+# Remove StartSession and VerifyCsrfToken middleware for benchmarks
+# This avoids session driver issues entirely
+cat > /var/www/laravel/app/Http/Middleware/BenchmarkTrimming.php << 'PHPEOF'
+<?php
+namespace App\Http\Middleware;
+class BenchmarkTrimming {
+    // marker class — not used directly
+}
+PHPEOF
+
+# For Laravel 11+: override bootstrap/app.php to strip session middleware
+cat > /var/www/laravel/bootstrap/app.php << 'PHPEOF'
+<?php
+use Illuminate\Foundation\Application;
+use Illuminate\Foundation\Configuration\Exceptions;
+use Illuminate\Foundation\Configuration\Middleware;
+
+return Application::configure(basePath: dirname(__DIR__))
+    ->withRouting(
+        web: __DIR__.'/../routes/web.php',
+    )
+    ->withMiddleware(function (Middleware $middleware) {
+        // Remove session and CSRF middleware — pure stateless benchmark
+        $middleware->remove(\Illuminate\Session\Middleware\StartSession::class);
+        $middleware->remove(\Illuminate\View\Middleware\ShareErrorsFromSession::class);
+        $middleware->remove(\Illuminate\Foundation\Http\Middleware\ValidateCsrfToken::class);
+    })
+    ->withExceptions(function (Exceptions $exceptions) {
+        //
+    })->create();
+PHPEOF
+
+# Clear any caches left by post-create scripts (packages.php, services.php, etc.)
+# These may contain absolute paths to /var/www/laravel/ that break inside containers
+# where the app is mounted at /var/www/html/
+cd /var/www/laravel
+php artisan config:clear  2>/dev/null || true
+php artisan route:clear   2>/dev/null || true
+php artisan view:clear    2>/dev/null || true
+php artisan cache:clear   2>/dev/null || true
+# Regenerate package discovery (paths are relative class names, not absolute paths)
+php artisan package:discover --ansi 2>/dev/null || true
+cd /
 
 # NOTE: Do NOT run config:cache or route:cache here.
 # Setup runs at /var/www/laravel but containers mount it at /var/www/html.
