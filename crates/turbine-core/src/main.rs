@@ -590,6 +590,8 @@ struct ServerState {
     worker_boot: Option<String>,
     /// Worker handler script (included per request in lightweight lifecycle).
     worker_handler: Option<String>,
+    /// Worker cleanup script (evaluated after each request in persistent mode).
+    worker_cleanup: Option<String>,
     /// Whether to call session_start() before PHP execution.
     session_auto_start: bool,
     /// Semaphore limiting concurrent worker usage to worker_count permits.
@@ -685,6 +687,7 @@ fn return_worker_to_pool(state: &ServerState, pool_index: Option<usize>, worker_
                     &state.persistent_app_root,
                     state.worker_boot.as_deref(),
                     state.worker_handler.as_deref(),
+                    state.worker_cleanup.as_deref(),
                 );
             } else {
                 pool.return_worker(worker_idx);
@@ -698,6 +701,7 @@ fn return_worker_to_pool(state: &ServerState, pool_index: Option<usize>, worker_
                 &state.persistent_app_root,
                 state.worker_boot.as_deref(),
                 state.worker_handler.as_deref(),
+                state.worker_cleanup.as_deref(),
             );
         } else {
             pool.return_worker(worker_idx);
@@ -923,6 +927,7 @@ fn cmd_serve(
         extra_ini: config.php.ini.clone(),
         extensions: config.php.extensions.clone(),
         zend_extensions: config.php.zend_extensions.clone(),
+        opcache_validate_timestamps: config.php.opcache_validate_timestamps.unwrap_or(false),
     };
     let mut engine = match PhpEngine::init_with(php_ini) {
         Ok(engine) => engine,
@@ -1426,10 +1431,11 @@ fn cmd_serve(
             let app_root_str = app_root.display().to_string();
             let w_boot = config.server.worker_boot.as_deref();
             let w_handler = config.server.worker_handler.as_deref();
+            let w_cleanup = config.server.worker_cleanup.as_deref();
 
             if is_thread_mode {
                 // Thread mode: spawn persistent workers as OS threads (ZTS required)
-                match pool.spawn_persistent_workers_threaded(&app_root_str, w_boot, w_handler) {
+                match pool.spawn_persistent_workers_threaded(&app_root_str, w_boot, w_handler, w_cleanup) {
                     Ok(()) => {
                         info!(
                             workers = pool.worker_count(),
@@ -1444,7 +1450,7 @@ fn cmd_serve(
                 }
             } else {
                 // Process mode: spawn persistent workers via fork
-                match pool.spawn_persistent_workers(&app_root_str, w_boot, w_handler) {
+                match pool.spawn_persistent_workers(&app_root_str, w_boot, w_handler, w_cleanup) {
                     Ok(true) => {
                         info!(
                             workers = pool.worker_count(),
@@ -1623,6 +1629,7 @@ fn cmd_serve(
             persistent_app_root: app_root.display().to_string(),
             worker_boot: config.server.worker_boot.clone(),
             worker_handler: config.server.worker_handler.clone(),
+            worker_cleanup: config.server.worker_cleanup.clone(),
             session_auto_start: config.session.enabled && config.session.auto_start,
             app_structure,
             php_bootstrap,
@@ -1708,6 +1715,7 @@ fn cmd_serve(
             persistent_app_root: String::new(),
             worker_boot: None,
             worker_handler: None,
+            worker_cleanup: None,
             session_auto_start: config.session.enabled && config.session.auto_start,
             worker_semaphore: None,
             auto_scale: false,
@@ -3060,12 +3068,14 @@ async fn handle_request_inner(
                                 &state.persistent_app_root,
                                 state.worker_boot.as_deref(),
                                 state.worker_handler.as_deref(),
+                                state.worker_cleanup.as_deref(),
                             );
                         } else {
                             let _ = pool.reap_and_respawn_persistent(
                                 &state.persistent_app_root,
                                 state.worker_boot.as_deref(),
                                 state.worker_handler.as_deref(),
+                                state.worker_cleanup.as_deref(),
                             );
                         }
                         match pool.get_idle_worker() {
@@ -3127,6 +3137,7 @@ async fn handle_request_inner(
                                 &return_state.persistent_app_root,
                                 return_state.worker_boot.as_deref(),
                                 return_state.worker_handler.as_deref(),
+                                return_state.worker_cleanup.as_deref(),
                             );
                         } else {
                             pool.return_worker(worker_idx);

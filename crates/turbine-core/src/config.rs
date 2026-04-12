@@ -109,6 +109,13 @@ pub struct ServerConfig {
     /// Relative paths are resolved from the application root.
     #[serde(default)]
     pub worker_handler: Option<String>,
+    /// PHP script executed after **every request** to clean up application
+    /// state (e.g. clear service container scoped instances, flush caches).
+    /// Evaluated via `zend_eval_string` after the response is sent but before
+    /// `request_shutdown`.  Requires `persistent_workers = true`.
+    /// Relative paths are resolved from the application root.
+    #[serde(default)]
+    pub worker_cleanup: Option<String>,
     /// Number of Tokio async I/O threads (default = number of CPU cores).
     /// Increase to handle more concurrent connections; decrease to leave more
     /// cores for PHP worker processes.
@@ -160,6 +167,12 @@ pub struct PhpConfig {
     /// OPcache preload script path (empty or "auto" = auto-detect).
     #[serde(default)]
     pub preload_script: Option<String>,
+    /// Enable OPcache file timestamp validation.
+    /// When `true`, OPcache checks if PHP files have been modified on disk
+    /// and recompiles them.  Useful during development but adds stat() overhead.
+    /// Default: `false` (files are never re-checked — maximum performance).
+    #[serde(default)]
+    pub opcache_validate_timestamps: Option<bool>,
     /// Arbitrary php.ini directives (key = value).
     #[serde(default)]
     pub ini: std::collections::HashMap<String, String>,
@@ -693,6 +706,7 @@ impl Default for ServerConfig {
             persistent_workers: None,
             worker_boot: None,
             worker_handler: None,
+            worker_cleanup: None,
             tokio_worker_threads: None,
         }
     }
@@ -712,6 +726,7 @@ impl Default for PhpConfig {
             jit_buffer_size: default_jit_buffer_size(),
             upload_tmp_dir: default_upload_tmp_dir(),
             preload_script: None,
+            opcache_validate_timestamps: None,
             ini: std::collections::HashMap::new(),
         }
     }

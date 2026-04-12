@@ -374,6 +374,7 @@ pub fn worker_event_loop_persistent(
     app_root: &str,
     worker_boot: Option<&str>,
     worker_handler: Option<&str>,
+    worker_cleanup: Option<&str>,
 ) {
     debug!(
         pid = std::process::id(),
@@ -444,6 +445,14 @@ pub fn worker_event_loop_persistent(
     } else {
         None
     };
+
+    // Resolve cleanup script path once (used after each request).
+    let cleanup_abs = worker_cleanup.map(|s| resolve_worker_script(app_root, s));
+    let cleanup_code = cleanup_abs.as_ref().map(|p| {
+        let code = format!("include '{}';", p);
+        safe_cstring(code.as_bytes())
+    });
+    let cleanup_eval_name = safe_cstring(b"turbine_worker_cleanup");
 
     // Install initial output capture (for both modes).
     unsafe {
@@ -591,6 +600,15 @@ pub fn worker_event_loop_persistent(
                 let h = output::take_headers();
                 let s = output::take_response_code();
 
+                // Run cleanup script (if configured) before request shutdown
+                if let Some(ref c_cleanup) = cleanup_code {
+                    turbine_php_sys::zend_eval_string(
+                        c_cleanup.as_ptr(),
+                        std::ptr::null_mut(),
+                        cleanup_eval_name.as_ptr(),
+                    );
+                }
+
                 turbine_php_sys::turbine_worker_request_shutdown();
 
                 (r, b, h, s)
@@ -606,6 +624,15 @@ pub fn worker_event_loop_persistent(
                 let b = output::take_output();
                 let h = output::take_headers();
                 let s = output::take_response_code();
+
+                // Run cleanup script (if configured) before request shutdown
+                if let Some(ref c_cleanup) = cleanup_code {
+                    turbine_php_sys::zend_eval_string(
+                        c_cleanup.as_ptr(),
+                        std::ptr::null_mut(),
+                        cleanup_eval_name.as_ptr(),
+                    );
+                }
 
                 turbine_php_sys::php_request_shutdown(std::ptr::null_mut());
 
@@ -710,6 +737,7 @@ impl WorkerPool {
         app_root: &str,
         worker_boot: Option<&str>,
         worker_handler: Option<&str>,
+        worker_cleanup: Option<&str>,
     ) -> Result<bool, WorkerError> {
         let count = self.config().workers;
         info!(
@@ -720,12 +748,14 @@ impl WorkerPool {
         let owned_root = app_root.to_string();
         let owned_boot = worker_boot.map(|s| s.to_string());
         let owned_handler = worker_handler.map(|s| s.to_string());
+        let owned_cleanup = worker_cleanup.map(|s| s.to_string());
 
         for i in 0..count {
             let root = owned_root.clone();
             let boot = owned_boot.clone();
             let handler = owned_handler.clone();
-            let is_master = self.spawn_one_persistent(i, root, boot, handler)?;
+            let cleanup = owned_cleanup.clone();
+            let is_master = self.spawn_one_persistent(i, root, boot, handler, cleanup)?;
             if !is_master {
                 return Ok(false);
             }
@@ -744,6 +774,7 @@ impl WorkerPool {
         app_root: String,
         worker_boot: Option<String>,
         worker_handler: Option<String>,
+        worker_cleanup: Option<String>,
     ) -> Result<bool, WorkerError> {
         let mut cmd_pipe = [0i32; 2];
         let mut resp_pipe = [0i32; 2];
@@ -785,6 +816,7 @@ impl WorkerPool {
                     &app_root,
                     worker_boot.as_deref(),
                     worker_handler.as_deref(),
+                    worker_cleanup.as_deref(),
                 );
                 std::process::exit(0);
             }
@@ -797,6 +829,7 @@ impl WorkerPool {
         app_root: &str,
         worker_boot: Option<&str>,
         worker_handler: Option<&str>,
+        worker_cleanup: Option<&str>,
     ) -> Result<(), WorkerError> {
         let mut to_respawn = Vec::new();
 
@@ -817,6 +850,7 @@ impl WorkerPool {
                 app_root.to_string(),
                 worker_boot.map(|s| s.to_string()),
                 worker_handler.map(|s| s.to_string()),
+                worker_cleanup.map(|s| s.to_string()),
             )?;
         }
 
@@ -830,6 +864,7 @@ impl WorkerPool {
         app_root: String,
         worker_boot: Option<String>,
         worker_handler: Option<String>,
+        worker_cleanup: Option<String>,
     ) -> Result<bool, WorkerError> {
         let mut cmd_pipe = [0i32; 2];
         let mut resp_pipe = [0i32; 2];
@@ -887,6 +922,7 @@ impl WorkerPool {
                     &app_root,
                     worker_boot.as_deref(),
                     worker_handler.as_deref(),
+                    worker_cleanup.as_deref(),
                 );
                 std::process::exit(0);
             }
@@ -906,6 +942,7 @@ impl WorkerPool {
         app_root: &str,
         worker_boot: Option<&str>,
         worker_handler: Option<&str>,
+        worker_cleanup: Option<&str>,
     ) -> Result<(), WorkerError> {
         let count = self.config().workers;
         info!(
@@ -927,6 +964,7 @@ impl WorkerPool {
                 app_root.to_string(),
                 worker_boot.map(|s| s.to_string()),
                 worker_handler.map(|s| s.to_string()),
+                worker_cleanup.map(|s| s.to_string()),
             )?;
         }
 
@@ -943,6 +981,7 @@ impl WorkerPool {
         app_root: String,
         worker_boot: Option<String>,
         worker_handler: Option<String>,
+        worker_cleanup: Option<String>,
     ) -> Result<(), WorkerError> {
         use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
         use std::sync::Arc;
@@ -989,6 +1028,7 @@ impl WorkerPool {
                     &app_root,
                     worker_boot.as_deref(),
                     worker_handler.as_deref(),
+                    worker_cleanup.as_deref(),
                 );
 
                 // Clean up
@@ -1022,6 +1062,7 @@ impl WorkerPool {
         app_root: &str,
         worker_boot: Option<&str>,
         worker_handler: Option<&str>,
+        worker_cleanup: Option<&str>,
     ) -> Result<(), WorkerError> {
         let mut to_respawn = Vec::new();
 
@@ -1041,6 +1082,7 @@ impl WorkerPool {
                 app_root.to_string(),
                 worker_boot.map(|s| s.to_string()),
                 worker_handler.map(|s| s.to_string()),
+                worker_cleanup.map(|s| s.to_string()),
             )?;
         }
 
@@ -1053,6 +1095,7 @@ impl WorkerPool {
         app_root: String,
         worker_boot: Option<String>,
         worker_handler: Option<String>,
+        worker_cleanup: Option<String>,
     ) -> Result<(), WorkerError> {
         use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
         use std::sync::Arc;
@@ -1092,6 +1135,7 @@ impl WorkerPool {
                     &app_root,
                     worker_boot.as_deref(),
                     worker_handler.as_deref(),
+                    worker_cleanup.as_deref(),
                 );
                 unsafe {
                     turbine_php_sys::turbine_thread_cleanup();

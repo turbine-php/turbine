@@ -200,6 +200,18 @@ $GLOBALS['__turbine_kernel']->terminate($request, $response);
 gc_collect_cycles();
 PHPEOF
 
+# turbine-cleanup.php: runs AFTER every request in persistent mode
+# Clears scoped instances and resolved facades to prevent state leaks
+cat > /var/www/laravel/turbine-cleanup.php << 'PHPEOF'
+<?php
+declare(strict_types=1);
+$app = $GLOBALS['__turbine_app'];
+if (method_exists($app, 'forgetScopedInstances')) {
+    $app->forgetScopedInstances();
+}
+\Illuminate\Support\Facades\Facade::clearResolvedInstances();
+PHPEOF
+
 # ── 7. Turbine config files (all apps × modes × worker counts) ────────────────
 # Naming: {app}-{nts|zts}-{N}w[-p].toml
 #   nts = worker_mode "process"   persistent_workers false/true
@@ -248,7 +260,7 @@ for W in 4 8; do
     # Laravel — needs [sandbox] for framework detection and full app dir
     LARAVEL_INI=$'[php.ini]\nerror_reporting = "0"\ndisplay_errors = "Off"\n"date.timezone" = "UTC"'
     LARAVEL_SANDBOX=$'[sandbox]\nexecution_mode = "framework"\nfront_controller = true'
-    LARAVEL_BOOT=$'worker_boot = "turbine-boot.php"\nworker_handler = "turbine-handler.php"'
+    LARAVEL_BOOT=$'worker_boot = "turbine-boot.php"\nworker_handler = "turbine-handler.php"\nworker_cleanup = "turbine-cleanup.php"'
     make_turbine_toml /etc/turbine/laravel-nts-${W}w.toml   ${W} process false "[]" "$LARAVEL_INI" "" "$LARAVEL_SANDBOX"
     make_turbine_toml /etc/turbine/laravel-nts-${W}w-p.toml ${W} process true  "[]" "$LARAVEL_INI" "$LARAVEL_BOOT" "$LARAVEL_SANDBOX"
     make_turbine_toml /etc/turbine/laravel-zts-${W}w.toml   ${W} thread  false "[]" "$LARAVEL_INI" "" "$LARAVEL_SANDBOX"

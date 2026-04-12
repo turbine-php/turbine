@@ -251,6 +251,7 @@ impl WorkerPool {
         app_root: &str,
         worker_boot: Option<&str>,
         worker_handler: Option<&str>,
+        worker_cleanup: Option<&str>,
     ) {
         if index < self.workers.len() {
             let should_recycle = self.workers[index].mark_idle();
@@ -292,6 +293,7 @@ impl WorkerPool {
                     app_root.to_string(),
                     worker_boot.map(|s| s.to_string()),
                     worker_handler.map(|s| s.to_string()),
+                    worker_cleanup.map(|s| s.to_string()),
                 ) {
                     error!(index = index, error = %e, "Failed to inline respawn persistent worker");
                 }
