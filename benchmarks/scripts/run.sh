@@ -16,7 +16,7 @@ set -euo pipefail
 
 VERSION="${1:-dev}"
 IMAGE_TAG="${2:-latest}"
-WRK_CONNECTIONS="${3:-100}"
+WRK_CONNECTIONS="${3:-256}"
 WRK_DURATION="${4:-30}"
 
 WARMUP_CONNECTIONS=20
@@ -57,6 +57,25 @@ wait_http() {
     done
     log "ERROR: server never became ready at ${url}"
     return 1
+}
+
+# ── Validate response body ─ log response for debugging, warn on suspect results ──
+validate_response() {
+    local label="$1"
+    local url="$2"
+    local body status
+    status=$(curl -s -o /tmp/bench_body.txt -w "%{http_code}" --max-time 5 "$url" 2>/dev/null)
+    body=$(head -c 500 /tmp/bench_body.txt 2>/dev/null)
+    local size
+    size=$(wc -c < /tmp/bench_body.txt 2>/dev/null | tr -d ' ')
+    log "  VALIDATE ${label}: HTTP ${status}, ${size} bytes, body: ${body:0:120}"
+    if [[ "$status" == "404" || "$status" == "403" || "$status" == "502" ]]; then
+        log "  WARNING: ${label} returned HTTP ${status} — PHP may not be executing!"
+    fi
+    if [[ -z "$body" || "$body" == *"404"* || "$body" == *"Not Found"* ]]; then
+        log "  WARNING: ${label} response looks like an error page"
+    fi
+    rm -f /tmp/bench_body.txt
 }
 
 # ── Collect docker stats while benchmark runs ─────────────────────────────────
@@ -161,6 +180,8 @@ bench_container() {
         return 0
     fi
 
+    validate_response "$label" "$url"
+
     log "  Warmup ${label}..."
     wrk -c "$WARMUP_CONNECTIONS" -d "${WARMUP_DURATION}s" -t 2 \
         "$url" >/dev/null 2>&1 || true
@@ -231,6 +252,9 @@ bench_php_scripts() {
         echo "[${joined%,}]"
         return 0
     fi
+
+    # Validate first script to confirm PHP is executing
+    validate_response "${label}/${scripts[0]}" "http://127.0.0.1:${BENCH_PORT}/${scripts[0]}"
 
     local results=()
     for script in "${scripts[@]}"; do

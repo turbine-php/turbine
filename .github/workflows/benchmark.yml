@@ -16,7 +16,7 @@ on:
       connections:
         description: "Number of concurrent connections for wrk."
         required: false
-        default: "100"
+        default: "256"
       duration:
         description: "Benchmark duration in seconds per scenario."
         required: false
