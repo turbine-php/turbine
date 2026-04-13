@@ -189,6 +189,10 @@ jobs:
           memory_limit = "256M"
           opcache_memory = 128
 
+          [php.ini]
+          display_errors = "Off"
+          error_reporting = "0"
+
           [logging]
           level = "error"
 
@@ -207,11 +211,21 @@ jobs:
           {
               auto_https off
               admin off
+              order php_server before file_server
               frankenphp {
                   num_threads \${WORKERS}
+                  php_ini opcache.enable              1
+                  php_ini opcache.memory_consumption  128
+                  php_ini opcache.interned_strings_buffer 16
+                  php_ini opcache.max_accelerated_files 10000
+                  php_ini opcache.validate_timestamps 0
+                  php_ini opcache.revalidate_freq     0
+                  php_ini opcache.save_comments       1
+                  php_ini opcache.jit                 function
+                  php_ini opcache.jit_buffer_size     64M
               }
           }
-          :80 {
+          http://:80 {
               root * /app
               php_server
           }
@@ -251,18 +265,16 @@ jobs:
                   local url="http://127.0.0.1:\${BENCH_PORT}/\${script}"
                   echo "[verify]   Testing \${script}..." >&2
 
-                  # Phase 1: uniqueness via curl samples
+                  # Phase 1: uniqueness via curl samples (sequential for reliability)
                   local sample_dir=\$(mktemp -d)
-                  local pids_arr=()
                   for i in \$(seq 1 \${SAMPLES}); do
-                      curl -s -H "X-Request-Token: s-\${i}" "\$url" > "\${sample_dir}/\${i}.txt" &
-                      pids_arr+=(\$!)
-                      if (( i % 64 == 0 )); then
-                          for p in "\${pids_arr[@]}"; do wait "\$p" 2>/dev/null; done
-                          pids_arr=()
-                      fi
+                      curl -s --max-time 5 -H "X-Request-Token: s-\${i}" "\$url" > "\${sample_dir}/\${i}.txt" 2>/dev/null
                   done
-                  for p in "\${pids_arr[@]}"; do wait "\$p" 2>/dev/null; done
+
+                  # Diagnostic: dump first sample response for debugging
+                  echo "[verify]     Sample 1 (\${script}):" >&2
+                  head -c 500 "\${sample_dir}/1.txt" >&2 2>/dev/null || true
+                  echo >&2
 
                   local empty=0
                   for f in "\${sample_dir}"/*.txt; do
@@ -282,14 +294,22 @@ jobs:
 
                   # Phase 1 extra: SHA-256 verification for verify_compute
                   local hash_invalid=0
+                  local hash_err_shown=0
                   if [[ "\$script" == "verify_compute.php" ]]; then
                       for f in "\${sample_dir}"/*.txt; do
                           python3 -c "
-          import json, hashlib, sys
-          d = json.load(open(sys.argv[1]))
-          expected = hashlib.sha256(d['input'].encode()).hexdigest()
-          sys.exit(0 if d['hash'] == expected else 1)
-          " "\$f" 2>/dev/null || hash_invalid=\$((hash_invalid + 1))
+import json, hashlib, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    expected = hashlib.sha256(d['input'].encode()).hexdigest()
+    if d['hash'] != expected:
+        print(f'HASH MISMATCH: got {d["hash"]}, expected {expected}', file=sys.stderr)
+        sys.exit(1)
+except Exception as e:
+    print(f'PARSE ERROR ({sys.argv[1]}): {e}', file=sys.stderr)
+    print(f'  Content: {open(sys.argv[1]).read()[:200]}', file=sys.stderr)
+    sys.exit(1)
+" "\$f" 2>&1 | { if [[ \$hash_err_shown -lt 3 ]]; then cat >&2; fi; } || { hash_invalid=\$((hash_invalid + 1)); hash_err_shown=\$((hash_err_shown + 1)); }
                       done
                   fi
 
