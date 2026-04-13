@@ -1,0 +1,451 @@
+name: Verify Benchmark Integrity
+
+on:
+  workflow_dispatch:
+    inputs:
+      php_version:
+        description: "PHP major version (e.g. 8.4). Both NTS and ZTS images will be tested."
+        required: false
+        default: "8.4"
+      connections:
+        description: "Number of concurrent connections for wrk."
+        required: false
+        default: "256"
+      duration:
+        description: "Benchmark duration in seconds per test."
+        required: false
+        default: "10"
+      samples:
+        description: "Number of curl samples for Phase 1 uniqueness check."
+        required: false
+        default: "500"
+      workers:
+        description: "Number of workers/threads per server."
+        required: false
+        default: "4"
+
+# Required secrets:
+#   HETZNER_API_TOKEN — Hetzner Cloud API token (Project → API Tokens → Read+Write)
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify on Hetzner CCX33
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse inputs
+        id: meta
+        run: |
+          echo "php_version=${{ inputs.php_version || '8.4' }}" >> "$GITHUB_OUTPUT"
+          echo "connections=${{ inputs.connections || '256' }}"  >> "$GITHUB_OUTPUT"
+          echo "duration=${{ inputs.duration || '10' }}"        >> "$GITHUB_OUTPUT"
+          echo "samples=${{ inputs.samples || '500' }}"         >> "$GITHUB_OUTPUT"
+          echo "workers=${{ inputs.workers || '4' }}"           >> "$GITHUB_OUTPUT"
+
+      - name: Generate SSH keypair
+        run: ssh-keygen -t ed25519 -f /tmp/bench_key -N ""
+
+      - name: Create Hetzner SSH key
+        id: hkey
+        env:
+          HCLOUD_TOKEN: ${{ secrets.HETZNER_API_TOKEN }}
+        run: |
+          KEY_NAME="verify-${{ github.run_id }}-${{ github.run_attempt }}"
+          RESP=$(curl -sSL -X POST \
+            -H "Authorization: Bearer $HCLOUD_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"name\":\"${KEY_NAME}\",\"public_key\":\"$(cat /tmp/bench_key.pub)\"}" \
+            https://api.hetzner.cloud/v1/ssh_keys)
+          ERR_CODE=$(echo "$RESP" | jq -r '.error.code // empty')
+          if [[ -n "$ERR_CODE" ]]; then
+            echo "::error::Hetzner SSH key error: $(echo "$RESP" | jq -r '.error.message')"
+            exit 1
+          fi
+          KEY_ID=$(echo "$RESP" | jq -r '.ssh_key.id')
+          echo "id=${KEY_ID}" >> "$GITHUB_OUTPUT"
+          echo "KEY_ID=${KEY_ID}" >> "$GITHUB_ENV"
+
+      - name: Create Hetzner CCX33 server
+        id: server
+        env:
+          HCLOUD_TOKEN: ${{ secrets.HETZNER_API_TOKEN }}
+        run: |
+          RESP=$(curl -sSL -X POST \
+            -H "Authorization: Bearer $HCLOUD_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"name\":\"verify-${{ github.run_id }}-${{ github.run_attempt }}\",\"server_type\":\"ccx33\",\"image\":\"ubuntu-24.04\",\"ssh_keys\":[${{ steps.hkey.outputs.id }}],\"location\":\"nbg1\"}" \
+            https://api.hetzner.cloud/v1/servers)
+          ERR=$(echo "$RESP" | jq -r '.error.message // empty')
+          if [[ -n "$ERR" ]]; then
+            echo "::error::Hetzner API error: $ERR"
+            exit 1
+          fi
+          echo "id=$(echo "$RESP"   | jq -r '.server.id')"                  >> "$GITHUB_OUTPUT"
+          echo "ip=$(echo "$RESP"   | jq -r '.server.public_net.ipv4.ip')"  >> "$GITHUB_OUTPUT"
+          echo "SERVER_ID=$(echo "$RESP" | jq -r '.server.id')" >> "$GITHUB_ENV"
+
+      - name: Wait for SSH availability
+        run: |
+          IP="${{ steps.server.outputs.ip }}"
+          echo "Waiting for SSH on ${IP}..."
+          for i in $(seq 1 40); do
+            ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+                -i /tmp/bench_key "root@${IP}" "echo ready" 2>/dev/null && break
+            echo "  Attempt ${i}/40 — retrying in 10s..."
+            sleep 10
+          done
+
+      - name: Upload scripts
+        run: |
+          scp -o StrictHostKeyChecking=no -i /tmp/bench_key -r \
+            benchmarks/scripts "root@${{ steps.server.outputs.ip }}:/root/bench"
+
+      - name: Install Docker and wrk
+        run: |
+          ssh -o StrictHostKeyChecking=no -i /tmp/bench_key \
+            "root@${{ steps.server.outputs.ip }}" bash -s << 'SETUP'
+          set -euo pipefail
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+              ca-certificates curl gnupg python3
+          curl -fsSL https://get.docker.com | sh
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+              wrk || {
+              apt-get install -y --no-install-recommends libssl-dev build-essential git
+              git clone --depth 1 https://github.com/wg/wrk.git /tmp/wrk-src
+              make -C /tmp/wrk-src -j$(nproc)
+              cp /tmp/wrk-src/wrk /usr/local/bin/wrk
+          }
+          echo "[setup] Docker $(docker --version) · wrk $(wrk --version 2>&1 | head -1)"
+          SETUP
+
+      - name: Pull Docker images
+        run: |
+          PHP="${{ steps.meta.outputs.php_version }}"
+          ssh -o StrictHostKeyChecking=no -i /tmp/bench_key \
+            "root@${{ steps.server.outputs.ip }}" bash -s << PULL
+          set -euo pipefail
+          docker pull "katisuhara/turbine-php:latest-php${PHP}-nts"
+          docker pull "katisuhara/turbine-php:latest-php${PHP}-zts"
+          docker pull "dunglas/frankenphp:latest"
+          echo "[setup] Images pulled"
+          PULL
+
+      - name: Run verification benchmark
+        id: verify
+        run: |
+          PHP="${{ steps.meta.outputs.php_version }}"
+          CONN="${{ steps.meta.outputs.connections }}"
+          DUR="${{ steps.meta.outputs.duration }}"
+          SAMPLES="${{ steps.meta.outputs.samples }}"
+          WORKERS="${{ steps.meta.outputs.workers }}"
+          IP="${{ steps.server.outputs.ip }}"
+
+          ssh -o StrictHostKeyChecking=no -i /tmp/bench_key "root@${IP}" bash -s << VERIFY_SCRIPT > /tmp/verify-results.json 2> /tmp/verify-log.txt
+          set -euo pipefail
+
+          CONN="${CONN}"
+          DUR="${DUR}"
+          SAMPLES="${SAMPLES}"
+          WORKERS="${WORKERS}"
+          PHP_VERSION="${PHP}"
+          BENCH_PORT=8080
+          WRK_LUA="/root/bench/wrk-report.lua"
+          PHP_DIR="/root/bench/php"
+
+          TURBINE_IMAGE_NTS="katisuhara/turbine-php:latest-php\${PHP_VERSION}-nts"
+          TURBINE_IMAGE_ZTS="katisuhara/turbine-php:latest-php\${PHP_VERSION}-zts"
+          FRANKENPHP_IMAGE="dunglas/frankenphp:latest"
+
+          VERIFY_SCRIPTS=(verify_dynamic.php verify_echo.php verify_compute.php verify_payload.php)
+
+          # --- Create verification app directory ---
+          mkdir -p /var/www/verify
+          cp /root/bench/php/verify_*.php /var/www/verify/
+
+          # --- Create Turbine configs ---
+          mkdir -p /etc/turbine
+          for MODE in nts zts; do
+            for PERS in false true; do
+              SUFFIX="\${MODE}-\${WORKERS}w"
+              [[ "\$PERS" == "true" ]] && SUFFIX="\${SUFFIX}-p"
+              WM="process"
+              [[ "\$MODE" == "zts" ]] && WM="thread"
+              cat > "/etc/turbine/verify-\${SUFFIX}.toml" << TOML
+          [server]
+          listen = "0.0.0.0:80"
+          workers = \${WORKERS}
+          worker_mode = "\${WM}"
+          worker_max_requests = 0
+          persistent_workers = \${PERS}
+
+          [php]
+          memory_limit = "256M"
+          opcache_memory = 128
+
+          [logging]
+          level = "error"
+
+          [cache]
+          enabled = false
+
+          [compression]
+          enabled = false
+          TOML
+            done
+          done
+
+          # --- Create FrankenPHP Caddyfile ---
+          mkdir -p /etc/frankenphp
+          cat > "/etc/frankenphp/verify-\${WORKERS}w.Caddyfile" << CADDY
+          {
+              auto_https off
+              admin off
+              frankenphp {
+                  num_threads \${WORKERS}
+              }
+          }
+          :80 {
+              root * /app
+              php_server
+          }
+          CADDY
+
+          # --- Helper functions ---
+          wait_http() {
+              local url="\$1"
+              for i in \$(seq 1 40); do
+                  code=\$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 "\$url" 2>/dev/null) || true
+                  [[ -n "\$code" && "\$code" != "000" && "\$code" -lt 500 ]] && return 0
+                  sleep 1
+              done
+              return 1
+          }
+
+          # --- Run tests for one server variant ---
+          # Usage: run_variant <label> <docker_args...>
+          run_variant() {
+              local label="\$1"; shift
+              local results_json="[]"
+
+              echo "[verify] Starting \${label}..." >&2
+              docker run -d --name bench-verify -p \${BENCH_PORT}:80 "\$@" >/dev/null 2>&1
+
+              if ! wait_http "http://127.0.0.1:\${BENCH_PORT}/verify_echo.php"; then
+                  echo "[verify] SKIP \${label}: server not ready" >&2
+                  docker logs --tail 20 bench-verify >&2 2>&1 || true
+                  docker stop bench-verify >/dev/null 2>&1 || true
+                  docker rm bench-verify >/dev/null 2>&1 || true
+                  echo '{"label":"'"'\${label}'"'","status":"skip","tests":[]}'
+                  return 0
+              fi
+
+              local test_results=()
+              for script in "\${VERIFY_SCRIPTS[@]}"; do
+                  local url="http://127.0.0.1:\${BENCH_PORT}/\${script}"
+                  echo "[verify]   Testing \${script}..." >&2
+
+                  # Phase 1: uniqueness via curl samples
+                  local sample_dir=\$(mktemp -d)
+                  local pids_arr=()
+                  for i in \$(seq 1 \${SAMPLES}); do
+                      curl -s -H "X-Request-Token: s-\${i}" "\$url" > "\${sample_dir}/\${i}.txt" &
+                      pids_arr+=(\$!)
+                      if (( i % 64 == 0 )); then
+                          for p in "\${pids_arr[@]}"; do wait "\$p" 2>/dev/null; done
+                          pids_arr=()
+                      fi
+                  done
+                  for p in "\${pids_arr[@]}"; do wait "\$p" 2>/dev/null; done
+
+                  local empty=0
+                  for f in "\${sample_dir}"/*.txt; do
+                      [[ ! -s "\$f" ]] && empty=\$((empty + 1))
+                  done
+
+                  local unique_bodies=\$(md5sum "\${sample_dir}"/*.txt | awk '{print \$1}' | sort -u | wc -l | tr -d ' ')
+                  local duplicates=\$((\${SAMPLES} - unique_bodies))
+
+                  # Phase 1 extra: counter check for verify_dynamic
+                  local unique_counters=0
+                  if [[ "\$script" == "verify_dynamic.php" ]]; then
+                      unique_counters=\$(for f in "\${sample_dir}"/*.txt; do
+                          python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['c'])" "\$f" 2>/dev/null
+                      done | sort -u | wc -l | tr -d ' ')
+                  fi
+
+                  # Phase 1 extra: SHA-256 verification for verify_compute
+                  local hash_invalid=0
+                  if [[ "\$script" == "verify_compute.php" ]]; then
+                      for f in "\${sample_dir}"/*.txt; do
+                          python3 -c "
+          import json, hashlib, sys
+          d = json.load(open(sys.argv[1]))
+          expected = hashlib.sha256(d['input'].encode()).hexdigest()
+          sys.exit(0 if d['hash'] == expected else 1)
+          " "\$f" 2>/dev/null || hash_invalid=\$((hash_invalid + 1))
+                      done
+                  fi
+
+                  rm -rf "\$sample_dir"
+
+                  # Phase 2: wrk throughput
+                  wrk -c 10 -d 3s -t 1 "\$url" >/dev/null 2>&1 || true
+                  local wrk_raw=\$(mktemp)
+                  wrk -c \${CONN} -d \${DUR}s -t 4 -s "\${WRK_LUA}" "\$url" > "\$wrk_raw" 2>/dev/null || true
+                  local wrk_json=\$(grep '^{' "\$wrk_raw" | head -1)
+                  rm -f "\$wrk_raw"
+                  [[ -z "\$wrk_json" ]] && wrk_json='{}'
+
+                  local phase1_pass="true"
+                  [[ "\$duplicates" -gt 0 ]] && phase1_pass="false"
+                  [[ "\$empty" -gt 0 ]] && phase1_pass="false"
+                  [[ "\$script" == "verify_compute.php" && "\$hash_invalid" -gt 0 ]] && phase1_pass="false"
+
+                  test_results+=("\$(printf '{"script":"%s","samples":%d,"unique_bodies":%d,"duplicates":%d,"empty":%d,"unique_counters":%d,"hash_invalid":%d,"phase1_pass":%s,"wrk":%s}' \
+                      "\$script" "\${SAMPLES}" "\$unique_bodies" "\$duplicates" "\$empty" "\$unique_counters" "\$hash_invalid" "\$phase1_pass" "\$wrk_json")")
+
+                  # Log summary
+                  local rps=\$(echo "\$wrk_json" | python3 -c "import sys,json; print(json.load(sys.stdin).get('rps',0))" 2>/dev/null || echo 0)
+                  if [[ "\$phase1_pass" == "true" ]]; then
+                      echo "[verify]     PASS \${script}: \${rps} req/s, \${duplicates} dups, \${unique_bodies}/\${SAMPLES} unique" >&2
+                  else
+                      echo "[verify]     FAIL \${script}: \${rps} req/s, \${duplicates} dups, \${empty} empty, \${hash_invalid} bad hashes" >&2
+                  fi
+              done
+
+              docker stop bench-verify >/dev/null 2>&1 || true
+              docker rm bench-verify >/dev/null 2>&1 || true
+
+              # Output JSON for this variant
+              local joined=\$(printf '%s,' "\${test_results[@]}")
+              echo "{\"label\":\"\${label}\",\"tests\":[\${joined%,}]}"
+          }
+
+          # ── Run all variants ───────────────────────────────────────────────
+          ALL_RESULTS=()
+
+          echo "[verify] === Turbine NTS (process) ===" >&2
+          ALL_RESULTS+=("\$(run_variant "Turbine NTS · \${WORKERS}w" \
+              -v /var/www/verify:/var/www/html \
+              -v "/etc/turbine/verify-nts-\${WORKERS}w.toml:/var/www/html/turbine.toml:ro" \
+              "\$TURBINE_IMAGE_NTS")")
+
+          echo "[verify] === Turbine NTS (persistent) ===" >&2
+          ALL_RESULTS+=("\$(run_variant "Turbine NTS · \${WORKERS}w · persistent" \
+              -v /var/www/verify:/var/www/html \
+              -v "/etc/turbine/verify-nts-\${WORKERS}w-p.toml:/var/www/html/turbine.toml:ro" \
+              "\$TURBINE_IMAGE_NTS")")
+
+          echo "[verify] === Turbine ZTS (thread) ===" >&2
+          ALL_RESULTS+=("\$(run_variant "Turbine ZTS · \${WORKERS}w" \
+              -v /var/www/verify:/var/www/html \
+              -v "/etc/turbine/verify-zts-\${WORKERS}w.toml:/var/www/html/turbine.toml:ro" \
+              "\$TURBINE_IMAGE_ZTS")")
+
+          echo "[verify] === Turbine ZTS (persistent) ===" >&2
+          ALL_RESULTS+=("\$(run_variant "Turbine ZTS · \${WORKERS}w · persistent" \
+              -v /var/www/verify:/var/www/html \
+              -v "/etc/turbine/verify-zts-\${WORKERS}w-p.toml:/var/www/html/turbine.toml:ro" \
+              "\$TURBINE_IMAGE_ZTS")")
+
+          echo "[verify] === FrankenPHP ===" >&2
+          ALL_RESULTS+=("\$(run_variant "FrankenPHP (ZTS) · \${WORKERS}w" \
+              -e SERVER_NAME=:80 \
+              -v /var/www/verify:/app \
+              -v "/etc/frankenphp/verify-\${WORKERS}w.Caddyfile:/etc/caddy/Caddyfile" \
+              "\$FRANKENPHP_IMAGE")")
+
+          # Output combined JSON
+          JOINED=\$(printf '%s,' "\${ALL_RESULTS[@]}")
+          echo "[{\"meta\":{\"php_version\":\"\${PHP_VERSION}\",\"connections\":\${CONN},\"duration\":\${DUR},\"samples\":\${SAMPLES},\"workers\":\${WORKERS}},\"results\":[\${JOINED%,}]}]"
+          VERIFY_SCRIPT
+
+          echo "--- Verify log ---"
+          cat /tmp/verify-log.txt
+          echo "--- Verify results ---"
+          cat /tmp/verify-results.json
+
+      - name: Generate summary
+        if: always() && steps.verify.outcome != 'skipped'
+        run: |
+          python3 - /tmp/verify-results.json << 'PYEOF'
+          import json, sys
+
+          try:
+              data = json.load(open(sys.argv[1]))
+          except Exception as e:
+              print(f"::error::Failed to parse results: {e}")
+              sys.exit(1)
+
+          meta = data[0]["meta"]
+          results = data[0]["results"]
+
+          print("## Verification Benchmark Results\n")
+          print(f"| | |")
+          print(f"|---|---|")
+          print(f"| **PHP** | {meta['php_version']} |")
+          print(f"| **Server** | Hetzner CCX33 (8 vCPU / 32 GB) |")
+          print(f"| **Connections** | {meta['connections']} |")
+          print(f"| **Duration** | {meta['duration']}s |")
+          print(f"| **Samples** | {meta['samples']} |")
+          print(f"| **Workers** | {meta['workers']} |")
+          print()
+
+          total_pass = 0
+          total_fail = 0
+
+          for variant in results:
+              label = variant.get("label", "?")
+              tests = variant.get("tests", [])
+              print(f"### {label}\n")
+              print("| Test | Req/s | p50 | p99 | Samples | Unique | Dups | Hashes | Phase 1 |")
+              print("|------|------:|----:|----:|--------:|-------:|-----:|-------:|:-------:|")
+              for t in tests:
+                  w = t.get("wrk", {})
+                  rps = w.get("rps", 0)
+                  p50 = w.get("latency_p50_ms", 0)
+                  p99 = w.get("latency_p99_ms", 0)
+                  samples = t.get("samples", 0)
+                  unique = t.get("unique_bodies", 0)
+                  dups = t.get("duplicates", 0)
+                  hinv = t.get("hash_invalid", 0)
+                  passed = t.get("phase1_pass", False)
+                  icon = "✅" if passed else "❌"
+                  if passed:
+                      total_pass += 1
+                  else:
+                      total_fail += 1
+                  print(f"| {t['script']} | {rps:,} | {p50:.1f} ms | {p99:.1f} ms | {samples} | {unique} | {dups} | {hinv} | {icon} |")
+              print()
+
+          print(f"---\n**Total: {total_pass} passed, {total_fail} failed**\n")
+
+          if total_fail > 0:
+              print("::error::Some verification tests failed!")
+              sys.exit(1)
+          else:
+              print("All verification tests passed — every response is unique, no caching detected.")
+          PYEOF
+
+      - name: Delete Hetzner server and SSH key
+        if: always()
+        env:
+          HCLOUD_TOKEN: ${{ secrets.HETZNER_API_TOKEN }}
+        run: |
+          if [[ -n "${SERVER_ID:-}" ]]; then
+            curl -fsSL -X DELETE \
+              -H "Authorization: Bearer $HCLOUD_TOKEN" \
+              "https://api.hetzner.cloud/v1/servers/${SERVER_ID}" || true
+          fi
+          if [[ -n "${KEY_ID:-}" ]]; then
+            curl -fsSL -X DELETE \
+              -H "Authorization: Bearer $HCLOUD_TOKEN" \
+              "https://api.hetzner.cloud/v1/ssh_keys/${KEY_ID}" || true
+          fi
