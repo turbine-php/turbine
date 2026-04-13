@@ -166,8 +166,11 @@ jobs:
           VERIFY_SCRIPTS=(verify_dynamic.php verify_echo.php verify_compute.php verify_payload.php)
 
           # --- Create verification app directory ---
-          mkdir -p /var/www/verify
+          # Turbine serves from /var/www/html (root)
+          # FrankenPHP serves from /app/public (convention)
+          mkdir -p /var/www/verify /var/www/verify-frankenphp/public
           cp /root/bench/php/verify_*.php /var/www/verify/
+          cp /root/bench/php/verify_*.php /var/www/verify-frankenphp/public/
 
           # --- Create Turbine configs ---
           mkdir -p /etc/turbine
@@ -201,6 +204,12 @@ jobs:
 
           [compression]
           enabled = false
+
+          [security]
+          enabled = false
+
+          [sandbox]
+          enforce_open_basedir = false
           TOML
             done
           done
@@ -226,7 +235,7 @@ jobs:
               }
           }
           http://:80 {
-              root * /app
+              root * /app/public
               php_server
           }
           CADDY
@@ -271,10 +280,12 @@ jobs:
                       curl -s --max-time 5 -H "X-Request-Token: s-\${i}" "\$url" > "\${sample_dir}/\${i}.txt" 2>/dev/null
                   done
 
-                  # Diagnostic: dump first sample response for debugging
-                  echo "[verify]     Sample 1 (\${script}):" >&2
-                  head -c 500 "\${sample_dir}/1.txt" >&2 2>/dev/null || true
-                  echo >&2
+                  # Capture first sample for diagnostics (included in results JSON)
+                  local sample_response=""
+                  if [[ -s "\${sample_dir}/1.txt" ]]; then
+                      sample_response=\$(head -c 300 "\${sample_dir}/1.txt" | tr '"' "'" | tr '\n' ' ')
+                  fi
+                  echo "[verify]     Sample 1 (\${script}): \${sample_response:0:200}" >&2
 
                   local empty=0
                   for f in "\${sample_dir}"/*.txt; do
@@ -284,32 +295,33 @@ jobs:
                   local unique_bodies=\$(md5sum "\${sample_dir}"/*.txt | awk '{print \$1}' | sort -u | wc -l | tr -d ' ')
                   local duplicates=\$((\${SAMPLES} - unique_bodies))
 
-                  # Phase 1 extra: counter check for verify_dynamic
-                  local unique_counters=0
-                  if [[ "\$script" == "verify_dynamic.php" ]]; then
-                      unique_counters=\$(for f in "\${sample_dir}"/*.txt; do
-                          python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['c'])" "\$f" 2>/dev/null
-                      done | sort -u | wc -l | tr -d ' ')
-                  fi
-
                   # Phase 1 extra: SHA-256 verification for verify_compute
                   local hash_invalid=0
-                  local hash_err_shown=0
+                  local hash_first_err=""
                   if [[ "\$script" == "verify_compute.php" ]]; then
                       for f in "\${sample_dir}"/*.txt; do
-                          python3 -c "
+                          if ! python3 -c "
+          import json, hashlib, sys
+          d = json.load(open(sys.argv[1]))
+          expected = hashlib.sha256(d['input'].encode()).hexdigest()
+          if d['hash'] != expected:
+              sys.exit(1)
+          " "\$f" 2>/dev/null; then
+                              hash_invalid=\$((hash_invalid + 1))
+                              if [[ -z "\$hash_first_err" ]]; then
+                                  hash_first_err=\$(python3 -c "
           import json, hashlib, sys
           try:
+              raw = open(sys.argv[1]).read()
               d = json.load(open(sys.argv[1]))
               expected = hashlib.sha256(d['input'].encode()).hexdigest()
-              if d['hash'] != expected:
-                  print(f'HASH MISMATCH: got {d[\"hash\"]}, expected {expected}', file=sys.stderr)
-                  sys.exit(1)
+              print(f'input={d[\"input\"][:60]} hash={d[\"hash\"][:16]}... expected={expected[:16]}...')
           except Exception as e:
-              print(f'PARSE ERROR ({sys.argv[1]}): {e}', file=sys.stderr)
-              print(f'  Content: {open(sys.argv[1]).read()[:200]}', file=sys.stderr)
-              sys.exit(1)
-          " "\$f" 2>&1 | { if [[ \$hash_err_shown -lt 3 ]]; then cat >&2; fi; } || { hash_invalid=\$((hash_invalid + 1)); hash_err_shown=\$((hash_err_shown + 1)); }
+              print(f'PARSE_ERR: {e} | content={raw[:150]}')
+          " "\$f" 2>/dev/null || echo "python error")
+                                  echo "[verify]     HASH ERR: \${hash_first_err}" >&2
+                              fi
+                          fi
                       done
                   fi
 
@@ -328,8 +340,12 @@ jobs:
                   [[ "\$empty" -gt 0 ]] && phase1_pass="false"
                   [[ "\$script" == "verify_compute.php" && "\$hash_invalid" -gt 0 ]] && phase1_pass="false"
 
-                  test_results+=("\$(printf '{"script":"%s","samples":%d,"unique_bodies":%d,"duplicates":%d,"empty":%d,"unique_counters":%d,"hash_invalid":%d,"phase1_pass":%s,"wrk":%s}' \
-                      "\$script" "\${SAMPLES}" "\$unique_bodies" "\$duplicates" "\$empty" "\$unique_counters" "\$hash_invalid" "\$phase1_pass" "\$wrk_json")")
+                  # Escape sample_response for JSON
+                  local safe_sample=\$(echo "\$sample_response" | sed 's/\\/\\\\/g; s/"/\\"/g' | head -c 200)
+                  local safe_hash_err=\$(echo "\$hash_first_err" | sed 's/\\/\\\\/g; s/"/\\"/g' | head -c 200)
+
+                  test_results+=("\$(printf '{"script":"%s","samples":%d,"unique_bodies":%d,"duplicates":%d,"empty":%d,"hash_invalid":%d,"phase1_pass":%s,"wrk":%s,"sample_response":"%s","hash_first_err":"%s"}' \
+                      "\$script" "\${SAMPLES}" "\$unique_bodies" "\$duplicates" "\$empty" "\$hash_invalid" "\$phase1_pass" "\$wrk_json" "\$safe_sample" "\$safe_hash_err")")
 
                   # Log summary
                   local rps=\$(echo "\$wrk_json" | python3 -c "import sys,json; print(json.load(sys.stdin).get('rps',0))" 2>/dev/null || echo 0)
@@ -378,7 +394,7 @@ jobs:
           echo "[verify] === FrankenPHP ===" >&2
           ALL_RESULTS+=("\$(run_variant "FrankenPHP (ZTS) · \${WORKERS}w" \
               -e SERVER_NAME=:80 \
-              -v /var/www/verify:/app \
+              -v /var/www/verify-frankenphp:/app \
               -v "/etc/frankenphp/verify-\${WORKERS}w.Caddyfile:/etc/caddy/Caddyfile" \
               "\$FRANKENPHP_IMAGE")")
 
@@ -395,38 +411,54 @@ jobs:
       - name: Generate summary
         if: always() && steps.verify.outcome != 'skipped'
         run: |
-          python3 - /tmp/verify-results.json << 'PYEOF'
-          import json, sys
+          python3 - /tmp/verify-results.json "$GITHUB_STEP_SUMMARY" << 'PYEOF'
+          import json, sys, os
+
+          summary_file = sys.argv[2] if len(sys.argv) > 2 else None
+          lines = []
+          def out(s=""):
+              print(s)
+              lines.append(s)
 
           try:
               data = json.load(open(sys.argv[1]))
           except Exception as e:
-              print(f"::error::Failed to parse results: {e}")
+              out(f"::error::Failed to parse results: {e}")
+              # Try to dump raw content for debugging
+              try:
+                  raw = open(sys.argv[1]).read()[:2000]
+                  out(f"\nRaw results file content:\n```\n{raw}\n```")
+              except:
+                  pass
+              if summary_file:
+                  with open(summary_file, "a") as f:
+                      f.write("\n".join(lines))
               sys.exit(1)
 
           meta = data[0]["meta"]
           results = data[0]["results"]
 
-          print("## Verification Benchmark Results\n")
-          print(f"| | |")
-          print(f"|---|---|")
-          print(f"| **PHP** | {meta['php_version']} |")
-          print(f"| **Server** | Hetzner CCX33 (8 vCPU / 32 GB) |")
-          print(f"| **Connections** | {meta['connections']} |")
-          print(f"| **Duration** | {meta['duration']}s |")
-          print(f"| **Samples** | {meta['samples']} |")
-          print(f"| **Workers** | {meta['workers']} |")
-          print()
+          out("## Verification Benchmark Results\n")
+          out("| | |")
+          out("|---|---|")
+          out(f"| **PHP** | {meta['php_version']} |")
+          out(f"| **Server** | Hetzner CCX33 (8 vCPU / 32 GB) |")
+          out(f"| **Connections** | {meta['connections']} |")
+          out(f"| **Duration** | {meta['duration']}s |")
+          out(f"| **Samples** | {meta['samples']} |")
+          out(f"| **Workers** | {meta['workers']} |")
+          out()
 
           total_pass = 0
           total_fail = 0
+          diagnostics = []
 
           for variant in results:
               label = variant.get("label", "?")
               tests = variant.get("tests", [])
-              print(f"### {label}\n")
-              print("| Test | Req/s | p50 | p99 | Samples | Unique | Dups | Hashes | Phase 1 |")
-              print("|------|------:|----:|----:|--------:|-------:|-----:|-------:|:-------:|")
+              out(f"### {label}\n")
+              out("| Test | Req/s | p50 | p99 | Samples | Unique | Dups | Hashes | Phase 1 |")
+              out("|------|------:|----:|----:|--------:|-------:|-----:|-------:|:-------:|")
               for t in tests:
                   w = t.get("wrk", {})
                   rps = w.get("rps", 0)
@@ -442,10 +474,29 @@ jobs:
                       total_pass += 1
                   else:
                       total_fail += 1
-                  print(f"| {t['script']} | {rps:,} | {p50:.1f} ms | {p99:.1f} ms | {samples} | {unique} | {dups} | {hinv} | {icon} |")
-              print()
+                      # Collect diagnostic info for failed tests
+                      diag = f"**{label} / {t['script']}**"
+                      sr = t.get("sample_response", "")
+                      he = t.get("hash_first_err", "")
+                      if sr:
+                          diag += f"\n- Sample: `{sr[:200]}`"
+                      if he:
+                          diag += f"\n- Hash error: `{he[:200]}`"
+                      diagnostics.append(diag)
+                  out(f"| {t['script']} | {rps:,} | {p50:.1f} ms | {p99:.1f} ms | {samples} | {unique} | {dups} | {hinv} | {icon} |")
+              out()
 
-          print(f"---\n**Total: {total_pass} passed, {total_fail} failed**\n")
+          out(f"---\n**Total: {total_pass} passed, {total_fail} failed**\n")
+
+          if diagnostics:
+              out("### Diagnostics (failed tests)\n")
+              for d in diagnostics:
+                  out(d)
+                  out()
+
+          if summary_file:
+              with open(summary_file, "a") as f:
+                  f.write("\n".join(lines))
 
           if total_fail > 0:
               print("::error::Some verification tests failed!")
