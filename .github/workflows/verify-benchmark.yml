@@ -298,18 +298,18 @@ jobs:
                   if [[ "\$script" == "verify_compute.php" ]]; then
                       for f in "\${sample_dir}"/*.txt; do
                           python3 -c "
-import json, hashlib, sys
-try:
-    d = json.load(open(sys.argv[1]))
-    expected = hashlib.sha256(d['input'].encode()).hexdigest()
-    if d['hash'] != expected:
-        print(f'HASH MISMATCH: got {d["hash"]}, expected {expected}', file=sys.stderr)
-        sys.exit(1)
-except Exception as e:
-    print(f'PARSE ERROR ({sys.argv[1]}): {e}', file=sys.stderr)
-    print(f'  Content: {open(sys.argv[1]).read()[:200]}', file=sys.stderr)
-    sys.exit(1)
-" "\$f" 2>&1 | { if [[ \$hash_err_shown -lt 3 ]]; then cat >&2; fi; } || { hash_invalid=\$((hash_invalid + 1)); hash_err_shown=\$((hash_err_shown + 1)); }
+          import json, hashlib, sys
+          try:
+              d = json.load(open(sys.argv[1]))
+              expected = hashlib.sha256(d['input'].encode()).hexdigest()
+              if d['hash'] != expected:
+                  print(f'HASH MISMATCH: got {d[\"hash\"]}, expected {expected}', file=sys.stderr)
+                  sys.exit(1)
+          except Exception as e:
+              print(f'PARSE ERROR ({sys.argv[1]}): {e}', file=sys.stderr)
+              print(f'  Content: {open(sys.argv[1]).read()[:200]}', file=sys.stderr)
+              sys.exit(1)
+          " "\$f" 2>&1 | { if [[ \$hash_err_shown -lt 3 ]]; then cat >&2; fi; } || { hash_invalid=\$((hash_invalid + 1)); hash_err_shown=\$((hash_err_shown + 1)); }
                       done
                   fi
 
