@@ -128,7 +128,14 @@ fn write_php_ini(overrides: &PhpIniOverrides) -> std::path::PathBuf {
         ));
         ini.push_str("opcache.interned_strings_buffer=16\n");
         ini.push_str("opcache.max_accelerated_files=10000\n");
-        ini.push_str(&format!("opcache.validate_timestamps={}\n", if overrides.opcache_validate_timestamps { 1 } else { 0 }));
+        ini.push_str(&format!(
+            "opcache.validate_timestamps={}\n",
+            if overrides.opcache_validate_timestamps {
+                1
+            } else {
+                0
+            }
+        ));
         ini.push_str("opcache.revalidate_freq=0\n");
         ini.push_str("opcache.save_comments=1\n");
         // SHM mode: bytecode stays in shared memory (fastest for long-running process).

@@ -1435,7 +1435,12 @@ fn cmd_serve(
 
             if is_thread_mode {
                 // Thread mode: spawn persistent workers as OS threads (ZTS required)
-                match pool.spawn_persistent_workers_threaded(&app_root_str, w_boot, w_handler, w_cleanup) {
+                match pool.spawn_persistent_workers_threaded(
+                    &app_root_str,
+                    w_boot,
+                    w_handler,
+                    w_cleanup,
+                ) {
                     Ok(()) => {
                         info!(
                             workers = pool.worker_count(),
