@@ -362,18 +362,26 @@ make_caddyfile() {
         echo "    auto_https off"
         echo "    admin off"
         echo "    order php_server before file_server"
+        echo "    frankenphp {"
         if [[ -n "$worker_script" ]]; then
             # Worker mode: declare worker in global frankenphp block
             # (matches proven local config in dev/laravel-test/Caddyfile.worker)
-            echo "    frankenphp {"
             echo "        worker ${worker_script} ${num_threads}"
-            echo "    }"
         else
             # Non-worker mode: limit PHP threads to N
-            echo "    frankenphp {"
             echo "        num_threads ${num_threads}"
-            echo "    }"
         fi
+        echo "        # Match Turbine OPcache+JIT settings for fair comparison"
+        echo "        php_ini opcache.enable              1"
+        echo "        php_ini opcache.memory_consumption  128"
+        echo "        php_ini opcache.interned_strings_buffer 16"
+        echo "        php_ini opcache.max_accelerated_files 10000"
+        echo "        php_ini opcache.validate_timestamps 0"
+        echo "        php_ini opcache.revalidate_freq     0"
+        echo "        php_ini opcache.save_comments       1"
+        echo "        php_ini opcache.jit                 function"
+        echo "        php_ini opcache.jit_buffer_size     64M"
+        echo "    }"
         echo "}"
         echo "http://:80 {"
         echo "    root * ${root}"

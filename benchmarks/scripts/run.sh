@@ -387,29 +387,34 @@ for W in 4 8; do
 done
 
 # ─── Laravel ─────────────────────────────────────────────────────────────────
-log "==> Scenario: Laravel (JSON endpoint)"
+log "==> Scenario: Laravel (GET /, GET /user/:id, POST /user)"
 for W in 4 8; do
     for P in "" "-p"; do
         KEY="turbine_nts_${W}w${P//-/_}"
+        BENCH_LUA_SCRIPT="$WRK_LUA_FRAMEWORK"
         save_result laravel "$KEY" \
             "$(bench_container "nts${P}/${W}w/laravel" "$TURBINE_IMAGE_NTS" "/" \
                 -v /var/www/laravel:/var/www/html \
                 -v "/etc/turbine/laravel-nts-${W}w${P}.toml:/var/www/html/turbine.toml:ro")"
     done
+    BENCH_LUA_SCRIPT="$WRK_LUA_FRAMEWORK"
     save_result laravel "turbine_zts_${W}w" \
         "$(bench_container "zts/${W}w/laravel" "$TURBINE_IMAGE_ZTS" "/" \
             -v /var/www/laravel:/var/www/html \
             -v "/etc/turbine/laravel-zts-${W}w.toml:/var/www/html/turbine.toml:ro")"
+    BENCH_LUA_SCRIPT="$WRK_LUA_FRAMEWORK"
     save_result laravel "frankenphp_${W}w" \
         "$(bench_container "frankenphp/${W}w/laravel" "$FRANKENPHP_IMAGE" "/" \
             -e SERVER_NAME=:80 \
             -v /var/www/laravel:/app \
             -v "/etc/frankenphp/laravel-${W}w.Caddyfile:/etc/caddy/Caddyfile")"
+    BENCH_LUA_SCRIPT="$WRK_LUA_FRAMEWORK"
     save_result laravel "frankenphp_${W}w_worker" \
         "$(bench_container "frankenphp/${W}w-worker/laravel" "$FRANKENPHP_IMAGE" "/" \
             -e SERVER_NAME=:80 \
             -v /var/www/laravel:/app \
             -v "/etc/frankenphp/laravel-${W}w-worker.Caddyfile:/etc/caddy/Caddyfile")"
+    BENCH_LUA_SCRIPT="$WRK_LUA_FRAMEWORK"
     save_result laravel "nginx_fpm_${W}w" \
         "$(bench_container "fpm/${W}w/laravel" "$FPM_IMAGE" "/" \
             -e WORKERS=${W} \

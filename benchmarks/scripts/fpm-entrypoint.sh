@@ -24,12 +24,28 @@ php_admin_value[memory_limit]               = 256M
 php_admin_value[opcache.memory_consumption] = 128
 php_admin_value[opcache.enable]             = 1
 php_admin_value[opcache.validate_timestamps]= 0
+php_admin_value[opcache.interned_strings_buffer] = 16
+php_admin_value[opcache.max_accelerated_files]   = 10000
+php_admin_value[opcache.revalidate_freq]         = 0
+php_admin_value[opcache.save_comments]           = 1
+php_admin_value[opcache.jit]                     = function
+php_admin_value[opcache.jit_buffer_size]         = 64M
 EOF
 
 # ── Fix permissions for Laravel (storage + bootstrap/cache need to be writable) ──
 if [ -d /var/www/html/storage ]; then
     chown -R www-data:www-data /var/www/html/storage /var/www/html/bootstrap/cache 2>/dev/null || true
     chmod -R ug+rw /var/www/html/storage /var/www/html/bootstrap/cache 2>/dev/null || true
+fi
+
+# ── Laravel runtime optimisation (config:cache + route:cache) ───────────────────
+# Paths are correct inside the container (/var/www/html) so caching works here.
+if [ -f /var/www/html/artisan ]; then
+    echo "[fpm-entry] Detected Laravel — running config:cache + route:cache" >&2
+    cd /var/www/html
+    php artisan config:cache 2>&1 >&2 || true
+    php artisan route:cache  2>&1 >&2 || true
+    cd /
 fi
 
 # ── Inject document root into Nginx config ─────────────────────────────────────
