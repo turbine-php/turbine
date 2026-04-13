@@ -8,6 +8,7 @@ worker_mode = "process"
 persistent_workers = true
 worker_boot = "turbine-boot.php"
 worker_handler = "turbine-handler.php"
+worker_cleanup = "turbine-cleanup.php"
 request_timeout = 30
 worker_max_requests = 10000
 channel_capacity = 64

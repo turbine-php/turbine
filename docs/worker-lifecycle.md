@@ -32,6 +32,7 @@ bindings across thousands of requests.
 persistent_workers = true
 worker_boot = "turbine-boot.php"       # path to boot script (relative to app root)
 worker_handler = "turbine-handler.php"  # path to per-request handler
+worker_cleanup = "turbine-cleanup.php"  # path to cleanup script (runs after each request)
 worker_max_requests = 10000            # recycle workers periodically
 ```
 
@@ -40,6 +41,7 @@ worker_max_requests = 10000            # recycle workers periodically
 | `persistent_workers` | Yes | Must be `true` to enable persistent mode |
 | `worker_boot` | No* | PHP script executed **once** per worker at startup |
 | `worker_handler` | No* | PHP script included on **every request** |
+| `worker_cleanup` | Recommended | PHP script executed **after every request** to reset state |
 | `worker_max_requests` | Recommended | Recycle workers after N requests (prevents state accumulation) |
 
 \* Both `worker_boot` and `worker_handler` must be set together.
@@ -77,6 +79,8 @@ worker_handler = "config/turbine/handler.php"
 │    │   → rearm $_GET, $_POST, $_SERVER, $_COOKIE │      │
 │    │ include 'worker_handler'                    │      │
 │    │   → dispatch request through booted app     │      │
+│    │ include 'worker_cleanup'   (if configured)  │      │
+│    │   → reset session, auth, scoped instances   │      │
 │    │ turbine_worker_request_shutdown()            │      │
 │    │   → clean up request state, keep app alive  │      │
 │    └─────────────────────────────────────────────┘      │
@@ -256,6 +260,70 @@ $handler($db);
 gc_collect_cycles();
 ```
 
+## Writing Cleanup Scripts
+
+The cleanup script runs **after every request**, after the response is sent but
+before `request_shutdown`. It should reset any framework state that would leak
+between requests — especially authentication, sessions, and scoped services.
+
+Without `worker_cleanup`, auth state, session data, and resolved services persist
+across requests on the same worker, causing bugs like users remaining logged in
+after logout.
+
+### Laravel
+
+```php
+<?php
+// turbine-cleanup.php
+
+$app = $GLOBALS['__turbine_app'];
+
+if (method_exists($app, 'resetScope')) { $app->resetScope(); }
+if (method_exists($app, 'forgetScopedInstances')) { $app->forgetScopedInstances(); }
+
+if ($app->resolved('session')) {
+    try {
+        $session = $app->make('session')->driver();
+        $session->flush();
+        $session->regenerate();
+    } catch (\Throwable $e) {}
+}
+
+$app->forgetInstance('session.store');
+
+if ($app->resolved('auth.driver')) { $app->forgetInstance('auth.driver'); }
+if ($app->resolved('auth')) { $app->make('auth')->forgetGuards(); }
+
+\Illuminate\Support\Facades\Facade::clearResolvedInstances();
+```
+
+### Phalcon
+
+```php
+<?php
+// turbine-cleanup.php
+
+$app = $GLOBALS['__turbine_app'];
+
+$app->response->resetHeaders();
+$app->response->setContent('');
+$app->response->setStatusCode(200);
+
+if ($app->getDI()->has('session') && $app->getDI()->get('session')->isStarted()) {
+    $app->getDI()->get('session')->destroy();
+}
+```
+
+### Symfony
+
+```php
+<?php
+// turbine-cleanup.php
+
+// Symfony's kernel->terminate() handles most cleanup.
+// Add explicit resets if your app uses stateful services.
+```
+
 ## Important Considerations
 
 ### State Accumulation
@@ -315,13 +383,15 @@ steps:
 
 1. Create `turbine-boot.php` (see [Laravel example](#laravel) above)
 2. Create `turbine-handler.php` (see [Laravel example](#laravel-1) above)
-3. Add to your `turbine.toml`:
+3. Create `turbine-cleanup.php` (see [Laravel cleanup](#laravel-2) above)
+4. Add to your `turbine.toml`:
 
 ```toml
 [server]
 persistent_workers = true
 worker_boot = "turbine-boot.php"
 worker_handler = "turbine-handler.php"
+worker_cleanup = "turbine-cleanup.php"
 ```
 
 This gives you **the same performance** with explicit, configurable control

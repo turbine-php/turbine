@@ -201,14 +201,19 @@ gc_collect_cycles();
 PHPEOF
 
 # turbine-cleanup.php: runs AFTER every request in persistent mode
-# Clears scoped instances and resolved facades to prevent state leaks
+# Clears session, auth, scoped instances and facades to prevent state leaks
 cat > /var/www/laravel/turbine-cleanup.php << 'PHPEOF'
 <?php
 declare(strict_types=1);
 $app = $GLOBALS['__turbine_app'];
-if (method_exists($app, 'forgetScopedInstances')) {
-    $app->forgetScopedInstances();
+if (method_exists($app, 'resetScope')) { $app->resetScope(); }
+if (method_exists($app, 'forgetScopedInstances')) { $app->forgetScopedInstances(); }
+if ($app->resolved('session')) {
+    try { $s = $app->make('session')->driver(); $s->flush(); $s->regenerate(); } catch (\Throwable $e) {}
 }
+$app->forgetInstance('session.store');
+if ($app->resolved('auth.driver')) { $app->forgetInstance('auth.driver'); }
+if ($app->resolved('auth')) { $app->make('auth')->forgetGuards(); }
 \Illuminate\Support\Facades\Facade::clearResolvedInstances();
 PHPEOF
 

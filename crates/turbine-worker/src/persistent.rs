@@ -448,6 +448,18 @@ pub fn worker_event_loop_persistent(
 
     // Resolve cleanup script path once (used after each request).
     let cleanup_abs = worker_cleanup.map(|s| resolve_worker_script(app_root, s));
+    if let Some(ref path) = cleanup_abs {
+        info!(
+            pid = std::process::id(),
+            path = %path,
+            "Worker cleanup script resolved"
+        );
+    } else {
+        warn!(
+            pid = std::process::id(),
+            "No worker_cleanup configured — cleanup will NOT run"
+        );
+    }
     let cleanup_code = cleanup_abs.as_ref().map(|p| {
         let code = format!("include '{}';", p);
         safe_cstring(code.as_bytes())
@@ -602,10 +614,26 @@ pub fn worker_event_loop_persistent(
 
                 // Run cleanup script (if configured) before request shutdown
                 if let Some(ref c_cleanup) = cleanup_code {
-                    turbine_php_sys::zend_eval_string(
+                    debug!(
+                        pid = std::process::id(),
+                        "Running worker cleanup (lightweight path)"
+                    );
+                    let cleanup_result = turbine_php_sys::zend_eval_string(
                         c_cleanup.as_ptr(),
                         std::ptr::null_mut(),
                         cleanup_eval_name.as_ptr(),
+                    );
+                    if cleanup_result != turbine_php_sys::SUCCESS {
+                        warn!(
+                            pid = std::process::id(),
+                            result = cleanup_result,
+                            "Cleanup script eval FAILED"
+                        );
+                    }
+                } else {
+                    debug!(
+                        pid = std::process::id(),
+                        "No cleanup_code — skipping cleanup"
                     );
                 }
 
@@ -627,10 +655,26 @@ pub fn worker_event_loop_persistent(
 
                 // Run cleanup script (if configured) before request shutdown
                 if let Some(ref c_cleanup) = cleanup_code {
-                    turbine_php_sys::zend_eval_string(
+                    debug!(
+                        pid = std::process::id(),
+                        "Running worker cleanup (full lifecycle path)"
+                    );
+                    let cleanup_result = turbine_php_sys::zend_eval_string(
                         c_cleanup.as_ptr(),
                         std::ptr::null_mut(),
                         cleanup_eval_name.as_ptr(),
+                    );
+                    if cleanup_result != turbine_php_sys::SUCCESS {
+                        warn!(
+                            pid = std::process::id(),
+                            result = cleanup_result,
+                            "Cleanup script eval FAILED (full lifecycle)"
+                        );
+                    }
+                } else {
+                    debug!(
+                        pid = std::process::id(),
+                        "No cleanup_code — skipping cleanup (full lifecycle)"
                     );
                 }
 
