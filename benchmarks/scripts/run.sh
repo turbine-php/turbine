@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # run.sh — Execute all benchmarks and output a single JSON document to stdout.
 #
-# Usage: bash run.sh [version] [image-tag] [connections] [duration]
+# Usage: bash run.sh [version] [php-version] [connections] [duration]
 #
 # Servers compared per scenario:
-#   turbine_nts  — Turbine process mode (NTS Docker image)
-#   turbine_zts  — Turbine thread  mode (ZTS Docker image)
-#   frankenphp   — FrankenPHP (ZTS-based Docker image; NOT used for Phalcon)
-#   nginx_fpm    — Nginx + PHP 8.4-FPM native, with Phalcon extension installed
+#   turbine_nts    — Turbine process mode (NTS Docker image)
+#   turbine_nts_p  — Turbine process mode, persistent workers (NTS Docker image)
+#   turbine_zts    — Turbine thread  mode (ZTS Docker image)
+#   turbine_zts_p  — Turbine thread  mode, persistent workers (ZTS Docker image)
+#   frankenphp     — FrankenPHP (ZTS-based Docker image; NOT used for Phalcon)
+#   nginx_fpm      — Nginx + PHP-FPM native, with Phalcon extension installed
 #
 # HTTP metrics: req/s, latency p50/p99/max (wrk + Lua JSON)
 # System metrics: avg CPU%, peak memory MiB (docker stats streaming)
@@ -15,7 +17,7 @@
 set -euo pipefail
 
 VERSION="${1:-dev}"
-IMAGE_TAG="${2:-latest}"
+PHP_VERSION="${2:-8.4}"
 WRK_CONNECTIONS="${3:-256}"
 WRK_DURATION="${4:-30}"
 
@@ -33,17 +35,11 @@ trap 'rm -rf "$RESULTS_DIR"' EXIT
 # save_result <scenario> <key> <json-string>
 save_result() { mkdir -p "${RESULTS_DIR}/${1}"; printf '%s' "${3}" > "${RESULTS_DIR}/${1}/${2}.json"; }
 
-# Resolve Docker image names
-if echo "$IMAGE_TAG" | grep -qE "nts|zts"; then
-    TURBINE_IMAGE_NTS="katisuhara/turbine-php:${IMAGE_TAG}"
-    TURBINE_IMAGE_ZTS="katisuhara/turbine-php:${IMAGE_TAG/nts/zts}"
-else
-    TURBINE_IMAGE_NTS="katisuhara/turbine-php:${IMAGE_TAG}-php8.4-nts"
-    TURBINE_IMAGE_ZTS="katisuhara/turbine-php:${IMAGE_TAG}-php8.4-zts"
-fi
+# Resolve Docker image names from PHP version
+TURBINE_IMAGE_NTS="katisuhara/turbine-php:latest-php${PHP_VERSION}-nts"
+TURBINE_IMAGE_ZTS="katisuhara/turbine-php:latest-php${PHP_VERSION}-zts"
 FRANKENPHP_IMAGE="dunglas/frankenphp:latest"
-FPM_IMAGE="bench-fpm:latest"   # locally built nginx+php8.4-fpm+phalcon image
-# Note: FrankenPHP is ZTS-based. Phalcon is NOT supported on FrankenPHP.
+FPM_IMAGE="bench-fpm:latest"   # locally built nginx+php-fpm+phalcon image
 
 log() { echo "[bench] $*" >&2; }
 
@@ -329,10 +325,13 @@ for W in 4 8; do
                 -v /var/www/raw:/var/www/html \
                 -v "/etc/turbine/raw-nts-${W}w${P}.toml:/var/www/html/turbine.toml:ro")"
     done
-    save_result raw_php "turbine_zts_${W}w" \
-        "$(bench_container "zts/${W}w/raw" "$TURBINE_IMAGE_ZTS" "/" \
-            -v /var/www/raw:/var/www/html \
-            -v "/etc/turbine/raw-zts-${W}w.toml:/var/www/html/turbine.toml:ro")"
+    for P in "" "-p"; do
+        KEY="turbine_zts_${W}w${P//-/_}"
+        save_result raw_php "$KEY" \
+            "$(bench_container "zts${P}/${W}w/raw" "$TURBINE_IMAGE_ZTS" "/" \
+                -v /var/www/raw:/var/www/html \
+                -v "/etc/turbine/raw-zts-${W}w${P}.toml:/var/www/html/turbine.toml:ro")"
+    done
     save_result raw_php "frankenphp_${W}w" \
         "$(bench_container "frankenphp/${W}w/raw" "$FRANKENPHP_IMAGE" "/" \
             -e SERVER_NAME=:80 \
@@ -361,11 +360,14 @@ for W in 4 8; do
                 -v "/etc/turbine/php-bench-nts-${W}w${P}.toml:/var/www/html/turbine.toml:ro" \
                 -- "${PHP_SCRIPTS[@]}")"
     done
-    save_result php_scripts "turbine_zts_${W}w" \
-        "$(bench_php_scripts "zts/${W}w/php-bench" "$TURBINE_IMAGE_ZTS" \
-            -v /var/www/php-bench:/var/www/html \
-            -v "/etc/turbine/php-bench-zts-${W}w.toml:/var/www/html/turbine.toml:ro" \
-            -- "${PHP_SCRIPTS[@]}")"
+    for P in "" "-p"; do
+        KEY="turbine_zts_${W}w${P//-/_}"
+        save_result php_scripts "$KEY" \
+            "$(bench_php_scripts "zts${P}/${W}w/php-bench" "$TURBINE_IMAGE_ZTS" \
+                -v /var/www/php-bench:/var/www/html \
+                -v "/etc/turbine/php-bench-zts-${W}w${P}.toml:/var/www/html/turbine.toml:ro" \
+                -- "${PHP_SCRIPTS[@]}")"
+    done
     save_result php_scripts "frankenphp_${W}w" \
         "$(bench_php_scripts "frankenphp/${W}w/php-bench" "$FRANKENPHP_IMAGE" \
             -e SERVER_NAME=:80 \
@@ -397,11 +399,14 @@ for W in 4 8; do
                 -v /var/www/laravel:/var/www/html \
                 -v "/etc/turbine/laravel-nts-${W}w${P}.toml:/var/www/html/turbine.toml:ro")"
     done
-    BENCH_LUA_SCRIPT="$WRK_LUA_FRAMEWORK"
-    save_result laravel "turbine_zts_${W}w" \
-        "$(bench_container "zts/${W}w/laravel" "$TURBINE_IMAGE_ZTS" "/" \
-            -v /var/www/laravel:/var/www/html \
-            -v "/etc/turbine/laravel-zts-${W}w.toml:/var/www/html/turbine.toml:ro")"
+    for P in "" "-p"; do
+        KEY="turbine_zts_${W}w${P//-/_}"
+        BENCH_LUA_SCRIPT="$WRK_LUA_FRAMEWORK"
+        save_result laravel "$KEY" \
+            "$(bench_container "zts${P}/${W}w/laravel" "$TURBINE_IMAGE_ZTS" "/" \
+                -v /var/www/laravel:/var/www/html \
+                -v "/etc/turbine/laravel-zts-${W}w${P}.toml:/var/www/html/turbine.toml:ro")"
+    done
     BENCH_LUA_SCRIPT="$WRK_LUA_FRAMEWORK"
     save_result laravel "frankenphp_${W}w" \
         "$(bench_container "frankenphp/${W}w/laravel" "$FRANKENPHP_IMAGE" "/" \
@@ -436,11 +441,14 @@ for W in 4 8; do
                 -v /var/www/phalcon:/var/www/html \
                 -v "/etc/turbine/phalcon-nts-${W}w${P}.toml:/var/www/html/turbine.toml:ro")"
     done
-    BENCH_LUA_SCRIPT="$WRK_LUA_FRAMEWORK"
-    save_result phalcon "turbine_zts_${W}w" \
-        "$(bench_container "zts/${W}w/phalcon" "$TURBINE_IMAGE_ZTS" "/" \
-            -v /var/www/phalcon:/var/www/html \
-            -v "/etc/turbine/phalcon-zts-${W}w.toml:/var/www/html/turbine.toml:ro")"
+    for P in "" "-p"; do
+        KEY="turbine_zts_${W}w${P//-/_}"
+        BENCH_LUA_SCRIPT="$WRK_LUA_FRAMEWORK"
+        save_result phalcon "$KEY" \
+            "$(bench_container "zts${P}/${W}w/phalcon" "$TURBINE_IMAGE_ZTS" "/" \
+                -v /var/www/phalcon:/var/www/html \
+                -v "/etc/turbine/phalcon-zts-${W}w${P}.toml:/var/www/html/turbine.toml:ro")"
+    done
     BENCH_LUA_SCRIPT="$WRK_LUA_FRAMEWORK"
     save_result phalcon "nginx_fpm_${W}w" \
         "$(bench_container "fpm/${W}w/phalcon" "$FPM_IMAGE" "/" \
@@ -463,6 +471,7 @@ SERVER_ORDER = [
     'turbine_nts_4w',        'turbine_nts_8w',
     'turbine_nts_4w_p',      'turbine_nts_8w_p',
     'turbine_zts_4w',        'turbine_zts_8w',
+    'turbine_zts_4w_p',      'turbine_zts_8w_p',
     'frankenphp_4w',         'frankenphp_8w',
     'frankenphp_4w_worker',  'frankenphp_8w_worker',
     'nginx_fpm_4w',          'nginx_fpm_8w',
@@ -477,10 +486,10 @@ SCENARIO_META = {
         'scripts': ['html_50k.php', 'pdf_50k.php', 'random_50k.php'],
     },
     'laravel': {
-        'description': 'Laravel 13 — mixed routes: GET /, GET /user/:id, POST /user (no database)',
+        'description': 'Laravel 13 — mixed JSON routes: GET /, GET /user/:id, POST /user (stateless, no database)',
     },
     'phalcon': {
-        'description': 'Phalcon Micro — mixed routes: GET /, GET /user/:id, POST /user',
+        'description': 'Phalcon Micro — mixed JSON routes: GET /, GET /user/:id, POST /user',
         'note': 'FrankenPHP excluded — Phalcon is incompatible with FrankenPHP (ZTS threading)',
     },
 }
@@ -501,6 +510,7 @@ for sname, meta in SCENARIO_META.items():
 doc = {
     'version': '${VERSION}',
     'date':    '${BENCH_DATE}',
+    'php_version': '${PHP_VERSION}',
     'server':  'Hetzner CCX33 (8 vCPU dedicated / 32 GB RAM / NVMe)',
     'tool':    'wrk',
     'images': {

@@ -76,6 +76,8 @@ SERVER_LABELS = {
     "turbine_nts_8w_p":     "Turbine NTS · 8w · persistent",
     "turbine_zts_4w":       "Turbine ZTS · 4w",
     "turbine_zts_8w":       "Turbine ZTS · 8w",
+    "turbine_zts_4w_p":     "Turbine ZTS · 4w · persistent",
+    "turbine_zts_8w_p":     "Turbine ZTS · 8w · persistent",
     "frankenphp_4w":        "FrankenPHP (ZTS) · 4w",
     "frankenphp_8w":        "FrankenPHP (ZTS) · 8w",
     "frankenphp_4w_worker": "FrankenPHP (ZTS) · 4w · worker",
@@ -88,6 +90,7 @@ SERVER_ORDER = [
     "turbine_nts_4w",       "turbine_nts_8w",
     "turbine_nts_4w_p",     "turbine_nts_8w_p",
     "turbine_zts_4w",       "turbine_zts_8w",
+    "turbine_zts_4w_p",     "turbine_zts_8w_p",
     "frankenphp_4w",        "frankenphp_8w",
     "frankenphp_4w_worker", "frankenphp_8w_worker",
     "nginx_fpm_4w",         "nginx_fpm_8w",
@@ -177,6 +180,7 @@ def render_report(data: dict, version: str, date: str) -> str:
 
     nts_img = images.get("turbine_nts", "")
     zts_img = images.get("turbine_zts", "")
+    php_ver = data.get("php_version", "")
 
     lines = [
         "# Turbine Benchmark Results",
@@ -185,6 +189,7 @@ def render_report(data: dict, version: str, date: str) -> str:
         f"|---|---|",
         f"| **Version** | {version} |",
         f"| **Date** | {date} |",
+        f"| **PHP** | {php_ver} |",
         f"| **Server** | {server} |",
         f"| **Tool** | [{tool}](https://github.com/wg/wrk) |",
         f"| **Parameters** | {duration}s · {conns} connections |",
@@ -195,7 +200,9 @@ def render_report(data: dict, version: str, date: str) -> str:
         f"| **Turbine ZTS image** | `{zts_img}` |",
         "",
         "> **Baseline**: Nginx + PHP-FPM · 8 workers.",
-        "> **Persistent**: PHP worker process stays alive across requests (same as FrankenPHP worker mode).",
+        "> **NTS**: Non-thread-safe PHP — process mode (fork per worker).",
+        "> **ZTS**: Thread-safe PHP — thread mode (shared memory, lock-free dispatch).",
+        "> **Persistent**: PHP worker stays alive across requests (bootstrap once, handle many).",
         "> **FrankenPHP** uses ZTS PHP internally and does **not** support Phalcon.",
         "> All servers (including FPM) run inside Docker containers for equal overhead.",
         "> CPU and memory metrics are collected via `docker stats --no-stream` during benchmark.",

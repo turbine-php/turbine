@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # setup.sh — One-time server setup on Hetzner CCX33 (Ubuntu 24.04)
 #
+# Usage: bash setup.sh [php_version]
+#   php_version — PHP major version, e.g. 8.4 or 8.5 (default: 8.4)
+#
 # Strategy:
 #   - ALL servers run inside Docker containers — equal overhead, fair comparison
 #   - Turbine NTS/ZTS and FrankenPHP use published Docker Hub images
@@ -10,8 +13,10 @@
 
 set -euo pipefail
 
-TURBINE_IMAGE_NTS="katisuhara/turbine-php:latest-php8.4-nts"
-TURBINE_IMAGE_ZTS="katisuhara/turbine-php:latest-php8.4-zts"
+PHP_VERSION="${1:-8.4}"
+
+TURBINE_IMAGE_NTS="katisuhara/turbine-php:latest-php${PHP_VERSION}-nts"
+TURBINE_IMAGE_ZTS="katisuhara/turbine-php:latest-php${PHP_VERSION}-zts"
 FRANKENPHP_IMAGE="dunglas/frankenphp:latest"
 PHALCON_VERSION="5.11.1"
 WRK_VERSION="master"
@@ -84,13 +89,17 @@ cat > /var/www/phalcon/index.php << 'PHPEOF'
 use Phalcon\Mvc\Micro;
 $app = new Micro();
 $app->get('/', function () {
-    http_response_code(200);
+    header('Content-Type: application/json');
+    echo json_encode(['status' => 'ok', 'framework' => 'Phalcon', 'php' => PHP_VERSION]);
 });
 $app->get('/user/{id}', function ($id) {
-    echo $id;
+    header('Content-Type: application/json');
+    echo json_encode(['id' => (int) $id, 'name' => 'User ' . $id, 'email' => 'user' . $id . '@example.com']);
 });
 $app->post('/user', function () {
-    http_response_code(200);
+    header('Content-Type: application/json');
+    http_response_code(201);
+    echo json_encode(['status' => 'created', 'id' => random_int(1, 100000)]);
 });
 $app->handle($_SERVER['REQUEST_URI'] ?? '/');
 PHPEOF
@@ -119,13 +128,14 @@ sed -i 's/DB_CONNECTION=.*/DB_CONNECTION=sqlite/'        /var/www/laravel/.env
 touch /var/www/laravel/database/database.sqlite
 
 # Standard benchmark routes: GET /, GET /user/:id, POST /user
+# Routes return JSON with meaningful bodies so benchmarks measure real work.
 cat > /var/www/laravel/routes/web.php << 'PHPEOF'
 <?php
 use Illuminate\Support\Facades\Route;
 
-Route::get('/', fn() => response('', 200));
-Route::get('/user/{id}', fn(string $id) => response($id, 200));
-Route::post('/user', fn() => response('', 200));
+Route::get('/', fn() => response()->json(['status' => 'ok', 'framework' => 'Laravel', 'php' => PHP_VERSION]));
+Route::get('/user/{id}', fn(string $id) => response()->json(['id' => (int) $id, 'name' => 'User ' . $id, 'email' => 'user' . $id . '@example.com']));
+Route::post('/user', fn() => response()->json(['status' => 'created', 'id' => random_int(1, 100000)], 201));
 PHPEOF
 
 # Override bootstrap/app.php — strip session/CSRF middleware for stateless benchmark
@@ -260,6 +270,7 @@ for W in 4 8; do
         make_turbine_toml /etc/turbine/${APP}-nts-${W}w.toml   ${W} process false
         make_turbine_toml /etc/turbine/${APP}-nts-${W}w-p.toml ${W} process true
         make_turbine_toml /etc/turbine/${APP}-zts-${W}w.toml   ${W} thread  false
+        make_turbine_toml /etc/turbine/${APP}-zts-${W}w-p.toml ${W} thread  true
     done
 
     # Laravel — needs [sandbox] for framework detection and full app dir
@@ -269,11 +280,13 @@ for W in 4 8; do
     make_turbine_toml /etc/turbine/laravel-nts-${W}w.toml   ${W} process false "[]" "$LARAVEL_INI" "" "$LARAVEL_SANDBOX"
     make_turbine_toml /etc/turbine/laravel-nts-${W}w-p.toml ${W} process true  "[]" "$LARAVEL_INI" "$LARAVEL_BOOT" "$LARAVEL_SANDBOX"
     make_turbine_toml /etc/turbine/laravel-zts-${W}w.toml   ${W} thread  false "[]" "$LARAVEL_INI" "" "$LARAVEL_SANDBOX"
+    make_turbine_toml /etc/turbine/laravel-zts-${W}w-p.toml ${W} thread  true  "[]" "$LARAVEL_INI" "$LARAVEL_BOOT" "$LARAVEL_SANDBOX"
 
     # Phalcon (requires phalcon extension)
     make_turbine_toml /etc/turbine/phalcon-nts-${W}w.toml   ${W} process false '["phalcon.so"]'
     make_turbine_toml /etc/turbine/phalcon-nts-${W}w-p.toml ${W} process true  '["phalcon.so"]'
     make_turbine_toml /etc/turbine/phalcon-zts-${W}w.toml   ${W} thread  false '["phalcon.so"]'
+    make_turbine_toml /etc/turbine/phalcon-zts-${W}w-p.toml ${W} thread  true  '["phalcon.so"]'
 done
 
 # ── 8. FrankenPHP worker scripts ──────────────────────────────────────────────
@@ -338,13 +351,17 @@ cat > /var/www/phalcon/public/worker.php << 'PHPEOF'
 use Phalcon\Mvc\Micro;
 $app = new Micro();
 $app->get('/', static function (): void {
-    http_response_code(200);
+    header('Content-Type: application/json');
+    echo json_encode(['status' => 'ok', 'framework' => 'Phalcon', 'php' => PHP_VERSION]);
 });
 $app->get('/user/{id}', static function ($id): void {
-    echo $id;
+    header('Content-Type: application/json');
+    echo json_encode(['id' => (int) $id, 'name' => 'User ' . $id, 'email' => 'user' . $id . '@example.com']);
 });
 $app->post('/user', static function (): void {
-    http_response_code(200);
+    header('Content-Type: application/json');
+    http_response_code(201);
+    echo json_encode(['status' => 'created', 'id' => random_int(1, 100000)]);
 });
 $handler = static function () use ($app): void {
     $app->handle($_SERVER['REQUEST_URI'] ?? '/');

@@ -9,10 +9,10 @@ on:
         description: "Version label for results (e.g. v0.2.0 or 'dev')."
         required: false
         default: "dev"
-      image_tag:
-        description: "Docker image tag to benchmark (e.g. latest-php8.4-nts). Leave blank to use 'latest'."
+      php_version:
+        description: "PHP major version to benchmark (e.g. 8.4, 8.5). Both NTS and ZTS images will be tested."
         required: false
-        default: "latest"
+        default: "8.4"
       connections:
         description: "Number of concurrent connections for wrk."
         required: false
@@ -49,16 +49,16 @@ jobs:
         id: meta
         run: |
           TAG="${{ github.event.inputs.tag || github.event.release.tag_name || 'dev' }}"
-          IMAGE_TAG="${{ github.event.inputs.image_tag || 'latest' }}"
-          CONNECTIONS="${{ github.event.inputs.connections || '100' }}"
+          PHP_VERSION="${{ github.event.inputs.php_version || '8.4' }}"
+          CONNECTIONS="${{ github.event.inputs.connections || '256' }}"
           DURATION="${{ github.event.inputs.duration || '30' }}"
           COMMIT="${{ github.event.inputs.commit_results || 'true' }}"
-          echo "tag=${TAG}"                >> "$GITHUB_OUTPUT"
-          echo "image_tag=${IMAGE_TAG}"    >> "$GITHUB_OUTPUT"
-          echo "connections=${CONNECTIONS}" >> "$GITHUB_OUTPUT"
-          echo "duration=${DURATION}"      >> "$GITHUB_OUTPUT"
-          echo "commit=${COMMIT}"          >> "$GITHUB_OUTPUT"
-          echo "date=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}"                  >> "$GITHUB_OUTPUT"
+          echo "php_version=${PHP_VERSION}"  >> "$GITHUB_OUTPUT"
+          echo "connections=${CONNECTIONS}"   >> "$GITHUB_OUTPUT"
+          echo "duration=${DURATION}"        >> "$GITHUB_OUTPUT"
+          echo "commit=${COMMIT}"            >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y-%m-%d)"   >> "$GITHUB_OUTPUT"
 
       - name: Generate SSH keypair
         run: ssh-keygen -t ed25519 -f /tmp/bench_key -N ""
@@ -125,7 +125,7 @@ jobs:
         run: |
           ssh -o StrictHostKeyChecking=no -i /tmp/bench_key \
             "root@${{ steps.server.outputs.ip }}" \
-            "bash /root/bench/setup.sh 2>&1"
+            "bash /root/bench/setup.sh '${{ steps.meta.outputs.php_version }}' 2>&1"
 
       - name: Run benchmarks
         run: |
@@ -133,7 +133,7 @@ jobs:
             "root@${{ steps.server.outputs.ip }}" \
             "bash /root/bench/run.sh \
               '${{ steps.meta.outputs.tag }}' \
-              '${{ steps.meta.outputs.image_tag }}' \
+              '${{ steps.meta.outputs.php_version }}' \
               '${{ steps.meta.outputs.connections }}' \
               '${{ steps.meta.outputs.duration }}'" \
             > /tmp/bench-results.json
