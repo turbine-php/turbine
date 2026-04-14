@@ -147,8 +147,9 @@ jobs:
           WORKERS="${{ steps.meta.outputs.workers }}"
           IP="${{ steps.server.outputs.ip }}"
 
-          ssh -o StrictHostKeyChecking=no -i /tmp/bench_key "root@${IP}" bash -s << VERIFY_SCRIPT > /tmp/verify-results.json 2> /tmp/verify-log.txt
-          set -euo pipefail
+          SSH_EXIT=0
+          ssh -o StrictHostKeyChecking=no -i /tmp/bench_key "root@${IP}" bash -s << VERIFY_SCRIPT > /tmp/verify-results.json 2> /tmp/verify-log.txt || SSH_EXIT=$?
+          set -uo pipefail
 
           CONN="${CONN}"
           DUR="${DUR}"
@@ -289,15 +290,15 @@ jobs:
                   # Phase 1: uniqueness via curl samples (sequential for reliability)
                   local sample_dir=\$(mktemp -d)
                   for i in \$(seq 1 \${SAMPLES}); do
-                      curl -s --max-time 5 -H "X-Request-Token: s-\${i}" "\$url" > "\${sample_dir}/\${i}.txt" 2>/dev/null
+                      curl -s --max-time 5 -H "X-Request-Token: s-\${i}" "\$url" > "\${sample_dir}/\${i}.txt" 2>/dev/null || true
                   done
 
-                  # Capture first sample for diagnostics (included in results JSON)
-                  local sample_response=""
+                  # Capture first sample for diagnostics (logged to stderr)
                   if [[ -s "\${sample_dir}/1.txt" ]]; then
-                      sample_response=\$(head -c 300 "\${sample_dir}/1.txt" | tr '"' "'" | tr '\n' ' ')
+                      echo "[verify]     Sample 1 (\${script}): \$(head -c 200 \${sample_dir}/1.txt)" >&2
+                  else
+                      echo "[verify]     Sample 1 (\${script}): EMPTY" >&2
                   fi
-                  echo "[verify]     Sample 1 (\${script}): \${sample_response:0:200}" >&2
 
                   local empty=0
                   for f in "\${sample_dir}"/*.txt; do
@@ -346,12 +347,8 @@ jobs:
                   [[ \$hash_tolerance -lt 5 ]] && hash_tolerance=5
                   [[ "\$script" == "verify_compute.php" && "\$hash_invalid" -gt "\$hash_tolerance" ]] && phase1_pass="false"
 
-                  # Escape sample_response for JSON
-                  local safe_sample=\$(echo "\$sample_response" | sed 's/\\/\\\\/g; s/"/\\"/g' | head -c 200)
-                  local safe_hash_err=\$(echo "\$hash_first_err" | sed 's/\\/\\\\/g; s/"/\\"/g' | head -c 200)
-
-                  test_results+=("\$(printf '{"script":"%s","samples":%d,"unique_bodies":%d,"duplicates":%d,"empty":%d,"hash_invalid":%d,"phase1_pass":%s,"wrk":%s,"sample_response":"%s","hash_first_err":"%s"}' \
-                      "\$script" "\${SAMPLES}" "\$unique_bodies" "\$duplicates" "\$empty" "\$hash_invalid" "\$phase1_pass" "\$wrk_json" "\$safe_sample" "\$safe_hash_err")")
+                  test_results+=("\$(printf '{"script":"%s","samples":%d,"unique_bodies":%d,"duplicates":%d,"empty":%d,"hash_invalid":%d,"phase1_pass":%s,"wrk":%s}' \
+                      "\$script" "\${SAMPLES}" "\$unique_bodies" "\$duplicates" "\$empty" "\$hash_invalid" "\$phase1_pass" "\$wrk_json")")
 
                   # Log summary
                   local rps=\$(echo "\$wrk_json" | python3 -c "import sys,json; print(json.load(sys.stdin).get('rps',0))" 2>/dev/null || echo 0)
@@ -409,10 +406,14 @@ jobs:
           echo "[{\"meta\":{\"php_version\":\"\${PHP_VERSION}\",\"connections\":\${CONN},\"duration\":\${DUR},\"samples\":\${SAMPLES},\"workers\":\${WORKERS}},\"results\":[\${JOINED%,}]}]"
           VERIFY_SCRIPT
 
-          echo "--- Verify log ---"
-          cat /tmp/verify-log.txt
-          echo "--- Verify results ---"
-          cat /tmp/verify-results.json
+          echo "--- Verify log (stderr from remote) ---"
+          cat /tmp/verify-log.txt || true
+          echo "--- Verify results (stdout from remote) ---"
+          cat /tmp/verify-results.json || true
+          echo "---"
+          if [[ \$SSH_EXIT -ne 0 ]]; then
+            echo "::warning::SSH command exited with code ${SSH_EXIT}"
+          fi
 
       - name: Generate summary
         if: always() && steps.verify.outcome != 'skipped'
@@ -480,25 +481,11 @@ jobs:
                       total_pass += 1
                   else:
                       total_fail += 1
-                      # Collect diagnostic info for failed tests
-                      diag = f"**{label} / {t['script']}**"
-                      sr = t.get("sample_response", "")
-                      he = t.get("hash_first_err", "")
-                      if sr:
-                          diag += f"\n- Sample: `{sr[:200]}`"
-                      if he:
-                          diag += f"\n- Hash error: `{he[:200]}`"
-                      diagnostics.append(diag)
                   out(f"| {t['script']} | {rps:,} | {p50:.1f} ms | {p99:.1f} ms | {samples} | {unique} | {dups} | {hinv} | {icon} |")
               out()
 
           out(f"---\n**Total: {total_pass} passed, {total_fail} failed**\n")
-
-          if diagnostics:
-              out("### Diagnostics (failed tests)\n")
-              for d in diagnostics:
-                  out(d)
-                  out()
+          out("*Check the `Run verification benchmark` step logs for detailed sample responses and hash error diagnostics.*\n")
 
           if summary_file:
               with open(summary_file, "a") as f:
