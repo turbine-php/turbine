@@ -100,9 +100,7 @@ impl SecurityLayer {
     pub fn check_input(&self, ip: IpAddr, params: &[(&str, &str)]) -> Verdict {
         if !self.config.enabled {
             return Verdict::Allow;
-        }
-
-        // 1. Behaviour guard — rate limit + scanning detection (cheapest)
+        }        // 1. Behaviour guard — rate limit + scanning detection (cheapest)
         if self.config.behaviour_guard {
             let bv = self.behaviour_guard.check_request(ip);
             if bv.is_blocked() {
@@ -136,6 +134,22 @@ impl SecurityLayer {
 
         debug!(ip = %ip, params = params.len(), "Input checks passed");
         Verdict::Allow
+    }
+
+    /// Returns `true` if `check_input` actually scans parameter values.
+    /// When this is `false`, callers can skip the work of building a
+    /// `Vec<(&str,&str)>` of params entirely (a hot-path allocation
+    /// otherwise paid by every request).
+    #[inline]
+    pub fn needs_input_scan(&self) -> bool {
+        self.config.enabled && (self.config.sql_guard || self.config.code_injection_guard)
+    }
+
+    /// Returns `true` if the behaviour guard is active.  Cheap per-IP check
+    /// that does not depend on params.
+    #[inline]
+    pub fn needs_behaviour_check(&self) -> bool {
+        self.config.enabled && self.config.behaviour_guard
     }
 
     /// Record a completed request (for behaviour tracking).

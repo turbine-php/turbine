@@ -13,3 +13,4 @@ nix = { workspace = true }
 libc = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "net", "rt"] }

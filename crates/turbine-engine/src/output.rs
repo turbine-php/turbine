@@ -154,14 +154,24 @@ pub fn clear_output_buffer() {
     RESPONSE_CODE.with(|rc| *rc.borrow_mut() = 200);
 }
 
-/// Take the accumulated output, leaving the buffer empty.
+/// Take the accumulated output, leaving the buffer empty but with its
+/// previously-grown capacity preserved.  Using `split_off(0)` instead of
+/// `mem::take` keeps the 4 KB (or larger) backing allocation alive across
+/// requests — avoids a realloc cycle on every hot request.
 pub fn take_output() -> Vec<u8> {
-    OUTPUT_BUFFER.with(|buf| std::mem::take(&mut *buf.borrow_mut()))
+    OUTPUT_BUFFER.with(|buf| {
+        let mut b = buf.borrow_mut();
+        b.split_off(0)
+    })
 }
 
-/// Take the accumulated HTTP headers, leaving the buffer empty.
+/// Take the accumulated HTTP headers, leaving the buffer empty but keeping
+/// its capacity (typical responses reuse ~8-16 header slots).
 pub fn take_headers() -> Vec<(String, String)> {
-    HEADER_BUFFER.with(|buf| std::mem::take(&mut *buf.borrow_mut()))
+    HEADER_BUFFER.with(|buf| {
+        let mut b = buf.borrow_mut();
+        b.split_off(0)
+    })
 }
 
 /// Get the HTTP response status code set by PHP.

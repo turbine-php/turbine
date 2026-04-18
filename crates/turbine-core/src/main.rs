@@ -20,9 +20,7 @@ use turbine_cache::{CacheConfig, ResponseCache};
 use turbine_engine::{PhpEngine, PhpIniOverrides};
 use turbine_metrics::MetricsCollector;
 use turbine_security::{BehaviourConfig, SecurityConfig as SecConfig, SecurityLayer};
-use turbine_worker::persistent::{
-    decode_response, encode_request, read_ready_signal, PersistentRequest,
-};
+use turbine_worker::persistent::{encode_request, read_ready_signal, PersistentRequest};
 use turbine_worker::pool::{
     read_native_response_from_fd, worker_event_loop_channel, worker_event_loop_native, PoolConfig,
     WorkerMode, WorkerPool,
@@ -493,6 +491,31 @@ impl ThreadDispatch {
         }
     }
 
+    /// Bulk-refresh all worker fds.  Called by the background reaper after
+    /// dead workers have been respawned so the dispatch uses up-to-date
+    /// pipe fds instead of the stale ones left behind by the dead PIDs.
+    /// If `new_fds` has more entries than before (scale-up) the extra
+    /// workers are added to the idle pool.  Shrinks are not applied here
+    /// (handled by shrink_one).
+    fn refresh_fds(&self, new_fds: Vec<(std::os::unix::io::RawFd, std::os::unix::io::RawFd)>) {
+        let prev_len = {
+            let mut fds = self.worker_fds.write();
+            let prev = fds.len();
+            *fds = new_fds;
+            prev
+        };
+        let new_len = self.worker_fds.read().len();
+        if new_len > prev_len {
+            // Newly added workers — make them idle and grow the semaphore.
+            let mut q = self.idle_queue.lock();
+            for i in prev_len..new_len {
+                q.push_back(i);
+            }
+            drop(q);
+            self.idle_sem.add_permits(new_len - prev_len);
+        }
+    }
+
     /// Send a request payload to worker `idx` via in-memory channel.
     fn send_request(&self, idx: usize, payload: Vec<u8>) -> Result<(), String> {
         self.request_txs[idx]
@@ -557,6 +580,11 @@ struct ServerState {
     pid_file: Option<String>,
     /// Temporary directory for file uploads.
     upload_tmp_dir: String,
+    /// Maximum accepted request body size in bytes (derived from
+    /// `php.post_max_size`). Requests exceeding this receive HTTP 413
+    /// before the body is read — DoS protection against huge uploads.
+    /// `None` = no limit.
+    max_body_bytes: Option<usize>,
     /// Sandbox: execution mode ("strict" or "framework").
     execution_mode: String,
     /// Sandbox: whitelist of executable PHP files (strict mode).
@@ -1593,19 +1621,31 @@ fn cmd_serve(
             }
         }
 
-        // Build lock-free ThreadDispatch for thread mode.
-        // For channel mode (non-persistent + thread), the dispatch was already
-        // built by spawn_channel_workers.  For persistent + thread, we fall back
-        // to the pipe-based dispatch.
+        // Build lock-free ThreadDispatch for ALL pipe-based worker modes.
+        //
+        // Originally only the thread-mode workers used `ThreadDispatch` to
+        // escape the per-request `pool_mutex.lock()`.  Process-mode workers
+        // went through the pool mutex in the hot path which serialised
+        // dispatch across all cores.  We now build a pipe-based dispatch
+        // for process mode too.
+        //
+        // For channel mode (non-persistent + thread), the dispatch was
+        // already built by `spawn_channel_workers`.
+        //
+        // NOTE: recycle-by-max_requests is not enforced in the dispatch hot
+        // path.  The background reaper task (spawned below) periodically
+        // reaps dead workers and respawns them; for max_requests-based
+        // recycling in process mode the operator should prefer shorter
+        // worker lifetimes via OS signals or external supervision.  Thread
+        // mode has the same behaviour, so this does not regress any
+        // existing promise.
         let thread_dispatch: Option<Arc<ThreadDispatch>> =
             if let Some(td) = thread_dispatch_prebuilt.take() {
                 Some(Arc::new(td))
-            } else if is_thread_mode {
-                // Persistent workers — use pipe fds
+            } else {
+                // Both thread and process pipe-based modes use pipe fds.
                 let fds = pool.worker_fds();
                 Some(Arc::new(ThreadDispatch::new(fds)))
-            } else {
-                None
             };
 
         let state = Arc::new(ServerState {
@@ -1623,6 +1663,7 @@ fn cmd_serve(
             cors: config.cors.clone(),
             pid_file: config.server.pid_file.clone(),
             upload_tmp_dir: config.php.upload_tmp_dir.clone(),
+            max_body_bytes: parse_php_size(&config.php.post_max_size),
             execution_mode: config.sandbox.execution_mode.clone(),
             execution_whitelist,
             data_directories: data_directories.clone(),
@@ -1679,6 +1720,60 @@ fn cmd_serve(
                 acme::spawn_renewal_task(acme_config, tokens);
             });
         }
+
+        // Spawn a background reaper task that keeps the worker pool healthy
+        // and the lock-free `ThreadDispatch` in sync with pipe fds.  This is
+        // required now that ALL modes go through the dispatch (the mutex-
+        // path reap-on-timeout is no longer on the hot path).
+        if let (Some(td), true) = (state.thread_dispatch.clone(), state.worker_pool.is_some()) {
+            let reaper_state = state.clone();
+            rt.spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+                interval.set_missed_tick_behavior(
+                    tokio::time::MissedTickBehavior::Skip,
+                );
+                loop {
+                    interval.tick().await;
+                    // Cold path: lock the pool briefly to reap+respawn
+                    // dead workers, then sync dispatch fds.
+                    let pm = match reaper_state.worker_pool.as_ref() {
+                        Some(pm) => pm,
+                        None => break,
+                    };
+                    let new_fds = {
+                        let mut pool = pm.lock();
+                        if reaper_state.persistent_workers {
+                            if reaper_state.worker_mode == WorkerMode::Thread {
+                                let _ = pool.reap_and_respawn_persistent_threaded(
+                                    &reaper_state.persistent_app_root,
+                                    reaper_state.worker_boot.as_deref(),
+                                    reaper_state.worker_handler.as_deref(),
+                                    reaper_state.worker_cleanup.as_deref(),
+                                );
+                            } else {
+                                let _ = pool.reap_and_respawn_persistent(
+                                    &reaper_state.persistent_app_root,
+                                    reaper_state.worker_boot.as_deref(),
+                                    reaper_state.worker_handler.as_deref(),
+                                    reaper_state.worker_cleanup.as_deref(),
+                                );
+                            }
+                        } else if reaper_state.worker_mode == WorkerMode::Thread {
+                            let _ = pool.reap_and_respawn_threaded(
+                                turbine_worker::pool::worker_event_loop_native,
+                            );
+                        } else {
+                            let _ = pool.reap_and_respawn(
+                                turbine_worker::pool::worker_event_loop_native,
+                            );
+                        }
+                        pool.worker_fds()
+                    };
+                    td.refresh_fds(new_fds);
+                }
+            });
+        }
+
         rt.block_on(run_hyper_server(state, &listen, tls_acceptor));
     } else {
         // --- Single-process mode: PHP on a dedicated thread, hyper for HTTP ---
@@ -1702,6 +1797,7 @@ fn cmd_serve(
             cors: config.cors.clone(),
             pid_file: config.server.pid_file.clone(),
             upload_tmp_dir: config.php.upload_tmp_dir.clone(),
+            max_body_bytes: parse_php_size(&config.php.post_max_size),
             execution_mode: config.sandbox.execution_mode.clone(),
             execution_whitelist,
             data_directories,
@@ -1877,7 +1973,7 @@ fn build_tls_acceptor_with_sni(
         for (domain, vcert_path, vkey_path) in vhost_certs {
             let (certs, key) = load_cert_key(vcert_path, vkey_path);
             let signing_key =
-                rustls::crypto::ring::sign::any_supported_type(&key).unwrap_or_else(|e| {
+                rustls::crypto::aws_lc_rs::sign::any_supported_type(&key).unwrap_or_else(|e| {
                     error!(domain = %domain, "Failed to load signing key: {e}");
                     std::process::exit(1);
                 });
@@ -1891,7 +1987,7 @@ fn build_tls_acceptor_with_sni(
 
         // Also add the default cert to the SNI resolver as fallback
         let (default_certs, default_key) = load_cert_key(cert_path, key_path);
-        let default_signing = rustls::crypto::ring::sign::any_supported_type(&default_key)
+        let default_signing = rustls::crypto::aws_lc_rs::sign::any_supported_type(&default_key)
             .unwrap_or_else(|e| {
                 error!("Failed to load default signing key: {e}");
                 std::process::exit(1);
@@ -2227,6 +2323,12 @@ async fn run_hyper_server(
                     }
                 };
 
+                // Disable Nagle's algorithm — HTTP/1.1 and HTTP/2 both do their
+                // own batching, and Nagle adds up to ~40ms latency on p99 for
+                // small responses (< MSS).  Matches the defaults used by nginx,
+                // Caddy and hyper's own HTTP/2 stack.
+                let _ = stream.set_nodelay(true);
+
                 let state = state.clone();
                 let tls_acceptor = tls_acceptor.clone();
                 let conns = active_connections.clone();
@@ -2412,12 +2514,19 @@ async fn handle_request(
             let collected = body.collect().await.unwrap_or_default();
             let data = collected.to_bytes();
             if data.len() >= min_size {
-                if let Some((encoding, compressed)) = negotiate_compression(
-                    &accept_encoding,
-                    &state.compression_algorithms,
-                    &data,
-                    level,
-                ) {
+                // Compression (brotli/zstd/gzip) is CPU-bound and on hot
+                // payloads can take several ms.  Run on blocking pool so the
+                // tokio reactor stays free for other connections.
+                let algorithms = state.compression_algorithms.clone();
+                let accept = accept_encoding.clone();
+                let data_for_task = data.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    negotiate_compression(&accept, &algorithms, &data_for_task, level)
+                })
+                .await
+                .unwrap_or(None);
+
+                if let Some((encoding, compressed)) = result {
                     parts
                         .headers
                         .insert("Content-Encoding", encoding.parse().unwrap());
@@ -2542,11 +2651,20 @@ async fn handle_request_inner(
                 remote_addr,
                 &state.upload_tmp_dir,
                 &state.upload_security,
+                Some(8192), // admin endpoint: 8 KB is plenty
             )
             .await
             {
-                Some(pair) => pair,
-                None => {
+                Ok(pair) => pair,
+                Err(compat::RequestBuildError::PayloadTooLarge) => {
+                    return Ok(build_response(
+                        413,
+                        "application/json",
+                        b"{\"error\":\"payload too large\"}".to_vec(),
+                        &[],
+                    ))
+                }
+                Err(_) => {
                     return Ok(build_response(
                         400,
                         "application/json",
@@ -2665,11 +2783,26 @@ async fn handle_request_inner(
         remote_addr,
         &state.upload_tmp_dir,
         &state.upload_security,
+        state.max_body_bytes,
     )
     .await
     {
-        Some(pair) => pair,
-        None => {
+        Ok(pair) => pair,
+        Err(compat::RequestBuildError::PayloadTooLarge) => {
+            state.metrics.record_request(
+                "",
+                413,
+                request_start.elapsed().as_micros() as u64,
+                0,
+            );
+            return Ok(build_response(
+                413,
+                "text/plain",
+                b"Payload Too Large".to_vec(),
+                &[],
+            ));
+        }
+        Err(_) => {
             return Ok(build_response(
                 400,
                 "text/plain",
@@ -2682,40 +2815,57 @@ async fn handle_request_inner(
     debug!(method = %request.method, path = %request.path, "Request received");
 
     let client_ip = remote_addr.ip();
+    // Stringify the client IP once per request — otherwise `client_ip.to_string()`
+    // is called ~13× (access log, metrics, worker envelope, security) causing
+    // that many heap allocations on every hot path.
+    let client_ip_str = client_ip.to_string();
 
-    // Build the list of input parameters to scan for injection patterns.
-    // We include GET query params, POST form params, AND the raw body — this
-    // ensures JSON POST bodies are also covered by the SQL / code injection guards.
-    let query_params = request.get_params();
-    let post_params = request.post_params();
+    // Only build the parameter scan list if a guard will actually look at it.
+    // Laravel/Symfony apps with security disabled (or only behaviour guard on)
+    // were paying a full query+post params parse + raw-body copy + multiple
+    // Vec allocations on every single request for no benefit.
+    let needs_input_scan = state.security.needs_input_scan();
+    let needs_behaviour = state.security.needs_behaviour_check();
 
-    // Raw body scan: treat the first BODY_SCAN_LIMIT bytes as a single parameter so
-    // that JSON-encoded payloads (e.g. {"q":"1 UNION SELECT *"}) are inspected even
-    // when Content-Type is application/json (which post_params() skips).
-    // We cap at 8 KB: injection payloads are always near the beginning; scanning
-    // a multi-MB upload body would waste CPU without any security benefit.
-    const BODY_SCAN_LIMIT: usize = 8192;
-    let raw_body_str = if !request.body.is_empty() && post_params.is_empty() {
-        let slice = &request.body[..request.body.len().min(BODY_SCAN_LIMIT)];
-        // Use from_utf8_lossy — non-UTF-8 bytes become U+FFFD, but patterns won't match them.
-        String::from_utf8_lossy(slice).into_owned()
+    let input_verdict = if needs_input_scan {
+        let query_params = request.get_params();
+        let post_params = request.post_params();
+
+        // Raw body scan: treat the first BODY_SCAN_LIMIT bytes as a single parameter so
+        // that JSON-encoded payloads (e.g. {"q":"1 UNION SELECT *"}) are inspected even
+        // when Content-Type is application/json (which post_params() skips).
+        // We cap at 8 KB: injection payloads are always near the beginning; scanning
+        // a multi-MB upload body would waste CPU without any security benefit.
+        const BODY_SCAN_LIMIT: usize = 8192;
+        let raw_body_str = if !request.body.is_empty() && post_params.is_empty() {
+            let slice = &request.body[..request.body.len().min(BODY_SCAN_LIMIT)];
+            // Use from_utf8_lossy — non-UTF-8 bytes become U+FFFD, but patterns won't match them.
+            String::from_utf8_lossy(slice).into_owned()
+        } else {
+            String::new()
+        };
+
+        let mut all_params: Vec<(String, String)> = Vec::with_capacity(
+            query_params.len() + post_params.len() + if raw_body_str.is_empty() { 0 } else { 1 },
+        );
+        all_params.extend(query_params);
+        all_params.extend(post_params);
+        if !raw_body_str.is_empty() {
+            all_params.push(("_body".to_string(), raw_body_str));
+        }
+
+        let param_refs: Vec<(&str, &str)> = all_params
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+
+        state.security.check_input(client_ip, &param_refs)
+    } else if needs_behaviour {
+        // Only behaviour guard enabled — cheap per-IP check, no param work.
+        state.security.check_input(client_ip, &[])
     } else {
-        String::new()
+        turbine_security::Verdict::Allow
     };
-
-    let mut all_params: Vec<(String, String)> = Vec::with_capacity(
-        query_params.len() + post_params.len() + if raw_body_str.is_empty() { 0 } else { 1 },
-    );
-    all_params.extend(query_params);
-    all_params.extend(post_params);
-    if !raw_body_str.is_empty() {
-        all_params.push(("_body".to_string(), raw_body_str));
-    }
-
-    let param_refs: Vec<(&str, &str)> = all_params
-        .iter()
-        .map(|(k, v)| (k.as_str(), v.as_str()))
-        .collect();
 
     let php_path = app.resolve_path(&request.path);
 
@@ -2767,7 +2917,6 @@ async fn handle_request_inner(
         }
     }
 
-    let input_verdict = state.security.check_input(client_ip, &param_refs);
     if input_verdict.is_blocked() {
         let reason = input_verdict.reason().unwrap_or("blocked");
         warn!(ip = %client_ip, reason = reason, "Request blocked by security layer");
@@ -2862,14 +3011,14 @@ async fn handle_request_inner(
                 .find(|(k, _)| k.eq_ignore_ascii_case("Cookie"))
                 .map(|(_, v)| v.as_str())
                 .unwrap_or("");
-            let document_root = app.document_root.display().to_string();
-            let script_filename = app.document_root.join(&php_path).display().to_string();
+            let document_root = &app.document_root_str;
+            let script_filename = format!("{}/{}", &app.document_root_str, &php_path);
             let script_name = format!("/{}", &php_path);
             let per = PersistentRequest {
                 method: &request.method,
                 uri: full_uri,
                 body: &request.body,
-                client_ip: &client_ip.to_string(),
+                client_ip: &client_ip_str,
                 port: server_port,
                 is_https: state.is_tls,
                 headers: &headers_vec,
@@ -2881,11 +3030,13 @@ async fn handle_request_inner(
                 path_info: &request.path,
                 script_name: &script_name,
             };
-            let encoded = encode_request(&per);
-
             let guard = IdleGuard::new(td.clone(), worker_idx);
             let (cmd_fd, resp_fd) = td.fds(worker_idx);
-            if let Err(e) = write_to_fd(cmd_fd, &encoded) {
+            let write_result = turbine_worker::with_encode_scratch(|buf| {
+                turbine_worker::encode_request_into(buf, &per);
+                write_to_fd(cmd_fd, buf)
+            });
+            if let Err(e) = write_result {
                 error!(worker = worker_idx, error = %e, "Failed to send to persistent worker (thread dispatch)");
                 // guard returns worker on drop
                 return Ok(build_response(
@@ -2896,16 +3047,12 @@ async fn handle_request_inner(
                 ));
             }
 
-            let reader_handle = tokio::spawn(async move {
-                let result = tokio::task::spawn_blocking(move || decode_response(resp_fd))
-                    .await
-                    .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())));
-                result
-            });
-
-            let bin_result = reader_handle
-                .await
-                .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())));
+            // AsyncFd-based read: no spawn_blocking thread consumed.
+            let bin_result: std::io::Result<_> =
+                match turbine_worker::async_io::AsyncPipe::new(resp_fd) {
+                    Ok(mut pipe) => turbine_worker::decode_response_async(&mut pipe).await,
+                    Err(e) => Err(e),
+                };
             drop(guard);
 
             match bin_result {
@@ -2942,7 +3089,7 @@ async fn handle_request_inner(
                         &request.path,
                         status_code,
                         request_start,
-                        &client_ip.to_string(),
+                        &client_ip_str,
                     );
                     let extra_headers: Vec<(&str, &str)> = resp_headers
                         .iter()
@@ -3041,14 +3188,14 @@ async fn handle_request_inner(
                 .find(|(k, _)| k.eq_ignore_ascii_case("Cookie"))
                 .map(|(_, v)| v.as_str())
                 .unwrap_or("");
-            let document_root = app.document_root.display().to_string();
-            let script_filename = app.document_root.join(&php_path).display().to_string();
+            let document_root = &app.document_root_str;
+            let script_filename = format!("{}/{}", &app.document_root_str, &php_path);
             let script_name = format!("/{}", &php_path);
             let per = PersistentRequest {
                 method: &request.method,
                 uri: full_uri,
                 body: &request.body,
-                client_ip: &client_ip.to_string(),
+                client_ip: &client_ip_str,
                 port: server_port,
                 is_https: state.is_tls,
                 headers: &headers_vec,
@@ -3130,9 +3277,11 @@ async fn handle_request_inner(
             let return_state = state.clone();
             let reader_handle = tokio::spawn(async move {
                 let _permit_guard = permit; // Hold permit until task completes
-                let result = tokio::task::spawn_blocking(move || decode_response(resp_fd))
-                    .await
-                    .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())));
+                let result: std::io::Result<_> =
+                    match turbine_worker::async_io::AsyncPipe::new(resp_fd) {
+                        Ok(mut pipe) => turbine_worker::decode_response_async(&mut pipe).await,
+                        Err(e) => Err(e),
+                    };
                 if let Some(ref pool_mutex) = return_state.worker_pool {
                     let mut pool = pool_mutex.lock();
                     if result.is_ok() {
@@ -3201,7 +3350,7 @@ async fn handle_request_inner(
                         &request.path,
                         status_code,
                         request_start,
-                        &client_ip.to_string(),
+                        &client_ip_str,
                     );
 
                     let extra_headers: Vec<(&str, &str)> = resp_headers
@@ -3292,7 +3441,7 @@ async fn handle_request_inner(
     let superglobals = request.php_superglobals_code(
         &app_root,
         &php_path,
-        &client_ip.to_string(),
+        &client_ip_str,
         server_port,
         state.is_tls,
     );
@@ -3348,7 +3497,7 @@ async fn handle_request_inner(
                         &request.path,
                         504,
                         request_start,
-                        &client_ip.to_string(),
+                        &client_ip_str,
                     );
                     return Ok(build_response(
                         504,
@@ -3415,7 +3564,7 @@ async fn handle_request_inner(
                     &request.path,
                     status_code,
                     request_start,
-                    &client_ip.to_string(),
+                    &client_ip_str,
                 );
 
                 let extra_headers: Vec<(&str, &str)> = response
@@ -3523,28 +3672,9 @@ async fn handle_request_inner(
         } else {
             request.body.len() as i32
         };
-        let document_root = app.document_root.display().to_string();
+        let document_root = &app.document_root_str;
         let script_path_native = abs_php_path.display().to_string();
         let script_name = format!("/{}", &php_path);
-
-        let encoded = encode_native_request(
-            &script_path_native,
-            &request.method,
-            full_uri,
-            &request.query_string,
-            content_type_str,
-            content_length,
-            cookie_header,
-            &document_root,
-            &client_ip.to_string(),
-            0,
-            server_port,
-            state.is_tls,
-            &request.path,
-            &script_name,
-            &request.body,
-            &headers_vec,
-        );
 
         // ── Send request and receive response ─────────────────────
         // IdleGuard ensures the worker index returns to idle even if
@@ -3552,7 +3682,25 @@ async fn handle_request_inner(
         let guard = IdleGuard::new(td.clone(), worker_idx);
 
         let native_result: Result<NativeResponse, String> = if td.has_channels() {
-            // In-memory channel IPC (zero syscalls)
+            // In-memory channel IPC (zero syscalls); must own Vec<u8>.
+            let encoded = encode_native_request(
+                &script_path_native,
+                &request.method,
+                full_uri,
+                &request.query_string,
+                content_type_str,
+                content_length,
+                cookie_header,
+                &document_root,
+                &client_ip_str,
+                0,
+                server_port,
+                state.is_tls,
+                &request.path,
+                &script_name,
+                &request.body,
+                &headers_vec,
+            );
             if let Err(e) = td.send_request(worker_idx, encoded) {
                 error!(worker = worker_idx, error = %e, "Channel send failed (thread dispatch)");
                 // guard will return_idle on drop
@@ -3570,7 +3718,29 @@ async fn handle_request_inner(
         } else {
             // Pipe-based IPC (legacy / persistent fallback)
             let (cmd_fd, resp_fd) = td.fds(worker_idx);
-            if let Err(e) = write_to_fd(cmd_fd, &encoded) {
+            let write_result = turbine_worker::with_encode_scratch(|buf| {
+                turbine_worker::encode_native_request_into(
+                    buf,
+                    &script_path_native,
+                    &request.method,
+                    full_uri,
+                    &request.query_string,
+                    content_type_str,
+                    content_length,
+                    cookie_header,
+                    &document_root,
+                    &client_ip_str,
+                    0,
+                    server_port,
+                    state.is_tls,
+                    &request.path,
+                    &script_name,
+                    &request.body,
+                    &headers_vec,
+                );
+                write_to_fd(cmd_fd, buf)
+            });
+            if let Err(e) = write_result {
                 error!(worker = worker_idx, error = %e, "Failed to send to worker (thread dispatch)");
                 return Ok(build_response(
                     502,
@@ -3579,18 +3749,14 @@ async fn handle_request_inner(
                     &[],
                 ));
             }
-            let reader_handle = tokio::spawn(async move {
-                let result =
-                    tokio::task::spawn_blocking(move || read_native_response_from_fd(resp_fd))
-                        .await
-                        .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())));
-                result
-            });
-            // Note: guard (from outer scope) will return_idle when dropped.
-            reader_handle
-                .await
-                .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())))
-                .map_err(|e| e.to_string())
+            // AsyncFd-based read: reactor handles readiness, no blocking
+            // pool thread is consumed per in-flight request.
+            let result: std::io::Result<NativeResponse> =
+                match turbine_worker::async_io::AsyncPipe::new(resp_fd) {
+                    Ok(mut pipe) => turbine_worker::read_native_response_async(&mut pipe).await,
+                    Err(e) => Err(e),
+                };
+            result.map_err(|e| e.to_string())
         };
 
         // Explicitly drop the guard now to return worker to idle pool.
@@ -3637,7 +3803,7 @@ async fn handle_request_inner(
                     &request.path,
                     status_code,
                     request_start,
-                    &client_ip.to_string(),
+                    &client_ip_str,
                 );
                 let extra_headers: Vec<(&str, &str)> = resp_headers
                     .iter()
@@ -3765,14 +3931,14 @@ async fn handle_request_inner(
                         .find(|(k, _)| k.eq_ignore_ascii_case("Cookie"))
                         .map(|(_, v)| v.as_str())
                         .unwrap_or("");
-                    let document_root = app.document_root.display().to_string();
+                    let document_root = &app.document_root_str;
                     let script_filename = abs_php_path.display().to_string();
                     let script_name = format!("/{}", &php_path);
                     let per = PersistentRequest {
                         method: &request.method,
                         uri: full_uri,
                         body: &request.body,
-                        client_ip: &client_ip.to_string(),
+                        client_ip: &client_ip_str,
                         port: server_port,
                         is_https: state.is_tls,
                         headers: &headers_vec,
@@ -3813,7 +3979,7 @@ async fn handle_request_inner(
                     } else {
                         request.body.len() as i32
                     };
-                    let document_root = app.document_root.display().to_string();
+                    let document_root = &app.document_root_str;
                     let script_path_native = abs_php_path.display().to_string();
                     let script_name = format!("/{}", &php_path);
 
@@ -3826,7 +3992,7 @@ async fn handle_request_inner(
                         content_length,
                         cookie_header,
                         &document_root,
-                        &client_ip.to_string(),
+                        &client_ip_str,
                         0, // remote_port
                         server_port,
                         state.is_tls,
@@ -3879,18 +4045,26 @@ async fn handle_request_inner(
         }
         let reader_handle = tokio::spawn(async move {
             let _permit_guard = permit; // Hold permit until task completes
-            let result = if is_persistent {
-                WorkerResult::Persistent(
-                    tokio::task::spawn_blocking(move || decode_response(resp_fd))
-                        .await
-                        .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string()))),
-                )
-            } else {
-                WorkerResult::Native(
-                    tokio::task::spawn_blocking(move || read_native_response_from_fd(resp_fd))
-                        .await
-                        .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string()))),
-                )
+            // AsyncFd-based read: no blocking pool thread consumed per request.
+            let result = match turbine_worker::async_io::AsyncPipe::new(resp_fd) {
+                Ok(mut pipe) => {
+                    if is_persistent {
+                        WorkerResult::Persistent(
+                            turbine_worker::decode_response_async(&mut pipe).await,
+                        )
+                    } else {
+                        WorkerResult::Native(
+                            turbine_worker::read_native_response_async(&mut pipe).await,
+                        )
+                    }
+                }
+                Err(e) => {
+                    if is_persistent {
+                        WorkerResult::Persistent(Err(e))
+                    } else {
+                        WorkerResult::Native(Err(e))
+                    }
+                }
             };
             // Always return the worker after reading
             return_worker_to_pool(&return_state, pool_index, worker_idx);
@@ -3952,7 +4126,7 @@ async fn handle_request_inner(
                         &request.path,
                         status_code,
                         request_start,
-                        &client_ip.to_string(),
+                        &client_ip_str,
                     );
 
                     let extra_headers: Vec<(&str, &str)> = resp_headers
@@ -4042,7 +4216,7 @@ async fn handle_request_inner(
                         &request.path,
                         status_code,
                         request_start,
-                        &client_ip.to_string(),
+                        &client_ip_str,
                     );
 
                     let extra_headers: Vec<(&str, &str)> = resp_headers
@@ -4314,6 +4488,26 @@ fn apply_cors_headers(
     if cors.max_age > 0 {
         headers.insert("Access-Control-Max-Age", cors.max_age.into());
     }
+}
+
+/// Parse PHP-style size strings like "64M", "2G", "128K", "1024" into bytes.
+/// Returns `None` for "0", empty, or unparseable input (= no limit).
+fn parse_php_size(s: &str) -> Option<usize> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() || trimmed == "0" {
+        return None;
+    }
+    let (num_part, mult): (&str, usize) = match trimmed.chars().last() {
+        Some('K') | Some('k') => (&trimmed[..trimmed.len() - 1], 1024),
+        Some('M') | Some('m') => (&trimmed[..trimmed.len() - 1], 1024 * 1024),
+        Some('G') | Some('g') => (&trimmed[..trimmed.len() - 1], 1024 * 1024 * 1024),
+        _ => (trimmed, 1),
+    };
+    num_part
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .and_then(|n| n.checked_mul(mult))
 }
 
 fn build_response(

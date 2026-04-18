@@ -8,7 +8,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use http_body_util::BodyExt;
 use tracing::{info, warn};
 
 /// Upload security configuration passed from the sandbox config.
@@ -81,6 +80,15 @@ pub struct FullHttpRequest {
     pub multipart_post_params: Vec<(String, String)>,
 }
 
+/// Outcome of `FullHttpRequest::from_hyper`.
+#[derive(Debug)]
+pub enum RequestBuildError {
+    /// Malformed request (parsing/body error).
+    BadRequest,
+    /// Request body exceeds the configured `max_body_bytes` limit (413).
+    PayloadTooLarge,
+}
+
 impl FullHttpRequest {
     /// Parse a raw HTTP request from buffered bytes.
     #[allow(dead_code)]
@@ -149,12 +157,19 @@ impl FullHttpRequest {
     }
 
     /// Build a FullHttpRequest from a hyper Request.
+    ///
+    /// `max_body_bytes` caps the accepted request body size (DoS protection).
+    /// `None` = no limit.  If the `Content-Length` header declares a larger
+    /// body, the request is rejected *before* any bytes are read.  For
+    /// chunked/streamed bodies the accumulator is stopped as soon as the
+    /// limit is exceeded.
     pub async fn from_hyper(
         req: hyper::Request<hyper::body::Incoming>,
         remote_addr: std::net::SocketAddr,
         upload_tmp_dir: &str,
         upload_security: &UploadSecurityConfig,
-    ) -> Option<(Self, std::net::SocketAddr)> {
+        max_body_bytes: Option<usize>,
+    ) -> Result<(Self, std::net::SocketAddr), RequestBuildError> {
         let method = req.method().to_string();
         let uri = req.uri().clone();
         let path = uri.path().to_string();
@@ -173,14 +188,47 @@ impl FullHttpRequest {
             .get("content-length")
             .and_then(|v| v.parse::<usize>().ok());
 
+        // Early DoS check: reject before touching the body if the client
+        // declared a Content-Length larger than our configured limit.
+        if let (Some(max), Some(cl)) = (max_body_bytes, content_length) {
+            if cl > max {
+                return Err(RequestBuildError::PayloadTooLarge);
+            }
+        }
+
         let cookies = headers
             .get("cookie")
             .map(|c| parse_cookie_header(c))
             .unwrap_or_default();
 
-        let body = match req.collect().await {
-            Ok(collected) => collected.to_bytes().to_vec(),
-            Err(_) => Vec::new(),
+        // Stream body into a Vec, enforcing max_body_bytes as we go.
+        // This protects against chunked-transfer uploads that never send
+        // Content-Length but slowly exceed the limit.
+        let body = {
+            use http_body_util::BodyExt;
+            let mut incoming = req.into_body();
+            let mut acc: Vec<u8> = if let Some(cl) = content_length {
+                Vec::with_capacity(cl.min(max_body_bytes.unwrap_or(cl)))
+            } else {
+                Vec::new()
+            };
+            loop {
+                match incoming.frame().await {
+                    Some(Ok(frame)) => {
+                        if let Ok(data) = frame.into_data() {
+                            if let Some(max) = max_body_bytes {
+                                if acc.len().saturating_add(data.len()) > max {
+                                    return Err(RequestBuildError::PayloadTooLarge);
+                                }
+                            }
+                            acc.extend_from_slice(&data);
+                        }
+                    }
+                    Some(Err(_)) => return Err(RequestBuildError::BadRequest),
+                    None => break,
+                }
+            }
+            acc
         };
 
         let (files, multipart_post_params) = if let Some(ref ct) = content_type {
@@ -193,7 +241,7 @@ impl FullHttpRequest {
             (Vec::new(), Vec::new())
         };
 
-        Some((
+        Ok((
             Self {
                 method,
                 path,
@@ -641,8 +689,11 @@ impl AppDetector {
                 entry = "public/index.php",
                 "Detected front-controller application (public/index.php)"
             );
+            let doc_root = app_root.join("public");
+            let doc_root_str = doc_root.display().to_string();
             return AppStructure {
-                document_root: app_root.join("public"),
+                document_root: doc_root,
+                document_root_str: doc_root_str,
                 entry_point: "index.php".to_string(),
                 front_controller: true,
                 has_composer,
@@ -662,8 +713,11 @@ impl AppDetector {
                 front_controller = is_front_controller,
                 "Detected application with root index.php"
             );
+            let doc_root = app_root.to_path_buf();
+            let doc_root_str = doc_root.display().to_string();
             return AppStructure {
-                document_root: app_root.to_path_buf(),
+                document_root: doc_root,
+                document_root_str: doc_root_str,
                 entry_point: "index.php".to_string(),
                 front_controller: is_front_controller,
                 has_composer,
@@ -673,8 +727,11 @@ impl AppDetector {
         }
 
         // Fallback: no index.php found
+        let doc_root = app_root.to_path_buf();
+        let doc_root_str = doc_root.display().to_string();
         AppStructure {
-            document_root: app_root.to_path_buf(),
+            document_root: doc_root,
+            document_root_str: doc_root_str,
             entry_point: "index.php".to_string(),
             front_controller: false,
             has_composer: false,
@@ -695,6 +752,10 @@ pub struct AppStructure {
     pub has_composer: bool,
     pub has_env: bool,
     pub autoload_path: Option<PathBuf>,
+    /// Pre-computed `document_root.display().to_string()` — every PHP
+    /// request needs this string for `$_SERVER['DOCUMENT_ROOT']`.  Caching
+    /// it avoids ~N allocations (one per request) on the hot path.
+    pub document_root_str: String,
 }
 
 impl AppStructure {
@@ -962,6 +1023,7 @@ mod tests {
     fn app_structure_resolve_front_controller() {
         let structure = AppStructure {
             document_root: PathBuf::from("/app/public"),
+            document_root_str: "/app/public".to_string(),
             entry_point: "index.php".to_string(),
             front_controller: true,
             has_composer: true,
@@ -979,6 +1041,7 @@ mod tests {
     fn app_structure_resolve_generic() {
         let structure = AppStructure {
             document_root: PathBuf::from("/app"),
+            document_root_str: "/app".to_string(),
             entry_point: "index.php".to_string(),
             front_controller: false,
             has_composer: false,
@@ -998,6 +1061,7 @@ mod tests {
     fn bootstrap_code_with_env_and_autoload() {
         let structure = AppStructure {
             document_root: PathBuf::from("/app/public"),
+            document_root_str: "/app/public".to_string(),
             entry_point: "index.php".to_string(),
             front_controller: true,
             has_composer: true,
@@ -1126,6 +1190,7 @@ mod tests {
     fn execution_whitelist_blocks_non_entry_generic() {
         let structure = AppStructure {
             document_root: PathBuf::from("/app"),
+            document_root_str: "/app".to_string(),
             entry_point: "index.php".to_string(),
             front_controller: false,
             has_composer: false,

@@ -95,6 +95,8 @@ pub struct BehaviourGuard {
     config: BehaviourConfig,
     profiles: DashMap<IpAddr, IpProfile>,
     total_blocked: AtomicU64,
+    /// Soft cap on tracked IPs to bound memory under IP-rotation DoS.
+    max_profiles: usize,
 }
 
 impl BehaviourGuard {
@@ -103,16 +105,31 @@ impl BehaviourGuard {
     }
 
     pub fn with_config(config: BehaviourConfig) -> Self {
+        // Use 8× CPU count as shard count (min 32) to reduce contention
+        // when many IPs map to the same shard under high RPS.
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        let shards = (cpus * 8).next_power_of_two().max(32);
         BehaviourGuard {
             config,
-            profiles: DashMap::with_capacity(256),
+            profiles: DashMap::with_capacity_and_shard_amount(256, shards),
             total_blocked: AtomicU64::new(0),
+            max_profiles: 100_000,
         }
     }
 
     /// Check if a request from this IP should be allowed.
     pub fn check_request(&self, ip: IpAddr) -> Verdict {
         let window = Duration::from_secs(self.config.window_seconds);
+
+        // DoS guard: if the tracked-IP map has grown past the soft cap and
+        // this IP is unknown, don't insert a new profile (allow through).
+        // Legitimate traffic is almost entirely repeat-IPs; rotating-IP
+        // attacks would otherwise exhaust memory.
+        if self.profiles.len() >= self.max_profiles && !self.profiles.contains_key(&ip) {
+            return Verdict::Allow;
+        }
 
         let mut profile = self.profiles.entry(ip).or_insert_with(IpProfile::new);
         profile.maybe_reset_window(window);
@@ -180,6 +197,10 @@ impl BehaviourGuard {
 
     /// Record a SQLi attempt from an IP. Blocks after threshold.
     pub fn record_sqli_attempt(&self, ip: IpAddr) {
+        // Same DoS guard as check_request.
+        if self.profiles.len() >= self.max_profiles && !self.profiles.contains_key(&ip) {
+            return;
+        }
         let mut profile = self.profiles.entry(ip).or_insert_with(IpProfile::new);
         profile.sqli_attempts += 1;
 

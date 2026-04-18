@@ -14,9 +14,17 @@ use crate::worker::{Worker, WorkerState};
 /// Create a CString from bytes, stripping any interior null bytes rather than
 /// silently returning an empty string.  This prevents malicious null-byte
 /// injection from causing silent data loss in FFI calls.
+///
+/// Fast path: the vast majority of inputs (URIs, header names/values, method,
+/// script paths) contain no NUL bytes.  `memchr::memchr` is SIMD-accelerated
+/// via libc and avoids a full copy+filter pass when there are no NULs.
 pub fn safe_cstring(bytes: &[u8]) -> std::ffi::CString {
+    // Fast path — no NUL found, do a single copy via CString::new.
+    if !bytes.contains(&0) {
+        return std::ffi::CString::new(bytes).unwrap_or_default();
+    }
+    // Slow path — strip NULs.
     let cleaned: Vec<u8> = bytes.iter().copied().filter(|&b| b != 0).collect();
-    // After stripping nulls, CString::new cannot fail.
     std::ffi::CString::new(cleaned).unwrap_or_default()
 }
 
@@ -181,6 +189,11 @@ impl WorkerPool {
                     libc::close(cmd_read);
                     libc::close(resp_write);
                 }
+
+                // NOTE: we intentionally leave master-side fds in blocking
+                // mode here.  The initial ready-signal handshake (persistent
+                // workers) relies on blocking `libc::read`.  `AsyncPipe::new`
+                // flips the fd to non-blocking on first async use.
 
                 let worker = Worker::new(child, self.config.max_requests, cmd_write, resp_read);
 
@@ -1373,7 +1386,80 @@ impl NativeRequest {
     }
 }
 
-/// Encode a native request for the binary protocol.
+/// Encode a native request into the given buffer (cleared first).
+/// Hot-path variant: reuses caller-provided `Vec<u8>` to avoid allocations.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_native_request_into(
+    msg: &mut Vec<u8>,
+    script_path: &str,
+    method: &str,
+    uri: &str,
+    query_string: &str,
+    content_type: &str,
+    content_length: i32,
+    cookie: &str,
+    document_root: &str,
+    remote_addr: &str,
+    remote_port: u16,
+    server_port: u16,
+    is_https: bool,
+    path_info: &str,
+    script_name: &str,
+    body: &[u8],
+    headers: &[(&str, &str)],
+) {
+    msg.clear();
+
+    // Reserve: cmd(1) + total_len(4) + conservative payload estimate
+    let est = 1 + 4 + 256 + body.len()
+        + script_path.len() + uri.len() + query_string.len()
+        + document_root.len() + remote_addr.len()
+        + headers.iter().map(|(k, v)| k.len() + v.len() + 4).sum::<usize>();
+    msg.reserve(est);
+
+    // Prepend cmd byte and placeholder for total length; we'll patch length at the end.
+    msg.push(WorkerCmd::ExecuteNative as u8);
+    msg.extend_from_slice(&[0u8; 4]);
+    let payload_start = msg.len();
+
+    let write_str = |buf: &mut Vec<u8>, s: &str| {
+        buf.extend_from_slice(&(s.len() as u16).to_le_bytes());
+        buf.extend_from_slice(s.as_bytes());
+    };
+
+    write_str(msg, script_path);
+    write_str(msg, method);
+    write_str(msg, uri);
+    write_str(msg, query_string);
+    write_str(msg, content_type);
+    msg.extend_from_slice(&content_length.to_le_bytes());
+    write_str(msg, cookie);
+    write_str(msg, document_root);
+    write_str(msg, remote_addr);
+    msg.extend_from_slice(&remote_port.to_le_bytes());
+    msg.extend_from_slice(&server_port.to_le_bytes());
+    msg.push(is_https as u8);
+    write_str(msg, path_info);
+    write_str(msg, script_name);
+
+    // Body
+    msg.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    msg.extend_from_slice(body);
+
+    // Headers
+    msg.extend_from_slice(&(headers.len() as u16).to_le_bytes());
+    for (k, v) in headers {
+        write_str(msg, k);
+        write_str(msg, v);
+    }
+
+    // Patch total payload length
+    let payload_len = (msg.len() - payload_start) as u32;
+    msg[1..5].copy_from_slice(&payload_len.to_le_bytes());
+}
+
+/// Encode a native request for the binary protocol (allocating).
+/// Kept for tests and non-hot-path callers.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_native_request(
     script_path: &str,
@@ -1393,44 +1479,12 @@ pub fn encode_native_request(
     body: &[u8],
     headers: &[(&str, &str)],
 ) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(1024);
-
-    let write_str = |buf: &mut Vec<u8>, s: &str| {
-        buf.extend_from_slice(&(s.len() as u16).to_le_bytes());
-        buf.extend_from_slice(s.as_bytes());
-    };
-
-    write_str(&mut buf, script_path);
-    write_str(&mut buf, method);
-    write_str(&mut buf, uri);
-    write_str(&mut buf, query_string);
-    write_str(&mut buf, content_type);
-    buf.extend_from_slice(&content_length.to_le_bytes());
-    write_str(&mut buf, cookie);
-    write_str(&mut buf, document_root);
-    write_str(&mut buf, remote_addr);
-    buf.extend_from_slice(&remote_port.to_le_bytes());
-    buf.extend_from_slice(&server_port.to_le_bytes());
-    buf.push(is_https as u8);
-    write_str(&mut buf, path_info);
-    write_str(&mut buf, script_name);
-
-    // Body
-    buf.extend_from_slice(&(body.len() as u32).to_le_bytes());
-    buf.extend_from_slice(body);
-
-    // Headers
-    buf.extend_from_slice(&(headers.len() as u16).to_le_bytes());
-    for (k, v) in headers {
-        write_str(&mut buf, k);
-        write_str(&mut buf, v);
-    }
-
-    // Prepend cmd byte + total length
-    let mut msg = Vec::with_capacity(1 + 4 + buf.len());
-    msg.push(WorkerCmd::ExecuteNative as u8);
-    msg.extend_from_slice(&(buf.len() as u32).to_le_bytes());
-    msg.extend_from_slice(&buf);
+    let mut msg = Vec::with_capacity(1024);
+    encode_native_request_into(
+        &mut msg, script_path, method, uri, query_string, content_type,
+        content_length, cookie, document_root, remote_addr, remote_port,
+        server_port, is_https, path_info, script_name, body, headers,
+    );
     msg
 }
 
@@ -1533,6 +1587,80 @@ pub fn read_native_response_from_fd(resp_fd: RawFd) -> std::io::Result<NativeRes
         headers,
         body,
     })
+}
+
+/// Async variant of `read_native_response_from_fd` — reads from an
+/// `AsyncRead` source so the caller can await the pipe without spending
+/// a `spawn_blocking` thread per in-flight request.
+pub async fn read_native_response_async<R>(r: &mut R) -> std::io::Result<NativeResponse>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let mut status_buf = [0u8; 1];
+    r.read_exact(&mut status_buf).await?;
+    let success = status_buf[0] == WorkerResp::Ok as u8 || status_buf[0] == WorkerResp::Ready as u8;
+
+    let mut http_buf = [0u8; 2];
+    r.read_exact(&mut http_buf).await?;
+    let http_status = u16::from_le_bytes(http_buf);
+
+    let mut hcount_buf = [0u8; 2];
+    r.read_exact(&mut hcount_buf).await?;
+    let header_count = u16::from_le_bytes(hcount_buf) as usize;
+
+    let mut headers = Vec::with_capacity(header_count);
+    for _ in 0..header_count {
+        let mut kl = [0u8; 2];
+        r.read_exact(&mut kl).await?;
+        let key_len = u16::from_le_bytes(kl) as usize;
+        let mut key = vec![0u8; key_len];
+        if key_len > 0 {
+            r.read_exact(&mut key).await?;
+        }
+
+        let mut vl = [0u8; 2];
+        r.read_exact(&mut vl).await?;
+        let val_len = u16::from_le_bytes(vl) as usize;
+        let mut val = vec![0u8; val_len];
+        if val_len > 0 {
+            r.read_exact(&mut val).await?;
+        }
+
+        headers.push((
+            String::from_utf8_lossy(&key).into_owned(),
+            String::from_utf8_lossy(&val).into_owned(),
+        ));
+    }
+
+    let mut blen = [0u8; 4];
+    r.read_exact(&mut blen).await?;
+    let body_len = u32::from_le_bytes(blen) as usize;
+    let mut body = vec![0u8; body_len];
+    if body_len > 0 {
+        r.read_exact(&mut body).await?;
+    }
+
+    Ok(NativeResponse {
+        success,
+        http_status,
+        headers,
+        body,
+    })
+}
+
+/// Async write-all to a non-blocking fd registered with the tokio reactor.
+///
+/// Callers must have flipped the fd to non-blocking (via
+/// `async_io::set_nonblocking`) before calling this; otherwise writes will
+/// park the tokio worker thread on a short kernel buffer.
+pub async fn write_to_fd_async(
+    pipe: &mut crate::async_io::AsyncPipe,
+    data: &[u8],
+) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    pipe.write_all(data).await
 }
 
 /// Read a worker response directly from a raw resp_fd WITHOUT holding any lock.

@@ -163,32 +163,61 @@ fn read_bytes_fd(fd: RawFd) -> io::Result<Vec<u8>> {
 // Public encoding / decoding API
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Encode a `PersistentRequest` into the binary wire format.
-pub fn encode_request(req: &PersistentRequest<'_>) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(256 + req.body.len());
+/// Encode a `PersistentRequest` into the given buffer (cleared first).
+/// Hot-path variant: reuses caller-provided `Vec<u8>` to avoid allocations.
+pub fn encode_request_into(buf: &mut Vec<u8>, req: &PersistentRequest<'_>) {
+    buf.clear();
+    buf.reserve(256 + req.body.len());
 
-    write_u8(&mut buf, 0x01); // HandleRequest command
-    write_str(&mut buf, req.method);
-    write_str(&mut buf, req.uri);
-    write_bytes(&mut buf, req.body);
-    write_str(&mut buf, req.client_ip);
-    write_u32_le(&mut buf, req.port as u32);
-    write_u8(&mut buf, u8::from(req.is_https));
-    write_u32_le(&mut buf, req.headers.len() as u32);
+    write_u8(buf, 0x01); // HandleRequest command
+    write_str(buf, req.method);
+    write_str(buf, req.uri);
+    write_bytes(buf, req.body);
+    write_str(buf, req.client_ip);
+    write_u32_le(buf, req.port as u32);
+    write_u8(buf, u8::from(req.is_https));
+    write_u32_le(buf, req.headers.len() as u32);
     for (name, value) in req.headers {
-        write_str(&mut buf, name);
-        write_str(&mut buf, value);
+        write_str(buf, name);
+        write_str(buf, value);
     }
     // Extended fields for native SAPI execution
-    write_str(&mut buf, req.script_filename);
-    write_str(&mut buf, req.query_string);
-    write_str(&mut buf, req.document_root);
-    write_str(&mut buf, req.content_type);
-    write_str(&mut buf, req.cookie);
-    write_str(&mut buf, req.path_info);
-    write_str(&mut buf, req.script_name);
+    write_str(buf, req.script_filename);
+    write_str(buf, req.query_string);
+    write_str(buf, req.document_root);
+    write_str(buf, req.content_type);
+    write_str(buf, req.cookie);
+    write_str(buf, req.path_info);
+    write_str(buf, req.script_name);
+}
 
+/// Encode a `PersistentRequest` into the binary wire format (allocating).
+/// Kept for tests and non-hot-path callers.
+pub fn encode_request(req: &PersistentRequest<'_>) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(256 + req.body.len());
+    encode_request_into(&mut buf, req);
     buf
+}
+
+thread_local! {
+    static ENCODE_SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Run `f` with access to a per-thread reusable scratch buffer.
+/// The buffer is cleared before use; if it has grown beyond 1 MiB it is
+/// reset to release memory (bounded to keep RSS stable).
+pub fn with_encode_scratch<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut Vec<u8>) -> R,
+{
+    ENCODE_SCRATCH.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        if guard.capacity() > 1024 * 1024 {
+            *guard = Vec::with_capacity(512);
+        }
+        guard.clear();
+        f(&mut guard)
+    })
 }
 
 /// Decode a `PersistentResponse` from the worker's resp pipe (blocking).
@@ -212,6 +241,42 @@ pub fn decode_response(resp_fd: RawFd) -> io::Result<PersistentResponse> {
     }
 
     let body = read_bytes_fd(resp_fd)?;
+    Ok(PersistentResponse {
+        status,
+        headers,
+        body,
+    })
+}
+
+/// Async version of `decode_response` — reads from an `AsyncRead` source
+/// (typically an `AsyncPipe` wrapping the resp fd).  Used by the request
+/// handler to avoid spending a `spawn_blocking` thread per in-flight
+/// request.
+pub async fn decode_response_async<R>(r: &mut R) -> io::Result<PersistentResponse>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use crate::async_io::{read_bytes_async, read_string_async, read_u16_le_async, read_u32_le_async, read_u8_async};
+
+    let _marker = read_u8_async(r).await?;
+    let status = read_u16_le_async(r).await?;
+    let hdr_count = read_u32_le_async(r).await?;
+
+    if hdr_count > 256 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("decode_response_async: invalid header_count={hdr_count} — pipe desynced"),
+        ));
+    }
+
+    let mut headers = Vec::with_capacity(hdr_count as usize);
+    for _ in 0..hdr_count {
+        let name = read_string_async(r).await?;
+        let value = read_string_async(r).await?;
+        headers.push((name, value));
+    }
+
+    let body = read_bytes_async(r).await?;
     Ok(PersistentResponse {
         status,
         headers,
@@ -445,6 +510,15 @@ pub fn worker_event_loop_persistent(
     } else {
         None
     };
+    // Pre-build the C string for the handler path once per worker.
+    // This avoids allocating + formatting + re-parsing an "include '...';"
+    // wrapper string through zend_eval_string on every request — that
+    // wrapper was bypassing OPcache for the outer eval. We now call
+    // turbine_execute_script() (which uses php_execute_script + OPcache)
+    // directly on the handler path.
+    let c_handler_path = handler_abs
+        .as_ref()
+        .map(|p| safe_cstring(p.as_bytes()));
 
     // Resolve cleanup script path once (used after each request).
     let cleanup_abs = worker_cleanup.map(|s| resolve_worker_script(app_root, s));
@@ -593,20 +667,17 @@ pub fn worker_event_loop_persistent(
             );
 
             let (result, body, headers, status) = if lightweight {
-                // ── Lightweight path: include worker_handler per request ──
+                // ── Lightweight path: execute worker_handler directly via OPcache ──
                 turbine_php_sys::turbine_worker_request_startup();
 
                 output::install_output_capture();
                 output::clear_output_buffer();
 
-                let handler_code = format!("include '{}';", handler_abs.as_ref().unwrap());
-                let c_handler = safe_cstring(handler_code.as_bytes());
-                let eval_name = safe_cstring(b"turbine_worker_handler");
-                let r = turbine_php_sys::zend_eval_string(
-                    c_handler.as_ptr(),
-                    std::ptr::null_mut(),
-                    eval_name.as_ptr(),
-                );
+                // Use turbine_execute_script (php_execute_script) so the handler
+                // goes straight through OPcache without being re-parsed every
+                // request as an eval'd wrapper string.
+                let handler_ptr = c_handler_path.as_ref().unwrap().as_ptr();
+                let r = turbine_php_sys::turbine_execute_script(handler_ptr);
 
                 let b = output::take_output();
                 let h = output::take_headers();
