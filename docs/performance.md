@@ -84,6 +84,79 @@ OPcache is configured for maximum performance:
 - `file_cache = /tmp/turbine-opcache` — L2 disk cache for warm restarts
 - `jit = function` — JIT compiles hot functions to native code
 
+#### JIT tuning (PHP 8.0+)
+
+`jit_buffer_size` controls how much memory the JIT gets for native code.
+Tune based on framework size:
+
+| Workload                         | Recommended            |
+|:---------------------------------|:-----------------------|
+| Simple API / microservice         | `"32M"` (default)      |
+| Laravel / Symfony / WordPress     | `"128M"`               |
+| Data crunching / template engines | `"256M"` + `jit=tracing` |
+
+`jit = tracing` (the full tracing JIT) is significantly faster than the
+default `function` mode for CPU-bound PHP (template engines, ORM query
+builders, compute loops) — expect **2-3× speed-up** on arithmetic-heavy
+code. It costs a bit more memory and has a warm-up period where it
+discovers hot traces, which is why you typically combine it with
+**preload** so the warm-up runs at boot instead of at first request.
+
+#### OPcache preload
+
+Preload lets PHP parse + link every class in a framework **once, at
+master boot**, before any `fork()`. Combined with Turbine's CoW worker
+model this means:
+
+- All workers share **one physical copy** of Laravel's class graph —
+  RSS per worker drops 30-50 %.
+- First-request latency drops dramatically. On Laravel, cold boot goes
+  from ~80 ms → ~5 ms per request because routing, middleware, and
+  container reflection are already linked.
+- JIT tracing has time to warm up during preload instead of burning
+  CPU on the first real user's request.
+
+Turbine auto-detects the following files at startup (in order):
+
+1. `vendor/preload.php`
+2. `preload.php`
+3. `config/preload.php`
+
+To point at a custom location:
+
+```toml
+[php]
+preload_script = "bootstrap/preload.php"
+```
+
+A minimal Laravel preload file:
+
+```php
+<?php
+$root = __DIR__ . '/..';
+require $root . '/vendor/autoload.php';
+
+$classes = [
+    // Framework core — adjust to your app's hot classes
+    \Illuminate\Foundation\Application::class,
+    \Illuminate\Http\Request::class,
+    \Illuminate\Http\Response::class,
+    \Illuminate\Routing\Router::class,
+    \Illuminate\Routing\UrlGenerator::class,
+    \Illuminate\Container\Container::class,
+    \Illuminate\Database\Eloquent\Model::class,
+    \Illuminate\View\Factory::class,
+];
+
+foreach ($classes as $cls) {
+    opcache_compile_file((new ReflectionClass($cls))->getFileName());
+}
+```
+
+> **Caveat:** preload requires `opcache.validate_timestamps = 0`. Code
+> changes to preloaded files require a full restart — which is already
+> how Turbine deploys work (`SIGHUP` or systemd restart).
+
 ### Response Cache
 
 For endpoints that return the same content:
@@ -185,3 +258,53 @@ level = "warn"
 [watcher]
 enabled = false
 ```
+
+## Advanced / experimental
+
+### CPU pinning (Linux only)
+
+```toml
+[server]
+pin_workers = true
+```
+
+Binds each worker to a fixed logical core (`worker_N → core N % ncpus`).
+Wins come from avoiding the scheduler bouncing hot PHP processes
+between cores, which invalidates L2/L3 caches and OPcache hot pages.
+
+Only enable when all of these are true:
+- Running on a **dedicated host** (no noisy neighbours).
+- `worker_count ≤ physical_core_count` (oversubscription negates the win).
+- Workload is latency-sensitive (tail latency matters more than throughput).
+
+No-op on macOS and in environments that don't allow `sched_setaffinity`
+(most cgroup-restricted containers).
+
+### IRQ affinity (sysadmin, outside Turbine)
+
+For the extreme end: route the NIC interrupt to cores that do NOT run
+PHP workers. On a 16-core host you might reserve cores 0-1 for IRQs +
+tokio reactor, cores 2-15 for `pin_workers`.
+
+```bash
+# Example: move ethN interrupts to cores 0-1
+echo 3 | sudo tee /proc/irq/$(grep ethN /proc/interrupts | awk -F: '{print $1}' | tr -d ' ')/smp_affinity
+```
+
+Combine with `isolcpus=2-15` on the kernel boot line to fully isolate
+worker cores from general-purpose scheduling. Typical gain on latency
+p99: **30-50%**. This is stock ScyllaDB / Redis-Benchmark tuning.
+
+### io_uring backend (stub — not yet active)
+
+Turbine's `io-uring` Cargo feature compiles a placeholder module but
+does **not** yet replace the epoll-based pipe I/O. The dispatch path
+still uses `tokio::io::unix::AsyncFd` (fast, but does incur a syscall
+per read/write).
+
+A full io_uring backend with `SQPOLL` would eliminate those syscalls
+entirely — Cloudflare Pingora reported ~30 % throughput improvement
+after the same switch. The implementation is non-trivial because
+`tokio-uring` uses completion-based futures that don't freely compose
+with hyper/rustls, so it requires a dedicated runtime on a thread
+isolated from the HTTP reactor. Tracking milestone: Turbine 0.3.
