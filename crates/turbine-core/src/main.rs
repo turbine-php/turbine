@@ -1729,9 +1729,7 @@ fn cmd_serve(
             let reaper_state = state.clone();
             rt.spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
-                interval.set_missed_tick_behavior(
-                    tokio::time::MissedTickBehavior::Skip,
-                );
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
                     interval.tick().await;
                     // Cold path: lock the pool briefly to reap+respawn
@@ -1763,9 +1761,8 @@ fn cmd_serve(
                                 turbine_worker::pool::worker_event_loop_native,
                             );
                         } else {
-                            let _ = pool.reap_and_respawn(
-                                turbine_worker::pool::worker_event_loop_native,
-                            );
+                            let _ = pool
+                                .reap_and_respawn(turbine_worker::pool::worker_event_loop_native);
                         }
                         pool.worker_fds()
                     };
@@ -1972,8 +1969,8 @@ fn build_tls_acceptor_with_sni(
 
         for (domain, vcert_path, vkey_path) in vhost_certs {
             let (certs, key) = load_cert_key(vcert_path, vkey_path);
-            let signing_key =
-                rustls::crypto::aws_lc_rs::sign::any_supported_type(&key).unwrap_or_else(|e| {
+            let signing_key = rustls::crypto::aws_lc_rs::sign::any_supported_type(&key)
+                .unwrap_or_else(|e| {
                     error!(domain = %domain, "Failed to load signing key: {e}");
                     std::process::exit(1);
                 });
@@ -2789,12 +2786,9 @@ async fn handle_request_inner(
     {
         Ok(pair) => pair,
         Err(compat::RequestBuildError::PayloadTooLarge) => {
-            state.metrics.record_request(
-                "",
-                413,
-                request_start.elapsed().as_micros() as u64,
-                0,
-            );
+            state
+                .metrics
+                .record_request("", 413, request_start.elapsed().as_micros() as u64, 0);
             return Ok(build_response(
                 413,
                 "text/plain",
@@ -4044,7 +4038,8 @@ async fn handle_request_inner(
             Native(Result<NativeResponse, std::io::Error>),
         }
         let reader_handle = tokio::spawn(async move {
-            let _permit_guard = permit; // Hold permit until task completes
+            // Hold permit until task completes.
+            let _permit_guard = permit;
             // AsyncFd-based read: no blocking pool thread consumed per request.
             let result = match turbine_worker::async_io::AsyncPipe::new(resp_fd) {
                 Ok(mut pipe) => {

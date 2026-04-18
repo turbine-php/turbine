@@ -100,7 +100,7 @@ impl SecurityLayer {
     pub fn check_input(&self, ip: IpAddr, params: &[(&str, &str)]) -> Verdict {
         if !self.config.enabled {
             return Verdict::Allow;
-        }        // 1. Behaviour guard — rate limit + scanning detection (cheapest)
+        } // 1. Behaviour guard — rate limit + scanning detection (cheapest)
         if self.config.behaviour_guard {
             let bv = self.behaviour_guard.check_request(ip);
             if bv.is_blocked() {

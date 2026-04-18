@@ -8,8 +8,8 @@
 //! - Surgical state reset between HTTP requests
 //! - Persistent PHP worker mode (bootstrap once, handle N requests)
 
-mod error;
 pub mod async_io;
+mod error;
 pub mod persistent;
 pub mod pool;
 mod shared_mem;

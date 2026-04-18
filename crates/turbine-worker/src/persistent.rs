@@ -256,7 +256,9 @@ pub async fn decode_response_async<R>(r: &mut R) -> io::Result<PersistentRespons
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    use crate::async_io::{read_bytes_async, read_string_async, read_u16_le_async, read_u32_le_async, read_u8_async};
+    use crate::async_io::{
+        read_bytes_async, read_string_async, read_u16_le_async, read_u32_le_async, read_u8_async,
+    };
 
     let _marker = read_u8_async(r).await?;
     let status = read_u16_le_async(r).await?;
@@ -516,9 +518,7 @@ pub fn worker_event_loop_persistent(
     // wrapper was bypassing OPcache for the outer eval. We now call
     // turbine_execute_script() (which uses php_execute_script + OPcache)
     // directly on the handler path.
-    let c_handler_path = handler_abs
-        .as_ref()
-        .map(|p| safe_cstring(p.as_bytes()));
+    let c_handler_path = handler_abs.as_ref().map(|p| safe_cstring(p.as_bytes()));
 
     // Resolve cleanup script path once (used after each request).
     let cleanup_abs = worker_cleanup.map(|s| resolve_worker_script(app_root, s));

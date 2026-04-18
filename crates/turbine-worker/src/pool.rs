@@ -1411,10 +1411,19 @@ pub fn encode_native_request_into(
     msg.clear();
 
     // Reserve: cmd(1) + total_len(4) + conservative payload estimate
-    let est = 1 + 4 + 256 + body.len()
-        + script_path.len() + uri.len() + query_string.len()
-        + document_root.len() + remote_addr.len()
-        + headers.iter().map(|(k, v)| k.len() + v.len() + 4).sum::<usize>();
+    let est = 1
+        + 4
+        + 256
+        + body.len()
+        + script_path.len()
+        + uri.len()
+        + query_string.len()
+        + document_root.len()
+        + remote_addr.len()
+        + headers
+            .iter()
+            .map(|(k, v)| k.len() + v.len() + 4)
+            .sum::<usize>();
     msg.reserve(est);
 
     // Prepend cmd byte and placeholder for total length; we'll patch length at the end.
@@ -1481,9 +1490,23 @@ pub fn encode_native_request(
 ) -> Vec<u8> {
     let mut msg = Vec::with_capacity(1024);
     encode_native_request_into(
-        &mut msg, script_path, method, uri, query_string, content_type,
-        content_length, cookie, document_root, remote_addr, remote_port,
-        server_port, is_https, path_info, script_name, body, headers,
+        &mut msg,
+        script_path,
+        method,
+        uri,
+        query_string,
+        content_type,
+        content_length,
+        cookie,
+        document_root,
+        remote_addr,
+        remote_port,
+        server_port,
+        is_https,
+        path_info,
+        script_name,
+        body,
+        headers,
     );
     msg
 }
