@@ -253,8 +253,22 @@ fn write_php_ini(overrides: &PhpIniOverrides) -> std::path::PathBuf {
         info!(zend_extension = %ext, "Zend extension configured");
     }
 
-    // Custom php.ini directives from [php.ini] in turbine.toml
+    // Custom php.ini directives from [php.ini] in turbine.toml.
+    //
+    // Reject `output_buffering` overrides: Turbine's SAPI captures output
+    // via a `ub_write` callback that is only drained during
+    // `php_request_shutdown` when `output_buffering > 0`. A non-zero value
+    // causes large responses (> the buffer size) to be truncated on the
+    // hot path — enforce 0 unconditionally.
     for (key, value) in &overrides.extra_ini {
+        if key.eq_ignore_ascii_case("output_buffering") {
+            warn!(
+                directive = %key,
+                value = %value,
+                "Ignored php.ini override: output_buffering must be 0 under Turbine"
+            );
+            continue;
+        }
         ini.push_str(&format!("{}={}\n", key, value));
         info!(directive = %key, value = %value, "Custom php.ini directive set");
     }
