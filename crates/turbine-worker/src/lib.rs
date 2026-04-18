@@ -21,7 +21,7 @@ pub use persistent::{
     with_encode_scratch, PersistentRequest, PersistentResponse,
 };
 pub use pool::{
-    encode_native_request, encode_native_request_into, read_native_response_async,
+    encode_native_request, encode_native_request_into, pin_to_core, read_native_response_async,
     read_native_response_from_fd, safe_cstring, worker_event_loop_channel, write_to_fd,
     write_to_fd_async, NativeResponse, WorkerMode, WorkerPool,
 };

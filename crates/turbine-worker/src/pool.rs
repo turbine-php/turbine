@@ -66,6 +66,8 @@ pub struct PoolConfig {
     pub max_requests: u64,
     /// Worker backend mode (process or thread).
     pub mode: WorkerMode,
+    /// Pin each worker to a specific CPU core (Linux only, no-op elsewhere).
+    pub pin_workers: bool,
 }
 
 impl Default for PoolConfig {
@@ -78,8 +80,31 @@ impl Default for PoolConfig {
             workers: cpus,
             max_requests: 10_000,
             mode: WorkerMode::Process,
+            pin_workers: false,
         }
     }
+}
+
+/// Pin the calling thread/process to logical CPU `cpu`.  Linux-only;
+/// no-op on macOS and other systems.
+///
+/// Called inside each worker after fork/spawn to reduce cache
+/// thrashing from the scheduler bouncing hot PHP processes across
+/// cores.  Only meaningful when `worker_count ≤ core_count` on a
+/// dedicated host; otherwise disables work stealing for no benefit.
+#[inline]
+pub fn pin_to_core(cpu: usize) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_ZERO(&mut set);
+        libc::CPU_SET(cpu, &mut set);
+        // pid=0 means "current thread" when set via pthread_setaffinity_np,
+        // but sched_setaffinity with pid=0 binds the calling thread too.
+        let _ = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = cpu;
 }
 
 /// Global thread ID counter for thread-mode workers.
@@ -215,6 +240,14 @@ impl WorkerPool {
                     libc::close(resp_read);
                 }
 
+                // Optionally pin this worker to a specific CPU core.
+                if self.config.pin_workers {
+                    let ncpus = std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(1);
+                    pin_to_core(index % ncpus);
+                }
+
                 // Enter the worker event loop
                 worker_main(cmd_read, resp_write);
 
@@ -225,9 +258,13 @@ impl WorkerPool {
     }
 
     /// Get the next idle worker index, if available.
+    ///
+    /// Uses **LIFO** (pop from back) so the most-recently-returned worker
+    /// is reused first — its OPcache, Zend arenas and CPU caches are
+    /// still hot.  This matches the `ThreadDispatch::get_idle` policy.
     pub fn get_idle_worker(&mut self) -> Option<usize> {
-        // Find the first idle worker that is still alive
-        while let Some(idx) = self.idle_queue.pop_front() {
+        // Find the most-recently-returned idle worker that is still alive
+        while let Some(idx) = self.idle_queue.pop_back() {
             if idx < self.workers.len() && self.workers[idx].state() == WorkerState::Idle {
                 return Some(idx);
             }
@@ -534,11 +571,20 @@ impl WorkerPool {
         let alive = Arc::new(AtomicBool::new(true));
         let alive_clone = alive.clone();
         let thread_id = THREAD_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pin = self.config.pin_workers;
 
         // Spawn the worker thread
         std::thread::Builder::new()
             .name(format!("turbine-worker-{index}"))
             .spawn(move || {
+                // Optionally pin to core (Linux only).
+                if pin {
+                    let ncpus = std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(1);
+                    pin_to_core(index % ncpus);
+                }
+
                 // Initialize TSRM context for this thread (ZTS only)
                 let init_rc = unsafe { turbine_php_sys::turbine_thread_init() };
                 if init_rc != 0 {
@@ -1828,6 +1874,7 @@ mod tests {
             workers: 16,
             max_requests: 50_000,
             mode: WorkerMode::Thread,
+            pin_workers: false,
         };
         assert_eq!(config.workers, 16);
         assert_eq!(config.max_requests, 50_000);
@@ -1842,6 +1889,7 @@ mod tests {
             workers: 4,
             max_requests: 1000,
             mode: WorkerMode::Process,
+            pin_workers: false,
         });
         assert_eq!(pool.config().workers, 4);
         assert_eq!(pool.config().max_requests, 1000);
