@@ -679,11 +679,8 @@ pub fn worker_event_loop_persistent(
                 let handler_ptr = c_handler_path.as_ref().unwrap().as_ptr();
                 let r = turbine_php_sys::turbine_execute_script(handler_ptr);
 
-                let b = output::take_output();
-                let h = output::take_headers();
-                let s = output::take_response_code();
-
-                // Run cleanup script (if configured) before request shutdown
+                // Run cleanup script (if configured) BEFORE collecting output.
+                // Cleanup output is intentionally discarded below (after shutdown).
                 if let Some(ref c_cleanup) = cleanup_code {
                     debug!(
                         pid = std::process::id(),
@@ -708,7 +705,17 @@ pub fn worker_event_loop_persistent(
                     );
                 }
 
+                // CRITICAL: take_output AFTER request_shutdown. PHP's internal
+                // output_buffering (default 4096 bytes in php.ini) only flushes
+                // chunks to our ub_write callback during php_output_end_all()
+                // inside request_shutdown. Collecting before shutdown truncates
+                // any response > output_buffering (manifests as empty/partial
+                // bodies for large payloads under ZTS persistent mode).
                 turbine_php_sys::turbine_worker_request_shutdown();
+
+                let b = output::take_output();
+                let h = output::take_headers();
+                let s = output::take_response_code();
 
                 (r, b, h, s)
             } else {
@@ -720,11 +727,7 @@ pub fn worker_event_loop_persistent(
 
                 let r = turbine_php_sys::turbine_execute_script(c_script.as_ptr());
 
-                let b = output::take_output();
-                let h = output::take_headers();
-                let s = output::take_response_code();
-
-                // Run cleanup script (if configured) before request shutdown
+                // Run cleanup script (if configured) BEFORE collecting output.
                 if let Some(ref c_cleanup) = cleanup_code {
                     debug!(
                         pid = std::process::id(),
@@ -749,7 +752,12 @@ pub fn worker_event_loop_persistent(
                     );
                 }
 
+                // CRITICAL: shutdown before take_output — see lightweight path.
                 turbine_php_sys::php_request_shutdown(std::ptr::null_mut());
+
+                let b = output::take_output();
+                let h = output::take_headers();
+                let s = output::take_response_code();
 
                 (r, b, h, s)
             };
