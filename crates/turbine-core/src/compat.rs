@@ -1197,7 +1197,7 @@ mod tests {
             has_env: false,
             autoload_path: None,
         };
-        let whitelist = vec!["index.php".to_string()];
+        let whitelist = ["index.php".to_string()];
         let path = structure.resolve_path("/admin/shell.php");
         assert!(
             !whitelist.contains(&path),
@@ -1207,7 +1207,7 @@ mod tests {
 
     #[test]
     fn execution_whitelist_allows_entry_point() {
-        let whitelist = vec!["index.php".to_string()];
+        let whitelist = ["index.php".to_string()];
         assert!(
             whitelist.contains(&"index.php".to_string()),
             "index.php should be in whitelist"
@@ -1216,7 +1216,7 @@ mod tests {
 
     #[test]
     fn data_directory_blocks_execution() {
-        let data_dirs = vec!["storage/".to_string(), "uploads/".to_string()];
+        let data_dirs = ["storage/".to_string(), "uploads/".to_string()];
         let php_path = "storage/framework/shell.php";
         let blocked = data_dirs.iter().any(|dir| {
             let normalized = dir.trim_end_matches('/');
@@ -1227,7 +1227,7 @@ mod tests {
 
     #[test]
     fn data_directory_allows_entry_point() {
-        let data_dirs = vec!["storage/".to_string(), "uploads/".to_string()];
+        let data_dirs = ["storage/".to_string(), "uploads/".to_string()];
         let php_path = "index.php";
         let blocked = data_dirs.iter().any(|dir| {
             let normalized = dir.trim_end_matches('/');
