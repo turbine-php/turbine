@@ -40,6 +40,22 @@ worker_mode = "process"
 # Number of Tokio async I/O threads (default = number of CPU cores)
 # Increase for more concurrent connections; decrease to leave cores for PHP workers
 # tokio_worker_threads = 6
+# Pin each PHP worker to a specific CPU core (Linux only, no-op on macOS)
+# Worker N is bound to logical core N % cpu_count. Reduces cache thrashing at
+# the cost of losing work-stealing. Only worth it on dedicated hosts when
+# worker_count ≤ physical_core_count.
+# pin_workers = false
+# SO_BUSY_POLL budget in microseconds (Linux only). The kernel spins on the
+# NIC RX queue for up to this many µs before yielding, shaving 20-50µs off
+# p99 at the cost of CPU. Typical values: 50 (latency-sensitive) to 200.
+# Unset / 0 disables. Requires CAP_NET_ADMIN on kernels < 5.7.
+# listen_busy_poll_us = 50
+# Number of SO_REUSEPORT accept shards (Linux only). When > 1, binds N
+# listener sockets to the same (addr, port) and runs one accept loop per
+# shard so the kernel load-balances new connections with a per-flow hash.
+# Removes single-accept-queue contention above ~100k conn/s. Recommended:
+# match tokio_worker_threads (typically ncpus). Unset / ≤ 1 uses one listener.
+# listen_reuseport_shards = 8
 # Request timeout in seconds (0 = no timeout)
 request_timeout = 30
 # Max PHP requests per worker before respawn (prevents memory leaks)
@@ -252,6 +268,9 @@ statistics = true
 | `worker_boot` | string | none | Boot script path (once per worker). See [worker-lifecycle.md](worker-lifecycle.md) |
 | `worker_handler` | string | none | Handler script path (per request). See [worker-lifecycle.md](worker-lifecycle.md) |
 | `tokio_worker_threads` | integer | CPU cores | Number of Tokio async I/O threads |
+| `pin_workers` | bool | `false` | Pin each worker to a CPU core (Linux only). See [performance.md](performance.md#cpu-pinning-linux-only) |
+| `listen_busy_poll_us` | integer | none | `SO_BUSY_POLL` budget in µs (Linux only). See [performance.md](performance.md#so_busy_poll-linux-only) |
+| `listen_reuseport_shards` | integer | `1` | `SO_REUSEPORT` accept shards (Linux only). See [performance.md](performance.md#so_reuseport-accept-sharding-linux-only) |
 | `request_timeout` | integer | `30` | Request timeout in seconds (0 = unlimited) |
 | `worker_max_requests` | integer | `10000` | Requests per worker before respawn |
 | `channel_capacity` | integer | `64` | Channel size for single-process mode |

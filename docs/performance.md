@@ -240,6 +240,10 @@ request_timeout = 30
 max_wait_time = 5
 worker_max_requests = 10000
 # tokio_worker_threads = 6
+# --- Linux-only tuning (safe to leave commented on macOS / small boxes) ---
+# pin_workers = true
+# listen_busy_poll_us = 50
+# listen_reuseport_shards = 8
 
 [php]
 memory_limit = "512M"
@@ -248,6 +252,10 @@ jit_buffer_size = "128M"
 
 [compression]
 enabled = true
+
+[cache]
+enabled = true       # also activates request coalescing (singleflight)
+ttl_seconds = 30
 
 [security]
 enabled = true
@@ -260,6 +268,45 @@ enabled = false
 ```
 
 ## Advanced / experimental
+
+### Always-on optimizations (no config needed)
+
+Turbine enables the following by default — listed here so you know what you
+are benchmarking:
+
+- **mimalloc** as the global allocator (Microsoft Research). Typical
+  wins on allocation-heavy threaded workloads: 5–10 % throughput,
+  20–40 % lower p99 under concurrency, smaller RSS due to aggressive
+  segment reuse and better thread-local caches. Matches what Bun and
+  Deno ship.
+- **Transparent huge pages hint** (`madvise(MADV_HUGEPAGE)` +
+  `PR_SET_THP_DISABLE=0`) applied at process start on Linux. Reduces
+  TLB misses on OPcache SHM and Zend arenas. No-op on macOS and on
+  hosts configured with `transparent_hugepage = never`.
+- **LIFO hot-worker dispatch.** When a worker returns to the idle pool,
+  it is pushed to the back; the next request pops from the back. The
+  most-recently-used worker — whose OPcache, Zend arenas, and CPU
+  L1/L2 caches are still warm — gets the next request. Cold workers
+  still recycle naturally at peak load when the idle queue is empty.
+  Same trick Go's scheduler uses on local run queues.
+- **Request coalescing (singleflight)** on cacheable `GET`s. When N
+  concurrent requests hit the same URL and the response cache is
+  enabled but empty, only one PHP execution runs; the other N-1
+  callers wait on a `Notify` and receive a clone of the leader's
+  response. Saves server CPU roughly in proportion to traffic
+  concentration (often 50 %+ on real sites with a Pareto URL
+  distribution). Requires `[cache] enabled = true`.
+- **Zero-copy cache hits.** Cache bodies are stored as refcounted
+  `Bytes`. Serving a hit clones an 8-byte refcount instead of copying
+  the body — a 50 KB response served to 1000 concurrent clients
+  allocates 50 KB once, not 50 MB.
+- **`TCP_NODELAY` on every accepted stream.** Kills up to ~40 ms of
+  Nagle latency on p99 for small responses.
+- **Async pipe I/O via `AsyncFd`** (tokio reactor directly, no
+  `spawn_blocking`). Eliminates the 512-thread blocking-pool ceiling
+  on concurrent PHP requests.
+
+None of these are config-gated — they are part of the default build.
 
 ### CPU pinning (Linux only)
 
@@ -279,6 +326,75 @@ Only enable when all of these are true:
 
 No-op on macOS and in environments that don't allow `sched_setaffinity`
 (most cgroup-restricted containers).
+
+### `SO_BUSY_POLL` (Linux only)
+
+```toml
+[server]
+listen_busy_poll_us = 50   # spin budget in microseconds
+```
+
+Applied to the listener and every accepted connection. The kernel
+spins on the NIC RX queue for up to `listen_busy_poll_us` µs before
+yielding to the scheduler. Shaves 20–50 µs off p99 latency when the
+host is otherwise idle, but **wastes CPU on oversubscribed hosts** —
+the spin is real.
+
+Typical values: `50` (latency-sensitive APIs) to `200` (extreme
+low-latency trading-style). Silently ignored on macOS and when
+`setsockopt` fails (e.g. insufficient privileges on kernels < 5.7).
+
+### `SO_REUSEPORT` accept sharding (Linux only)
+
+```toml
+[server]
+listen_reuseport_shards = 8   # typically = tokio_worker_threads
+```
+
+Binds N independent listener sockets to the same `(addr, port)` and
+runs one accept loop per shard. The Linux kernel distributes new
+connections across them using a per-flow hash, removing contention on
+the single accept queue that otherwise becomes the bottleneck above
+~100 k connections/sec.
+
+Recommended value: match `tokio_worker_threads` (typically `ncpus`).
+The gain is largest on connection-churn-heavy workloads (short-lived
+HTTP/1 without keep-alive, WebSocket upgrades). Negligible on
+keep-alive-heavy workloads where connection setup is amortised.
+
+`None` / `0` / `1` keeps single-listener behaviour. Silently falls
+back to a single listener on non-Linux and when additional shards
+fail to bind.
+
+### Profile-Guided Optimization (PGO)
+
+`scripts/build-pgo.sh` automates the three-stage PGO workflow:
+
+1. **Instrumented build** — compiles Turbine with
+   `-Cprofile-generate` to emit counter hooks for every branch and
+   function call.
+2. **Workload run** — you start the instrumented binary and hit it
+   with `wrk` (or production traffic mirrored through it) against a
+   representative sample app. Counters accumulate in `.profraw`
+   files.
+3. **Optimized build** — consumes `llvm-profdata merge`'d profile to
+   reorder functions for instruction-cache locality, bias branch
+   prediction, and inline hot paths that cost-model alone would skip.
+
+Typical gain on HTTP-heavy code: **8–15 % throughput, 5–10 % lower
+p99**. Requires `rustup component add llvm-tools-preview`.
+
+```bash
+# Stage 1-2 (instrumented + workload)
+scripts/build-pgo.sh http://127.0.0.1:8080/
+# → prompts you to run `wrk` then press Enter
+
+# The script then merges .profraw files and does the optimized build.
+# Final binary: target/release/turbine
+```
+
+Combine with `pin_workers` + `listen_busy_poll_us` on a dedicated
+bare-metal host for the best numbers Turbine can produce today.
 
 ### IRQ affinity (sysadmin, outside Turbine)
 
@@ -308,3 +424,17 @@ after the same switch. The implementation is non-trivial because
 `tokio-uring` uses completion-based futures that don't freely compose
 with hyper/rustls, so it requires a dedicated runtime on a thread
 isolated from the HTTP reactor. Tracking milestone: Turbine 0.3.
+
+## A note on `output_buffering`
+
+Turbine captures PHP output via a custom `ub_write` SAPI callback.
+That callback is only drained during `php_request_shutdown`, so
+`output_buffering` **must stay at 0** (the default Turbine ships). Any
+non-zero value would cause responses larger than the buffer to be
+truncated on the hot path.
+
+Turbine enforces `output_buffering=0` in the generated php.ini and
+actively rejects overrides from `[php.ini]` in `turbine.toml` with a
+warn-level log message. Don't try to work around this — if you need
+buffered output in userland, use `ob_start()` / `ob_get_clean()` in
+PHP, which compose correctly with the SAPI capture.

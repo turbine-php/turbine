@@ -52,6 +52,8 @@ See [Worker Lifecycle](worker-lifecycle.md) for the lightweight boot/handler sys
 - **Named Worker Pools** — Route-based worker pool splitting for different workloads
 - **CORS** — Built-in Cross-Origin Resource Sharing configuration
 - **Response Cache** — In-memory caching with TTL
+- **Request Coalescing (Singleflight)** — N concurrent requests to the same cacheable URL collapse into a single PHP execution; active automatically when the response cache is enabled. See [Performance](performance.md#always-on-optimizations-no-config-needed).
+- **Linux Low-Latency Knobs** — Optional `pin_workers`, `SO_BUSY_POLL`, and `SO_REUSEPORT` accept sharding. See [Performance](performance.md).
 
 ## Quick Start
 

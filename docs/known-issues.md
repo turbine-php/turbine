@@ -118,6 +118,16 @@ chmod 1733 /tmp/turbine-sessions
 
 ---
 
+## `output_buffering` is forced to 0
+
+**[both]** — Turbine captures PHP output via a custom `ub_write` SAPI callback that is drained during `php_request_shutdown`. Any non-zero `output_buffering` would retain response bytes inside PHP's internal buffer beyond the capture window and truncate responses larger than the buffer size.
+
+The generated `php.ini` sets `output_buffering=0` and Turbine actively rejects overrides from `[php.ini]` in `turbine.toml` with a warn-level log entry. This is intentional and not configurable.
+
+If you need output buffering in userland, use `ob_start()` / `ob_get_clean()` in PHP — they compose correctly with the SAPI capture.
+
+---
+
 ## Runtime Library Path
 
 **[both]** — Turbine links against `libphp.dylib` (macOS) or `libphp.so` (Linux) at runtime. The library must be locatable by the dynamic linker.
