@@ -7,3 +7,6 @@ edition.workspace = true
 dashmap = { workspace = true }
 xxhash-rust = { workspace = true }
 tracing = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time"] }
+parking_lot = { workspace = true }
+bytes = { workspace = true }

@@ -2,6 +2,7 @@
 
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use dashmap::DashMap;
 use tracing::debug;
 use xxhash_rust::xxh3::xxh3_64;
@@ -28,9 +29,15 @@ impl Default for CacheConfig {
 }
 
 /// A cached response entry.
+///
+/// `body` is stored as [`Bytes`] — a reference-counted, immutable
+/// buffer.  Cloning is an atomic refcount bump (no allocation, no
+/// copy), so returning the body from a cache hit costs ~10ns instead
+/// of `O(body_len)`.  Hot paths (`get`, `Coalescer` followers) can
+/// share a single buffer across thousands of concurrent readers.
 #[derive(Clone)]
 pub struct CachedResponse {
-    pub body: Vec<u8>,
+    pub body: Bytes,
     pub content_type: String,
     pub status: u16,
     /// xxh3 hash of the PHP source that produced this response.
@@ -138,7 +145,44 @@ impl ResponseCache {
         self.store.insert(
             key,
             CachedResponse {
-                body: body.to_vec(),
+                body: Bytes::copy_from_slice(body),
+                content_type: content_type.to_string(),
+                status,
+                source_hash,
+                created_at: Instant::now(),
+                ttl: self.config.ttl,
+            },
+        );
+    }
+
+    /// Store a response using an already-owned [`Bytes`] — zero copy.
+    ///
+    /// Use this when the caller already holds a `Bytes` (e.g. shared
+    /// with the HTTP response and the coalescer); cache and response
+    /// path then share a single refcounted buffer.
+    pub fn put_bytes(
+        &self,
+        method: &str,
+        path: &str,
+        source_hash: u64,
+        status: u16,
+        content_type: &str,
+        body: Bytes,
+    ) {
+        if !self.config.enabled {
+            return;
+        }
+        if method != "GET" || status != 200 {
+            return;
+        }
+        if self.store.len() >= self.config.max_entries {
+            self.evict_oldest();
+        }
+        let key = Self::cache_key(method, path);
+        self.store.insert(
+            key,
+            CachedResponse {
+                body,
                 content_type: content_type.to_string(),
                 status,
                 source_hash,
@@ -222,7 +266,7 @@ mod tests {
         cache.put("GET", "/index.php", hash, 200, "text/html", b"hello");
         let hit = cache.get("GET", "/index.php", hash);
         assert!(hit.is_some());
-        assert_eq!(hit.unwrap().body, b"hello");
+        assert_eq!(hit.unwrap().body.as_ref(), b"hello");
     }
 
     #[test]
