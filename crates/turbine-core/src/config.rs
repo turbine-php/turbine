@@ -121,6 +121,46 @@ pub struct ServerConfig {
     /// cores for PHP worker processes.
     #[serde(default)]
     pub tokio_worker_threads: Option<usize>,
+    /// Pin each PHP worker to a specific CPU core (Linux only).
+    ///
+    /// When enabled, worker N is bound to logical core `N % cpu_count`.
+    /// This reduces cache thrashing from the scheduler bouncing workers
+    /// between cores, at the cost of losing work-stealing.  Only worth
+    /// it on dedicated hosts with stable workloads and when worker
+    /// count ≤ physical core count.  No-op on macOS.
+    #[serde(default)]
+    pub pin_workers: bool,
+    /// Enable `SO_BUSY_POLL` on the listening socket and accepted streams
+    /// (Linux only). Value is the busy-poll budget in microseconds — the
+    /// kernel will spin on the NIC RX queue for up to this many µs before
+    /// yielding to the scheduler, trading CPU for latency.
+    ///
+    /// Typical values: `50` (latency-sensitive) to `200` (extreme).
+    /// `0` / `None` disables. Requires `CAP_NET_ADMIN` on older kernels
+    /// (< 5.7); silently ignored on macOS and when the setsockopt fails.
+    ///
+    /// Expect 20-50µs off p99 on small-payload workloads when the server
+    /// core is otherwise idle. Wastes CPU on oversubscribed hosts.
+    #[serde(default)]
+    pub listen_busy_poll_us: Option<u32>,
+    /// Number of `SO_REUSEPORT` accept shards (Linux only).
+    ///
+    /// When set to `N > 1`, Turbine binds N independent listener sockets
+    /// to the same address with `SO_REUSEPORT` and runs one accept loop
+    /// per shard. The kernel distributes incoming connections across
+    /// them with a per-flow hash, removing contention on the single
+    /// accept queue that otherwise becomes the bottleneck above ~100k
+    /// connections/sec.
+    ///
+    /// `None` / `0` / `1` keeps the single-listener behaviour.
+    /// Recommended: match your tokio worker thread count (typically
+    /// `ncpus`). Silently falls back to a single listener on non-Linux
+    /// and on bind failure of additional shards.
+    ///
+    /// Gain: 10-30% more accept throughput under very high connection
+    /// churn. Negligible on keep-alive-heavy workloads.
+    #[serde(default)]
+    pub listen_reuseport_shards: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -708,6 +748,9 @@ impl Default for ServerConfig {
             worker_handler: None,
             worker_cleanup: None,
             tokio_worker_threads: None,
+            pin_workers: false,
+            listen_busy_poll_us: None,
+            listen_reuseport_shards: None,
         }
     }
 }

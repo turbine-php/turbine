@@ -55,6 +55,7 @@ zstd = "0.13"
 notify = { version = "7", default-features = false, features = ["macos_fsevent"] }
 sha2 = "0.10"
 parking_lot = "0.12"
+mimalloc = { version = "0.1", default-features = false }
 # ACME (Let's Encrypt) auto-provisioning — optional
 instant-acme = "0.7"
 rcgen = "0.13"

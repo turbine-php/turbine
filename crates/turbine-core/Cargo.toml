@@ -39,6 +39,8 @@ notify = { workspace = true }
 xxhash-rust = { workspace = true }
 parking_lot = { workspace = true }
 thiserror = { workspace = true }
+mimalloc = { workspace = true }
+libc = { workspace = true }
 
 # ACME auto-provisioning (optional, behind `acme` feature)
 instant-acme = { workspace = true, optional = true }
@@ -49,6 +51,14 @@ pem = { workspace = true, optional = true }
 default = []
 acme = ["dep:instant-acme", "dep:rcgen", "dep:pem"]
 embed = []
+# Linux-only io_uring backend for pipe I/O between master and workers.
+#
+# STATUS: experimental stub.  Enables the `io_uring_backend` module but
+# does NOT yet replace the epoll-based path.  Turning this on currently
+# compiles in the scaffolding only — runtime still uses AsyncFd.
+# Full implementation requires replacing `AsyncPipe` with a shared
+# `tokio-uring` runtime; see docs/performance.md.
+io-uring = []
 
 [build-dependencies]
 flate2 = "1"
