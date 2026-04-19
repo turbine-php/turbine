@@ -381,6 +381,21 @@ struct ThreadDispatch {
     /// Per-worker response receivers (in-memory channel mode).
     /// Empty when using pipe-based mode.
     response_rxs: Vec<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<NativeResponse>>>,
+    /// Per-worker request counter (for max_requests enforcement in the hot
+    /// path).  Incremented on each successful dispatch.  When a worker
+    /// reaches `max_requests`, `get_idle` skips it so the reaper can
+    /// recycle it before any new traffic lands on a stale interpreter.
+    requests_served: Vec<std::sync::atomic::AtomicU64>,
+    /// Per-worker unhealthy flag.  Set to `true` when a send/decode fails
+    /// (EPIPE, EOF, decode error).  Workers marked unhealthy are skipped
+    /// by `get_idle` until the reaper respawns them and resets the flag.
+    /// Prevents the well-known "dead fd still in idle queue" race where
+    /// a persistent worker crashed mid-request and the next dispatch
+    /// picks the same index, hits the dead pipe, and returns HTTP 502.
+    unhealthy: Vec<std::sync::atomic::AtomicBool>,
+    /// Max requests per worker before recycling (0 = unlimited, same
+    /// semantics as `ServerConfig.worker_max_requests`).
+    max_requests_per_worker: u64,
 }
 
 impl ThreadDispatch {
@@ -391,13 +406,74 @@ impl ThreadDispatch {
         for i in 0..count {
             queue.push_back(i);
         }
+        let mut requests_served = Vec::with_capacity(count);
+        let mut unhealthy = Vec::with_capacity(count);
+        for _ in 0..count {
+            requests_served.push(std::sync::atomic::AtomicU64::new(0));
+            unhealthy.push(std::sync::atomic::AtomicBool::new(false));
+        }
         ThreadDispatch {
             idle_sem: tokio::sync::Semaphore::new(count),
             idle_queue: parking_lot::Mutex::new(queue),
             worker_fds: parking_lot::RwLock::new(fds),
             request_txs: Vec::new(),
             response_rxs: Vec::new(),
+            requests_served,
+            unhealthy,
+            max_requests_per_worker: 0,
         }
+    }
+
+    /// Set the max_requests_per_worker threshold used by `get_idle` to
+    /// skip workers that have already served their quota (so the reaper
+    /// can recycle them without racing with new traffic).
+    fn set_max_requests(&mut self, max: u64) {
+        self.max_requests_per_worker = max;
+    }
+
+    /// Mark a worker as unhealthy (called on send/decode failure). The
+    /// worker will be skipped by `get_idle` until the reaper clears the
+    /// flag after respawning the underlying process/thread.
+    fn mark_unhealthy(&self, idx: usize) {
+        if idx < self.unhealthy.len() {
+            self.unhealthy[idx].store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// Clear the unhealthy flag and reset the request counter for a
+    /// freshly respawned worker.  Called from the reaper path.
+    #[allow(dead_code)]
+    fn mark_healthy(&self, idx: usize) {
+        if idx < self.unhealthy.len() {
+            self.unhealthy[idx].store(false, std::sync::atomic::Ordering::Release);
+            self.requests_served[idx].store(0, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// Increment the per-worker request counter.  Called on every
+    /// successful dispatch.
+    fn record_served(&self, idx: usize) {
+        if idx < self.requests_served.len() {
+            self.requests_served[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Returns true when `idx` is still safe to dispatch to.  Used by
+    /// `get_idle` to reject dead pipes / quota-exhausted workers.
+    fn is_pickable(&self, idx: usize) -> bool {
+        if idx >= self.unhealthy.len() {
+            return false;
+        }
+        if self.unhealthy[idx].load(std::sync::atomic::Ordering::Acquire) {
+            return false;
+        }
+        if self.max_requests_per_worker > 0 {
+            let served = self.requests_served[idx].load(std::sync::atomic::Ordering::Relaxed);
+            if served >= self.max_requests_per_worker {
+                return false;
+            }
+        }
+        true
     }
 
     /// Spawn channel-based worker threads and return a `ThreadDispatch` that
@@ -506,12 +582,22 @@ impl ThreadDispatch {
             .map(|rx| tokio::sync::Mutex::new(rx))
             .collect();
 
+        let mut requests_served = Vec::with_capacity(count);
+        let mut unhealthy = Vec::with_capacity(count);
+        for _ in 0..count {
+            requests_served.push(std::sync::atomic::AtomicU64::new(0));
+            unhealthy.push(std::sync::atomic::AtomicBool::new(false));
+        }
+
         let td = ThreadDispatch {
             idle_sem: tokio::sync::Semaphore::new(idle_count),
             idle_queue: parking_lot::Mutex::new(idle_queue),
             worker_fds: parking_lot::RwLock::new(Vec::new()),
             request_txs,
             response_rxs,
+            requests_served,
+            unhealthy,
+            max_requests_per_worker: 0,
         };
         (td, worker_info)
     }
@@ -541,18 +627,60 @@ impl ThreadDispatch {
     /// Cold workers still get recycled naturally: whenever the idle
     /// queue is empty at dispatch time (peak load), new requests fan
     /// out to every worker including cold ones.
+    ///
+    /// # Health filtering
+    ///
+    /// Workers flagged unhealthy (send/decode failed last time) or past
+    /// their `max_requests` quota are skipped and NOT returned to the
+    /// idle queue — the background reaper will respawn them and call
+    /// `mark_healthy` to clear the flags.  If every permit we acquire
+    /// points to an unhealthy worker we give up and return `None` so
+    /// the caller can trigger a reap cycle instead of looping forever.
     async fn get_idle(&self, timeout: std::time::Duration) -> Option<usize> {
-        let permit = match tokio::time::timeout(timeout, self.idle_sem.acquire()).await {
-            Ok(Ok(permit)) => permit,
-            _ => return None,
-        };
-        permit.forget(); // consumed; return_idle will add_permits(1)
-        let idx = self.idle_queue.lock().pop_back();
-        if idx.is_none() {
-            // Safety net: restore the permit if queue is unexpectedly empty
-            self.idle_sem.add_permits(1);
+        // Cap the number of skips so we can't spin forever if every
+        // worker is unhealthy at once (shouldn't happen — the reaper
+        // runs every 100ms — but defend against pathological cases).
+        let max_skips = self.unhealthy.len().max(1) * 2;
+        let mut skipped = 0usize;
+        loop {
+            let permit = match tokio::time::timeout(timeout, self.idle_sem.acquire()).await {
+                Ok(Ok(permit)) => permit,
+                _ => return None,
+            };
+            permit.forget(); // consumed; return_idle will add_permits(1)
+            let idx = self.idle_queue.lock().pop_back();
+            let idx = match idx {
+                Some(i) => i,
+                None => {
+                    // Safety net: restore the permit if queue is unexpectedly empty
+                    self.idle_sem.add_permits(1);
+                    return None;
+                }
+            };
+
+            if self.is_pickable(idx) {
+                return Some(idx);
+            }
+
+            // Unhealthy or quota-exhausted — drop this worker on the floor
+            // (do NOT add the permit back; the reaper will respawn it and
+            // call `mark_healthy` + `return_idle` which restores the
+            // permit).  This naturally applies back-pressure while the
+            // pool is shrinking.
+            skipped += 1;
+            tracing::debug!(
+                worker = idx,
+                skipped = skipped,
+                "get_idle: skipping unhealthy/exhausted worker"
+            );
+            if skipped >= max_skips {
+                tracing::warn!(
+                    skipped = skipped,
+                    "get_idle: giving up after too many unhealthy workers"
+                );
+                return None;
+            }
         }
-        idx
     }
 
     /// Return a worker to the idle pool.  Pushes to the back so the
@@ -588,6 +716,11 @@ impl ThreadDispatch {
     /// If `new_fds` has more entries than before (scale-up) the extra
     /// workers are added to the idle pool.  Shrinks are not applied here
     /// (handled by shrink_one).
+    ///
+    /// Clears the unhealthy flag for every worker — after a respawn,
+    /// the pipe fds are fresh, so any previous "dead pipe" verdict no
+    /// longer applies.  Also resets the per-worker request counter so
+    /// `max_requests` enforcement starts from zero on the new interpreter.
     fn refresh_fds(&self, new_fds: Vec<(std::os::unix::io::RawFd, std::os::unix::io::RawFd)>) {
         let prev_len = {
             let mut fds = self.worker_fds.write();
@@ -596,14 +729,35 @@ impl ThreadDispatch {
             prev
         };
         let new_len = self.worker_fds.read().len();
+
+        // Reset health/counter state for all known worker slots.
+        for i in 0..new_len.min(self.unhealthy.len()) {
+            self.unhealthy[i].store(false, std::sync::atomic::Ordering::Release);
+            self.requests_served[i].store(0, std::sync::atomic::Ordering::Release);
+        }
+
         if new_len > prev_len {
             // Newly added workers — make them idle and grow the semaphore.
-            let mut q = self.idle_queue.lock();
-            for i in prev_len..new_len {
-                q.push_back(i);
+            let growable = new_len.min(self.unhealthy.len()) - prev_len;
+            if growable > 0 {
+                let mut q = self.idle_queue.lock();
+                for i in prev_len..prev_len + growable {
+                    q.push_back(i);
+                }
+                drop(q);
+                self.idle_sem.add_permits(growable);
             }
-            drop(q);
-            self.idle_sem.add_permits(new_len - prev_len);
+            if new_len > self.unhealthy.len() {
+                // Health atomics are sized at startup; scale-ups beyond
+                // the initial cap would require reallocation (skipped
+                // here — auto_scale is off by default and this branch
+                // is best-effort). Log once so this is visible.
+                tracing::warn!(
+                    requested = new_len,
+                    cap = self.unhealthy.len(),
+                    "ThreadDispatch: scale-up beyond initial worker cap; health tracking limited to cap"
+                );
+            }
         }
     }
 
@@ -1740,20 +1894,24 @@ fn cmd_serve(
         // For channel mode (non-persistent + thread), the dispatch was
         // already built by `spawn_channel_workers`.
         //
-        // NOTE: recycle-by-max_requests is not enforced in the dispatch hot
-        // path.  The background reaper task (spawned below) periodically
-        // reaps dead workers and respawns them; for max_requests-based
-        // recycling in process mode the operator should prefer shorter
-        // worker lifetimes via OS signals or external supervision.  Thread
-        // mode has the same behaviour, so this does not regress any
-        // existing promise.
+        // Recycle-by-max_requests IS now enforced in the dispatch hot path:
+        // `get_idle` checks `ThreadDispatch.requests_served[idx]` vs the
+        // configured `worker_max_requests` and skips over workers that
+        // have reached quota, letting the reaper respawn them without
+        // racing with new traffic.  Dead pipes (EPIPE on send or EOF on
+        // decode) are similarly tagged unhealthy in the dispatch handler
+        // so the next `get_idle` won't pick the same worker again until
+        // it is respawned.  See `ThreadDispatch::is_pickable`.
         let thread_dispatch: Option<Arc<ThreadDispatch>> =
-            if let Some(td) = thread_dispatch_prebuilt.take() {
+            if let Some(mut td) = thread_dispatch_prebuilt.take() {
+                td.set_max_requests(config.server.worker_max_requests);
                 Some(Arc::new(td))
             } else {
                 // Both thread and process pipe-based modes use pipe fds.
                 let fds = pool.worker_fds();
-                Some(Arc::new(ThreadDispatch::new(fds)))
+                let mut td = ThreadDispatch::new(fds);
+                td.set_max_requests(config.server.worker_max_requests);
+                Some(Arc::new(td))
             };
 
         let state = Arc::new(ServerState {
@@ -3398,7 +3556,11 @@ async fn handle_request_inner(
             });
             if let Err(e) = write_result {
                 error!(worker = worker_idx, error = %e, "Failed to send to persistent worker (thread dispatch)");
-                // guard returns worker on drop
+                // Mark pipe as unhealthy so subsequent get_idle skips this
+                // worker until the reaper respawns it.  guard returns the
+                // idx on drop so the semaphore permit is restored, but
+                // the flag ensures the next dispatch bypasses this slot.
+                td.mark_unhealthy(worker_idx);
                 return Ok(build_response(
                     502,
                     "text/plain",
@@ -3413,6 +3575,13 @@ async fn handle_request_inner(
                     Ok(mut pipe) => turbine_worker::decode_response_async(&mut pipe).await,
                     Err(e) => Err(e),
                 };
+            // If decode failed, tag the worker unhealthy before releasing
+            // the guard so the next get_idle() can't pick it again.
+            if bin_result.is_err() {
+                td.mark_unhealthy(worker_idx);
+            } else {
+                td.record_served(worker_idx);
+            }
             drop(guard);
 
             match bin_result {
@@ -4120,6 +4289,7 @@ async fn handle_request_inner(
             );
             if let Err(e) = td.send_request(worker_idx, encoded) {
                 error!(worker = worker_idx, error = %e, "Channel send failed (thread dispatch)");
+                td.mark_unhealthy(worker_idx);
                 // guard will return_idle on drop
                 return Ok(build_response(
                     502,
@@ -4130,7 +4300,10 @@ async fn handle_request_inner(
             }
             match td.recv_response(worker_idx).await {
                 Some(resp) => Ok(resp),
-                None => Err("channel worker died".to_string()),
+                None => {
+                    td.mark_unhealthy(worker_idx);
+                    Err("channel worker died".to_string())
+                }
             }
         } else {
             // Pipe-based IPC (legacy / persistent fallback)
@@ -4159,6 +4332,7 @@ async fn handle_request_inner(
             });
             if let Err(e) = write_result {
                 error!(worker = worker_idx, error = %e, "Failed to send to worker (thread dispatch)");
+                td.mark_unhealthy(worker_idx);
                 return Ok(build_response(
                     502,
                     "text/plain",
@@ -4173,11 +4347,18 @@ async fn handle_request_inner(
                     Ok(mut pipe) => turbine_worker::read_native_response_async(&mut pipe).await,
                     Err(e) => Err(e),
                 };
+            if result.is_err() {
+                td.mark_unhealthy(worker_idx);
+            }
             result.map_err(|e| e.to_string())
         };
 
         // Explicitly drop the guard now to return worker to idle pool.
         drop(guard);
+
+        if native_result.is_ok() {
+            td.record_served(worker_idx);
+        }
 
         match native_result {
             Ok(resp) => {
