@@ -73,6 +73,7 @@ myapp/                  # Your Symfony app root
 
 1. **Preloading**: Use `preload_script = "config/preload.php"` for Symfony's built-in preloader.
 2. **Environment**: Set `APP_ENV=prod` and `APP_DEBUG=0` in `.env.local`.
-3. **Cache warmup**: Run `php bin/console cache:warmup --env=prod` before starting Turbine.
-4. **Var directory**: Ensure `var/cache/` and `var/log/` are writable.
-5. **Disabled functions**: If you use `Process` component, remove `proc_open` from `disabled_functions`.
+3. **DEFAULT_URI** (persistent workers): Symfony's router needs `DEFAULT_URI` when the kernel is booted without a live request context. Add `DEFAULT_URI=http://localhost/` (or your canonical URL) to `.env.local` to avoid `EnvNotFoundException: "Environment variable not found: DEFAULT_URI"` on every request.
+4. **Cache warmup**: Run `php bin/console cache:warmup --env=prod` before starting Turbine.
+5. **Var directory**: Ensure `var/cache/` and `var/log/` are writable.
+6. **Disabled functions**: If you use `Process` component, remove `proc_open` from `disabled_functions`.

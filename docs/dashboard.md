@@ -15,7 +15,7 @@ The dashboard is a single self-contained HTML page that auto-refreshes every 2 s
 | **Requests** | 2 s | Total requests and current requests/sec |
 | **Latency** | 2 s | Mean, p50, p99 in ms |
 | **Cache Hit Ratio** | 2 s | Response cache hits vs misses |
-| **Security Blocks** | 2 s | Cumulative number of blocked requests by OWASP guards |
+| **Security Blocks** | 2 s | Cumulative number of requests blocked by the sandbox and heuristic filters |
 | **Workers** | 2 s | Active worker count |
 | **Bytes Out** | 2 s | Total bytes sent |
 | **Endpoints** | 2 s | Per-path breakdown: requests, errors, mean, p99, relative load bar |

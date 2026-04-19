@@ -140,20 +140,20 @@ impl BehaviourGuard {
         // Step 1 — window rollover.  A single CAS installs the new window
         // start; losers skip the reset (another thread already did it).
         let win_start = profile.window_start_ns.load(Ordering::Acquire);
-        if window_ns > 0 && now_ns.saturating_sub(win_start) > window_ns {
-            if profile
+        if window_ns > 0
+            && now_ns.saturating_sub(win_start) > window_ns
+            && profile
                 .window_start_ns
                 .compare_exchange(win_start, now_ns, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
-            {
-                profile.request_count.store(0, Ordering::Release);
-                profile.error_count.store(0, Ordering::Release);
-                let bu = profile.block_until_ns.load(Ordering::Acquire);
-                if bu != 0 && bu <= now_ns {
-                    profile.blocked.store(false, Ordering::Release);
-                    profile.block_until_ns.store(0, Ordering::Release);
-                    profile.sqli_attempts.store(0, Ordering::Release);
-                }
+        {
+            profile.request_count.store(0, Ordering::Release);
+            profile.error_count.store(0, Ordering::Release);
+            let bu = profile.block_until_ns.load(Ordering::Acquire);
+            if bu != 0 && bu <= now_ns {
+                profile.blocked.store(false, Ordering::Release);
+                profile.block_until_ns.store(0, Ordering::Release);
+                profile.sqli_attempts.store(0, Ordering::Release);
             }
         }
 

@@ -11,9 +11,9 @@
   <img src="assets/logo.png" alt="Turbine" width="400" />
 </p>
 
-High-performance PHP application server written in Rust, powered by the PHP embed SAPI — with a **built-in OWASP security layer** that replaces ModSecurity and external WAFs at ~500 ns overhead.
+High-performance PHP application server written in Rust, powered by the PHP embed SAPI — with a built-in in-process sandbox (execution whitelist, upload hardening, path-traversal guard, PHP INI hardening) plus a lightweight heuristic input filter and per-IP behaviour guard.
 
-Turbine replaces the traditional **Nginx + PHP-FPM + OPcache** stack with a single binary that embeds PHP directly, eliminating inter-process communication overhead and reducing latency. Security guards (SQL injection, code injection, path traversal, behaviour analysis) run inside the same process — no extra hop, no extra service.
+Turbine replaces the traditional **Nginx + PHP-FPM + OPcache** stack with a single binary that embeds PHP directly, eliminating inter-process communication overhead and reducing latency. The security layer runs inside the same process — no extra hop, no extra service — but it is intentionally *not* a WAF: if you need OWASP CRS-level rule coverage, put a real WAF (Cloudflare, Coraza, Caddy + coraza, libmodsecurity) in front of Turbine.
 
 > [!WARNING]
 > **This project is under active development and is not yet ready for production use.**
@@ -26,7 +26,7 @@ Turbine replaces the traditional **Nginx + PHP-FPM + OPcache** stack with a sing
 - **Single binary** — no Nginx, no PHP-FPM, no reverse proxy
 - **Persistent workers** — process and thread modes with automatic scaling
 - **Zero-copy IPC** — in-memory channels for thread mode (ZTS), minimal overhead for high-throughput workloads
-- **OWASP security guards** — SQL injection, code injection, path traversal, behaviour analysis — all in Rust, ~500 ns overhead, zero external WAF needed
+- **Built-in sandbox** — execution whitelist, data-dir guard, path-traversal guard, PHP INI hardening, heuristic SQL/code input filter, per-IP behaviour guard (rate limit + scan detection) — all in Rust, ~500 ns overhead
 - **ACME auto-TLS** — automatic Let's Encrypt certificates
 - **Virtual hosting** — multiple domains on one server, SNI per-host TLS
 - **OPcache preload** — bytecode compiled once and kept in memory across all workers (not just per-process OPcache)
@@ -39,40 +39,48 @@ Turbine replaces the traditional **Nginx + PHP-FPM + OPcache** stack with a sing
 - **App embedding** — pack your entire PHP application into a single self-contained binary for distribution
 - **Built-in observability** — Prometheus metrics, live dashboard, per-IP blocked request log
 
-## Security — Built-in, Zero Overhead
+## Security — Built-in Sandbox
 
-Turbine includes a **multi-layered OWASP security system** written in Rust that runs inside the process — no ModSecurity, no WAF appliance, no extra hop.
+Turbine includes a multi-layered in-process security sandbox written in Rust. It is *not* a WAF and does *not* claim OWASP Top 10 coverage — for full rule coverage put Cloudflare, Coraza, or libmodsecurity + OWASP CRS in front of Turbine.
 
 ```
 Request → Execution Whitelist → Data Directory Guard → Path Guard
-        → SQL Injection Guard → Code Injection Guard → Behaviour Guard
+        → Heuristic Input Filter (SQL/code patterns) → Behaviour Guard
         → PHP Execution
 ```
 
-Each guard is an Aho-Corasick automaton (~150 ns). Total overhead across all guards: **~500 ns per request** — negligible compared to PHP execution time.
+Each stage is an Aho-Corasick scan or O(1) check. Total overhead is ~500 ns per request — negligible compared to PHP execution.
 
-| Guard | What it blocks | Overhead |
+| Layer | What it does | Overhead |
 |-------|---------------|----------|
-| **SQL Injection** | `UNION SELECT`, `SLEEP()`, `WAITFOR DELAY`, `LOAD_FILE`, stacked queries, hex obfuscation, 36 patterns | ~150 ns |
-| **Code Injection** | `eval()`, `system()`, `shell_exec()`, obfuscation chains (`eval(base64_decode(…))`), backtick, `ReflectionFunction`, 36 patterns | ~100–200 ns |
-| **Behaviour Guard** | Rate limiting per IP, scanning detection (high 4xx rate), SQLi accumulation → permanent IP block | ~200 ns |
-| **Path Guard** | `../` traversal, null bytes, double-encoding | ~50 ns |
-| **Execution Whitelist** | Only whitelisted PHP files are executable via HTTP | O(1) hash |
-| **Data Dir Guard** | PHP execution inside `uploads/`, `storage/` is always blocked | O(1) |
+| **Execution whitelist** | Only the detected entry point (or an explicit whitelist) can be executed via HTTP | O(1) hash |
+| **Data-dir guard** | Blocks PHP execution inside `uploads/`, `storage/`, etc. even if an attacker drops a `.php` file there | O(1) |
+| **Path guard** | Rejects `../`, null bytes, double-encoding | ~50 ns |
+| **SQL input filter** | Heuristic Aho-Corasick scan for high-signal tokens (`UNION SELECT`, `SLEEP(`, `LOAD_FILE(`, `INTO OUTFILE`, stacked queries, hex obfuscation, …). Tiered by `paranoia_level`. | ~150 ns |
+| **Code input filter** | Heuristic scan for `eval(`, `system(`, `shell_exec(`, backtick, obfuscation chains (`eval(base64_decode(…))`), `ReflectionFunction`, `$$`, …. Tiered by `paranoia_level`. | ~100–200 ns |
+| **Behaviour guard** | Per-IP scanning detection (high 4xx rate) and SQLi-attempt accumulation → temporary IP block. Optional rate limit (off by default). | ~200 ns |
 
-POST bodies (JSON and form-encoded) are also scanned — not just query strings.
+POST bodies (JSON and form-encoded) are scanned as well as query strings (first 8 KB of JSON).
+
+### Honest caveats
+
+- The SQL/code input filters are **heuristic** — they match substrings, not parsed tokens. They will miss clever obfuscation and can produce false positives on legitimate technical content. Tune with `paranoia_level` (0–3, default 1) and `exclude_paths`.
+- `max_requests_per_second` defaults to `0` (rate limit disabled). Set it explicitly if you want a hard cap per IP.
+- Path-traversal, execution whitelist, data-dir guard, and PHP INI hardening are deterministic and always safe to leave on.
 
 All guards are enabled by default. Toggle individually in `turbine.toml`:
 
 ```toml
 [security]
-enabled                = true
-sql_guard              = true
-code_injection_guard   = true
-path_traversal_guard   = true
-behaviour_guard        = true
-max_requests_per_second = 100
-sqli_block_threshold   = 3      # block IP after N SQLi attempts
+enabled                  = true
+sql_guard                = true
+code_injection_guard     = true
+path_traversal_guard     = true
+behaviour_guard          = true
+paranoia_level           = 1         # 0=off, 1=high-signal (default), 2=moderate, 3=aggressive (high FP)
+exclude_paths            = ["/admin", "/api/docs"]  # skip input filter (behaviour guard still runs)
+max_requests_per_second  = 0         # 0 = disabled (opt-in)
+sqli_block_threshold     = 3         # IP blocked after N heuristic SQLi matches
 ```
 
 > **Try it live:** the [`examples/raw-php/security-demo`](examples/raw-php/security-demo/) example ships an interactive browser UI where you can fire every attack type and watch them blocked in real time.
@@ -311,7 +319,7 @@ See [docs/tls.md](docs/tls.md) for ACME auto-TLS setup.
 | **Worker modes** | [**docs/worker.md**](docs/worker.md) — process vs thread, the key choice |
 | Configuration reference | [docs/config.md](docs/config.md) |
 | Building from source | [docs/compile.md](docs/compile.md) |
-| **Security model** | [**docs/security.md**](docs/security.md) — OWASP guards, sandbox, PHP hardening |
+| **Security model** | [**docs/security.md**](docs/security.md) — sandbox layers, heuristic filters, PHP hardening |
 | **Dashboard & Internal API** | [**docs/dashboard.md**](docs/dashboard.md) — UI panels, blocked IPs, Prometheus, cache clear |
 | Performance | [docs/performance.md](docs/performance.md) |
 | Laravel integration | [docs/laravel.md](docs/laravel.md) |
@@ -328,7 +336,7 @@ crates/
   turbine-php-sys/    PHP FFI bindings, embed SAPI integration
   turbine-engine/     PHP engine lifecycle management
   turbine-worker/     Worker pool (process & thread modes)
-  turbine-security/   OWASP security guards, sandbox
+  turbine-security/   Sandbox, heuristic input filter, per-IP behaviour guard
   turbine-metrics/    Performance metrics
   turbine-cache/      Response caching
 ```

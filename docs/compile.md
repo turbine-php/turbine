@@ -116,7 +116,7 @@ rustphp/
 │   ├── turbine-php-sys/      # PHP C FFI bindings
 │   ├── turbine-engine/       # PHP embed SAPI wrapper
 │   ├── turbine-worker/       # Multi-process worker pool
-│   ├── turbine-security/     # OWASP security guards
+│   ├── turbine-security/     # Sandbox, heuristic input filter, behaviour guard
 │   ├── turbine-metrics/      # Prometheus metrics
 │   └── turbine-cache/        # Response caching
 ├── scripts/

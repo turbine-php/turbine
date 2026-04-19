@@ -1,5 +1,5 @@
 # Turbine — Security Demo
-# All OWASP guards enabled with a low rate-limit for demo purposes.
+# All heuristic guards enabled with a low rate-limit for demo purposes.
 
 [server]
 workers = 2

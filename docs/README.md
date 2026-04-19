@@ -1,6 +1,6 @@
 # Turbine Documentation
 
-Turbine is a high-performance PHP application server written in Rust. It embeds PHP directly via the embed SAPI, eliminating the overhead of PHP-FPM, Nginx, and inter-process communication — and ships with a **built-in OWASP security layer** that runs in the same process with ~500 ns overhead, replacing the need for an external WAF or ModSecurity.
+Turbine is a high-performance PHP application server written in Rust. It embeds PHP directly via the embed SAPI, eliminating the overhead of PHP-FPM, Nginx, and inter-process communication — and ships with a **built-in in-process security sandbox** (execution whitelist, path guard, heuristic input filter, per-IP behaviour guard, PHP INI hardening) that runs in the same process with ~500 ns overhead. It is intentionally *not* a WAF: put Cloudflare, Coraza, or libmodsecurity + OWASP CRS in front of Turbine if you need full WAF rule coverage.
 
 ## Architecture
 
@@ -39,7 +39,7 @@ See [Worker Lifecycle](worker-lifecycle.md) for the lightweight boot/handler sys
 - **Config-Driven** — Everything configured via `turbine.toml`
 - **Built-in HTTP/1.1 & HTTP/2** — Powered by Hyper (Rust), no external web server needed
 - **Embedded PHP 8.4/8.5** — Native embed SAPI, shared OPcache, JIT compilation
-- **OWASP Security Guards** — SQL injection (36 patterns), code injection (36 patterns + 7 obfuscation chains), behaviour analysis (rate limiting, SQLi IP banning) — all in Rust, ~500 ns overhead, no WAF required. POST JSON bodies scanned. See [Security](security.md).
+- **Built-in Sandbox** — execution whitelist, data-dir guard, path-traversal guard, PHP INI hardening, heuristic SQL/code input filter (tiered by `paranoia_level`), per-IP behaviour guard (scan detection + optional rate limit). All in Rust, ~500 ns overhead. POST JSON/form bodies scanned. See [Security](security.md).
 - **Brotli, Zstd, Gzip Compression** — Automatic response compression with configurable algorithms
 - **Auto-scaling Workers** — Dynamic worker pool that scales up/down based on load
 - **ACME Auto-TLS** — Automatic Let's Encrypt certificate provisioning and renewal
@@ -135,7 +135,7 @@ Settings:
 | [Configuration](config.md) | Complete `turbine.toml` reference |
 | [**Worker Mode**](worker.md) | **Process vs Thread — the most important choice. Persistent workers, auto-scaling, named pools, Tokio tuning** |
 | [PHP Extensions](extensions.md) | Adding static and dynamic PHP extensions |
-| [Security](security.md) | OWASP guards, sandbox, rate limiting |
+| [Security](security.md) | Sandbox layers, heuristic input filter, behaviour guard |
 | [**Dashboard & Internal API**](dashboard.md) | **HTML dashboard, blocked IPs panel, Prometheus, cache clear, Bearer auth** |
 | [Phalcon](phalcon.md) | Phalcon native support with persistent workers |
 | [WordPress](wordpress.md) | WordPress native support with auto-security |

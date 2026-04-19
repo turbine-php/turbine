@@ -283,10 +283,13 @@ bench_user_post:
     methods: [POST]
 YAMLEOF
 
-# Prod mode: no debug, no profiler, cached routes/config
+# Prod mode: no debug, no profiler, cached routes/config.
+# DEFAULT_URI is required when the kernel is booted without a request
+# context (persistent workers) — the router resolves it at compile time.
 cat > /var/www/symfony/.env.local << 'ENVEOF'
 APP_ENV=prod
 APP_DEBUG=0
+DEFAULT_URI=http://localhost/
 ENVEOF
 
 # Warm cache for prod environment so first request isn't slow
@@ -305,8 +308,9 @@ cat > /var/www/symfony/turbine-boot.php << 'PHPEOF'
 <?php
 declare(strict_types=1);
 require __DIR__.'/vendor/autoload_runtime.php';
-$_SERVER['APP_ENV']   = $_ENV['APP_ENV']   = 'prod';
-$_SERVER['APP_DEBUG'] = $_ENV['APP_DEBUG'] = '0';
+$_SERVER['APP_ENV']     = $_ENV['APP_ENV']     = 'prod';
+$_SERVER['APP_DEBUG']   = $_ENV['APP_DEBUG']   = '0';
+$_SERVER['DEFAULT_URI'] = $_ENV['DEFAULT_URI'] = 'http://localhost/';
 require __DIR__.'/vendor/autoload.php';
 $GLOBALS['__turbine_kernel'] = new \App\Kernel('prod', false);
 $GLOBALS['__turbine_kernel']->boot();

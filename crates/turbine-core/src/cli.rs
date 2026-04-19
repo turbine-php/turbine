@@ -9,7 +9,7 @@ use clap::{Parser, Subcommand};
     about = "Turbine Runtime — high-performance PHP runtime built in Rust",
     long_about = "Runtime PHP de alta performance com segurança nativa, construído em Rust.\n\n\
                   Executa aplicações PHP com worker pool persistente, OPcode cache,\n\
-                  sandbox de segurança (OWASP Top 10) e response cache automático."
+                  sandbox de segurança (heurístico, não-WAF) e response cache automático."
 )]
 pub struct Cli {
     #[command(subcommand)]

@@ -1,6 +1,6 @@
 [package]
 name = "turbine-security"
-description = "OWASP Top 10 security guards — SQLi, XSS, path traversal, code injection"
+description = "Turbine in-process sandbox: execution whitelist, path guard, heuristic SQL/code input filter, per-IP behaviour guard (not a WAF)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

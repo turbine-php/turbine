@@ -100,21 +100,30 @@ upload_tmp_dir = "/tmp/turbine-uploads"
 # date.timezone = "UTC"
 
 [security]
-# Master switch for all OWASP guards
+# Master switch for all security guards (sandbox + heuristic filters)
 enabled = true
-# SQL injection detection (Aho-Corasick, ~150ns overhead)
+# SQL input filter (Aho-Corasick heuristic, ~150ns overhead — NOT a WAF)
 sql_guard = true
-# Code injection detection (eval, system, shell metacharacters)
+# Code input filter (eval, system, shell metacharacters — heuristic)
 code_injection_guard = true
 # Path traversal prevention (../, null bytes)
 path_traversal_guard = true
-# Behaviour analysis (rate limiting, scanning detection)
+# Behaviour analysis (rate limiting, scanning detection, per-IP profile)
 behaviour_guard = true
-# Max requests per second per IP (0 = unlimited)
-max_requests_per_second = 100
+# Heuristic paranoia level for SQL/code input filters:
+#   0 = filters disabled (path/exec/INI guards still run)
+#   1 = very high-signal only (default, low false-positive)
+#   2 = moderate (adds DDL, stacked queries, decoders)
+#   3 = aggressive (adds include(, str_replace(, $_GET[ … high false-positive)
+paranoia_level = 1
+# Path prefixes that skip the input filter (behaviour guard still runs)
+# exclude_paths = ["/admin", "/api/docs"]
+# Max requests per second per IP (0 = disabled; opt-in)
+max_requests_per_second = 0
 # Rate limit time window in seconds
 rate_limit_window = 60
-# Block IP permanently after this many SQL injection attempts (resets after block expires)
+# Temporarily block IP after this many heuristic SQLi matches
+# (only active when paranoia_level >= 2)
 sqli_block_threshold = 3
 
 [sandbox]

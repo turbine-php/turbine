@@ -14,15 +14,15 @@ listen = "127.0.0.1:8080"
 # ini = { "memory_limit" = "256M" }
 
 [security]
-# Enable OWASP Top 10 guards
+# Enable built-in security sandbox (NOT a WAF — put Cloudflare/Coraza upstream for OWASP CRS coverage)
 enabled = true
-# SQL injection guard
+# SQL input filter (heuristic)
 sql_guard = true
 # Path traversal guard
 path_traversal_guard = true
-# Code injection guard
+# Code input filter (heuristic)
 code_injection_guard = true
-# Behaviour guard (rate limiting, scanning detection)
+# Behaviour guard (scan detection, per-IP profile, optional rate limit)
 behaviour_guard = true
 
 [sandbox]
