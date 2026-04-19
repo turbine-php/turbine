@@ -365,6 +365,13 @@ level = "error"
 
 [cache]
 enabled = false
+
+# Rate limiting / behaviour guard disabled for benchmarks:
+# default is max_requests_per_second=100 per IP which causes 403s once wrk
+# starts pushing real load. FPM / FrankenPHP have no equivalent guard, so
+# keeping it enabled here would measure rate-limiter overhead, not PHP work.
+[security]
+enabled = false
 ${extra_sections}
 TOML
 }
