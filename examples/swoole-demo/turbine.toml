@@ -1,0 +1,35 @@
+# Turbine config for the combined Swoole-style demo.
+#
+# Every primitive is enabled; tweak to taste.  The dashboard token
+# gates writes to the admin endpoints (`/_/table/*`, `/_/task/*`,
+# `/_/ws/*`, `/_/async/*`).  Reads to `/_/metrics` are always allowed.
+
+[server]
+listen  = "0.0.0.0:8080"
+workers = 4
+
+[dashboard]
+enabled = true
+token   = "dev-token-change-me"
+
+[shared_table]
+enabled     = true
+max_entries = 10000
+
+[task_queue]
+enabled          = true
+max_channels     = 32
+channel_capacity = 10000
+max_wait_ms      = 30000
+
+[websocket]
+enabled          = true
+max_channels     = 64
+channel_capacity = 256
+max_frame_size   = 65536
+
+[async_io]
+enabled        = true
+allowed_roots  = ["./examples/swoole-demo/data"]
+max_io_bytes   = 1048576
+max_timer_ms   = 600000

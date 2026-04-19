@@ -420,3 +420,38 @@ picks up the job 30 s later.
   Use `scandir`/`unlink` in PHP; they're already non-blocking enough
   for typical workloads.
 
+
+## Metrics
+
+All four primitives report counters/gauges via a unified Prometheus
+exposition at `GET /_/metrics`.  The endpoint is always mounted even
+if no primitive is enabled — the minimum response contains only
+`turbine_build_info 1` so a scraper never sees a 404.
+
+| Metric                                  | Type    | Source       |
+|-----------------------------------------|---------|--------------|
+| `turbine_shared_table_size`             | gauge   | SharedTable  |
+| `turbine_shared_table_evictions_total`  | counter | SharedTable  |
+| `turbine_task_queue_channels`           | gauge   | TaskQueue    |
+| `turbine_task_queue_pushed_total`       | counter | TaskQueue    |
+| `turbine_task_queue_popped_total`       | counter | TaskQueue    |
+| `turbine_task_queue_rejected_total`     | counter | TaskQueue    |
+| `turbine_ws_channels`                   | gauge   | WsHub        |
+| `turbine_ws_published_total`            | counter | WsHub        |
+| `turbine_ws_subscribed_total`           | counter | WsHub        |
+| `turbine_ws_rejected_total`             | counter | WsHub        |
+| `turbine_async_reads_total`             | counter | AsyncIo      |
+| `turbine_async_writes_total`            | counter | AsyncIo      |
+| `turbine_async_timers_scheduled_total`  | counter | AsyncIo      |
+| `turbine_async_timers_fired_total`      | counter | AsyncIo      |
+| `turbine_async_allowed_roots`           | gauge   | AsyncIo      |
+| `turbine_build_info`                    | gauge   | always `1`   |
+
+Scrape example:
+
+```bash
+curl -s http://127.0.0.1:8080/_/metrics | grep turbine_task_queue
+```
+
+A combined end-to-end demo exercising all four primitives lives in
+[`examples/swoole-demo/`](../examples/swoole-demo/README.md).

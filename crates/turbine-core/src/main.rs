@@ -42,7 +42,9 @@ mod acme;
 mod admin;
 mod async_io;
 mod cli;
+mod cli_cmds;
 mod compat;
+mod compression;
 mod config;
 mod dashboard;
 mod embed;
@@ -50,6 +52,7 @@ mod features;
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
 mod io_uring_backend;
 mod path_guard;
+mod prometheus;
 mod shared_table;
 mod task_queue;
 mod websocket;
@@ -126,12 +129,12 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Command::Init) => cmd_init(),
-        Some(Command::Config) => cmd_config(),
-        Some(Command::Info) => cmd_info(),
-        Some(Command::Check { config }) => cmd_check(config),
-        Some(Command::Status { address }) => cmd_status(&address),
-        Some(Command::CacheClear { address }) => cmd_cache_clear(&address),
+        Some(Command::Init) => cli_cmds::cmd_init(),
+        Some(Command::Config) => cli_cmds::cmd_config(),
+        Some(Command::Info) => cli_cmds::cmd_info(),
+        Some(Command::Check { config }) => cli_cmds::cmd_check(config),
+        Some(Command::Status { address }) => cli_cmds::cmd_status(&address),
+        Some(Command::CacheClear { address }) => cli_cmds::cmd_cache_clear(&address),
         Some(Command::Serve {
             listen,
             workers,
@@ -157,209 +160,9 @@ fn main() {
     }
 }
 
-/// `turbine init` — generate a default turbine.toml
-fn cmd_init() {
-    let path = std::env::current_dir()
-        .unwrap_or_default()
-        .join("turbine.toml");
-    if path.exists() {
-        eprintln!("turbine.toml already exists");
-        std::process::exit(1);
-    }
-    std::fs::write(&path, RuntimeConfig::template()).expect("Failed to write turbine.toml");
-    println!("Created {}", path.display());
-}
-
-/// `turbine check` — validate turbine.toml configuration
-fn cmd_check(config_path: Option<String>) {
-    let path = config_path.unwrap_or_else(|| {
-        std::env::current_dir()
-            .unwrap_or_default()
-            .join("turbine.toml")
-            .to_string_lossy()
-            .to_string()
-    });
-
-    // Step 1: Check file exists
-    if !std::path::Path::new(&path).exists() {
-        eprintln!("\x1b[31m✗\x1b[0m Config file not found: {path}");
-        std::process::exit(1);
-    }
-
-    // Step 2: Read and parse TOML
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("\x1b[31m✗\x1b[0m Failed to read {path}: {e}");
-            std::process::exit(1);
-        }
-    };
-
-    let config: RuntimeConfig = match toml::from_str(&content) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("\x1b[31m✗\x1b[0m TOML parse error in {path}:");
-            eprintln!("  {e}");
-            std::process::exit(1);
-        }
-    };
-
-    // Step 3: Run semantic validation
-    let (errors, warnings) = config.check();
-
-    println!("\x1b[1mTurbine Configuration Check\x1b[0m");
-    println!("  File: {path}");
-    println!();
-
-    // Summary of key settings
-    println!("\x1b[1mSettings:\x1b[0m");
-    println!("  workers          = {}", config.server.workers);
-    println!("  worker_mode      = {}", config.server.worker_mode);
-    println!(
-        "  persistent       = {}",
-        config.server.persistent_workers.unwrap_or(false)
-    );
-    println!("  listen           = {}", config.server.listen);
-    println!("  request_timeout  = {}s", config.server.request_timeout);
-    println!("  max_requests     = {}", config.server.worker_max_requests);
-    if let Some(t) = config.server.tokio_worker_threads {
-        println!("  tokio_threads    = {t}");
-    }
-    println!("  security         = {}", config.security.enabled);
-    println!("  compression      = {}", config.compression.enabled);
-    println!("  cache            = {}", config.cache.enabled);
-    println!("  tls              = {}", config.server.tls.enabled);
-    if !config.virtual_hosts.is_empty() {
-        println!("  virtual_hosts    = {}", config.virtual_hosts.len());
-        for vhost in &config.virtual_hosts {
-            let aliases = if vhost.aliases.is_empty() {
-                String::new()
-            } else {
-                format!(" (+ {})", vhost.aliases.join(", "))
-            };
-            println!("    {} → {}{}", vhost.domain, vhost.root, aliases);
-        }
-    }
-    println!();
-
-    let mut has_issues = false;
-
-    if !errors.is_empty() {
-        has_issues = true;
-        println!("\x1b[31m✗ {} error(s):\x1b[0m", errors.len());
-        for e in &errors {
-            println!("  \x1b[31m•\x1b[0m {e}");
-        }
-        println!();
-    }
-
-    if !warnings.is_empty() {
-        has_issues = true;
-        println!("\x1b[33m⚠ {} warning(s):\x1b[0m", warnings.len());
-        for w in &warnings {
-            println!("  \x1b[33m•\x1b[0m {w}");
-        }
-        println!();
-    }
-
-    if has_issues {
-        if !errors.is_empty() {
-            eprintln!("\x1b[31m✗ Configuration has errors that must be fixed.\x1b[0m");
-            std::process::exit(1);
-        } else {
-            println!("\x1b[33m⚠ Configuration is valid but has warnings.\x1b[0m");
-        }
-    } else {
-        println!("\x1b[32m✓ Configuration is valid. No errors or warnings.\x1b[0m");
-    }
-}
-
-/// `turbine config` — display current configuration
-fn cmd_config() {
-    let config = RuntimeConfig::load();
-    println!("{config:#?}");
-}
-
-/// `turbine info` — show PHP engine information
-fn cmd_info() {
-    let engine = match PhpEngine::init() {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("Failed to init PHP: {e}");
-            std::process::exit(1);
-        }
-    };
-    println!("PHP version: {}", engine.php_version());
-    println!("Embed SAPI:  active");
-    println!("Turbine:     v{}", env!("CARGO_PKG_VERSION"));
-}
-
-/// `turbine status` — query a running server's status endpoint
-fn cmd_status(address: &str) {
-    let url = format!("http://{address}/_/status");
-    match std::net::TcpStream::connect(address) {
-        Ok(mut stream) => {
-            use std::io::{BufRead, BufReader, Write};
-            let req =
-                format!("GET /_/status HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n");
-            let _ = stream.write_all(req.as_bytes());
-            let mut response = String::new();
-            let mut reader = BufReader::new(&stream);
-            loop {
-                let mut line = String::new();
-                match reader.read_line(&mut line) {
-                    Ok(0) => break,
-                    Ok(_) => response.push_str(&line),
-                    Err(_) => break,
-                }
-            }
-            if let Some(body_start) = response.find("\r\n\r\n") {
-                print!("{}", &response[body_start + 4..]);
-            } else {
-                eprintln!("Invalid response from {url}");
-                std::process::exit(1);
-            }
-        }
-        Err(e) => {
-            eprintln!("Cannot connect to {address}: {e}");
-            eprintln!("Is the server running? Start with: turbine serve");
-            std::process::exit(1);
-        }
-    }
-}
-
-/// `turbine cache:clear` — send cache clear command to running server
-fn cmd_cache_clear(address: &str) {
-    match std::net::TcpStream::connect(address) {
-        Ok(mut stream) => {
-            use std::io::{BufRead, BufReader, Write};
-            let req = format!(
-                "POST /_/cache/clear HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
-            );
-            let _ = stream.write_all(req.as_bytes());
-            let mut response = String::new();
-            let mut reader = BufReader::new(&stream);
-            loop {
-                let mut line = String::new();
-                match reader.read_line(&mut line) {
-                    Ok(0) => break,
-                    Ok(_) => response.push_str(&line),
-                    Err(_) => break,
-                }
-            }
-            if let Some(body_start) = response.find("\r\n\r\n") {
-                print!("{}", &response[body_start + 4..]);
-            } else {
-                eprintln!("Invalid response");
-                std::process::exit(1);
-            }
-        }
-        Err(e) => {
-            eprintln!("Cannot connect to {address}: {e}");
-            std::process::exit(1);
-        }
-    }
-}
+// CLI subcommand handlers (`init`, `check`, `config`, `info`, `status`,
+// `cache:clear`) live in [`cli_cmds`].  Only `cmd_serve` remains in
+// this file because it is tightly coupled to the runtime bootstrap.
 
 /// Lock-free dispatch for thread-mode workers.
 ///
@@ -3440,6 +3243,13 @@ async fn handle_request_inner(
             .await);
         }
 
+        // ── Prometheus exposition ────────────────────────────────────────
+        // Always mounted: returns a baseline `turbine_build_info` marker
+        // plus counters/gauges for any enabled primitive.
+        if clean_path == "/_/metrics" {
+            return Ok(prometheus::handle_metrics(&state));
+        }
+
         return Ok(build_response(
             404,
             "text/plain",
@@ -4960,71 +4770,7 @@ fn parse_turbine_response_envelope(body: &[u8]) -> Option<(u16, Vec<(String, Str
     Some((status_code, headers, payload))
 }
 
-/// Compress response body with gzip if it exceeds min_size and the content type is compressible.
-fn is_compressible_content_type(content_type: &str) -> bool {
-    content_type.contains("text/")
-        || content_type.contains("application/json")
-        || content_type.contains("application/javascript")
-        || content_type.contains("application/xml")
-        || content_type.contains("image/svg+xml")
-        || content_type.contains("application/manifest+json")
-}
-
-fn gzip_compress(data: &[u8], level: u32) -> Vec<u8> {
-    use flate2::write::GzEncoder;
-    use flate2::Compression;
-    use std::io::Write;
-
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::new(level));
-    if encoder.write_all(data).is_err() {
-        return data.to_vec();
-    }
-    encoder.finish().unwrap_or_else(|_| data.to_vec())
-}
-
-fn brotli_compress(data: &[u8], level: u32) -> Vec<u8> {
-    let mut output = Vec::new();
-    let quality = level.min(11);
-    let params = brotli::enc::BrotliEncoderParams {
-        quality: quality as i32,
-        ..Default::default()
-    };
-    if brotli::BrotliCompress(&mut &data[..], &mut output, &params).is_err() {
-        return data.to_vec();
-    }
-    output
-}
-
-fn zstd_compress(data: &[u8], level: u32) -> Vec<u8> {
-    let zstd_level = level.min(19) as i32;
-    zstd::bulk::compress(data, zstd_level).unwrap_or_else(|_| data.to_vec())
-}
-
-/// Negotiate the best compression algorithm based on client's Accept-Encoding
-/// and server's preferred order. Returns (encoding_name, compressed_data).
-fn negotiate_compression(
-    accept_encoding: &str,
-    server_prefs: &[String],
-    data: &[u8],
-    level: u32,
-) -> Option<(&'static str, Vec<u8>)> {
-    let ae = accept_encoding.to_lowercase();
-    for pref in server_prefs {
-        match pref.as_str() {
-            "br" if ae.contains("br") => {
-                return Some(("br", brotli_compress(data, level)));
-            }
-            "zstd" if ae.contains("zstd") => {
-                return Some(("zstd", zstd_compress(data, level)));
-            }
-            "gzip" if ae.contains("gzip") => {
-                return Some(("gzip", gzip_compress(data, level)));
-            }
-            _ => {}
-        }
-    }
-    None
-}
+use compression::{is_compressible_content_type, negotiate_compression};
 
 /// Check if a request origin is allowed by the CORS config.
 fn cors_origin_allowed(cors: &config::CorsConfig, origin: &str) -> bool {
