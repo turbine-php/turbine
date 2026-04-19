@@ -153,9 +153,28 @@ fn write_php_ini(overrides: &PhpIniOverrides) -> std::path::PathBuf {
         if !overrides.preload_script.is_empty() {
             let preload_path = std::path::Path::new(&overrides.preload_script);
             if preload_path.exists() {
+                // PHP requires opcache.preload_user to be set to the username
+                // PHP will run as. When running as root (uid 0), an empty value
+                // triggers a fatal error: `opcache.preload requires
+                // opcache.preload_user when running under uid 0`. Resolve the
+                // current user's name via getpwuid() and fall back to "root"
+                // if the lookup fails but uid is 0.
+                let preload_user = unsafe {
+                    let uid = libc::getuid();
+                    let pw = libc::getpwuid(uid);
+                    if !pw.is_null() && !(*pw).pw_name.is_null() {
+                        std::ffi::CStr::from_ptr((*pw).pw_name)
+                            .to_string_lossy()
+                            .into_owned()
+                    } else if uid == 0 {
+                        "root".to_string()
+                    } else {
+                        String::new()
+                    }
+                };
                 ini.push_str(&format!("opcache.preload={}\n", overrides.preload_script));
-                ini.push_str("opcache.preload_user=\n");
-                info!(preload = %overrides.preload_script, "OPcache preload configured");
+                ini.push_str(&format!("opcache.preload_user={}\n", preload_user));
+                info!(preload = %overrides.preload_script, user = %preload_user, "OPcache preload configured");
             } else {
                 warn!(preload = %overrides.preload_script, "OPcache preload script not found — skipping");
             }
