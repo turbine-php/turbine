@@ -34,20 +34,20 @@ _Single PHP file returning plain-text Hello World_
 
 | Server | Req/s | vs baseline | p50 | p99 | Avg CPU | Peak Mem | Errors | Status |
 |--------|------:|:-----------:|----:|----:|:-------:|---------:|-------:|:-------|
-| Turbine NTS · 4w | 23,987 | 0.9× | 10.6 ms | 13.3 ms | 308.1% | 54 MiB | 0 | ✅ |
-| Turbine NTS · 8w | 28,548 | 1.1× | 8.8 ms | 11.9 ms | 354.0% | 61 MiB | 0 | ✅ |
-| Turbine NTS · 4w · persistent | 25,411 | 1.0× | 10.0 ms | 11.9 ms | 291.4% | 49 MiB | 0 | ✅ |
-| Turbine NTS · 8w · persistent | 31,152 | 1.2× | 8.1 ms | 10.6 ms | 332.3% | 53 MiB | 0 | ✅ |
-| Turbine ZTS · 4w | 31,001 | 1.2× | 8.2 ms | 11.1 ms | 389.3% | 68 MiB | 0 | ✅ |
-| Turbine ZTS · 8w | 35,739 | 1.3× | 7.0 ms | 11.8 ms | 433.3% | 74 MiB | 0 | ✅ |
-| Turbine ZTS · 4w · persistent | 21,323 | 0.8× | 11.8 ms | 18.1 ms | 350.4% | 60 MiB | 0 | ✅ |
-| Turbine ZTS · 8w · persistent | 25,906 | 1.0× | 9.8 ms | 12.5 ms | 394.1% | 69 MiB | 0 | ✅ |
-| FrankenPHP (ZTS) · 4w | 22,042 | 0.8× | 11.0 ms | 33.6 ms | 472.6% | 62 MiB | 0 | ✅ |
-| FrankenPHP (ZTS) · 8w | 24,427 | 0.9× | 10.0 ms | 28.3 ms | 447.9% | 60 MiB | 0 | ✅ |
-| FrankenPHP (ZTS) · 4w · worker | 24,554 | 0.9× | 10.0 ms | 28.6 ms | 450.1% | 55 MiB | 0 | ✅ |
-| FrankenPHP (ZTS) · 8w · worker | 22,213 | 0.8× | 10.9 ms | 33.3 ms | 471.9% | 68 MiB | 0 | ✅ |
-| Nginx + FPM · 4w | 23,882 | 0.9× | 10.6 ms | 13.1 ms | 397.4% | 33 MiB | 0 | ✅ |
-| Nginx + FPM · 8w | 26,746 | baseline | 9.5 ms | 11.8 ms | 426.0% | 36 MiB | 0 | ✅ |
+| Turbine NTS · 4w | 23,063 | 0.8× | 11.0 ms | 13.6 ms | 300.3% | 58 MiB | 0 | ✅ |
+| Turbine NTS · 8w | 28,735 | 1.1× | 8.8 ms | 11.8 ms | 350.0% | 57 MiB | 0 | ✅ |
+| Turbine NTS · 4w · persistent | 25,582 | 0.9× | 10.0 ms | 11.7 ms | 290.6% | 48 MiB | 0 | ✅ |
+| Turbine NTS · 8w · persistent | 32,007 | 1.2× | 7.9 ms | 10.5 ms | 335.7% | 55 MiB | 0 | ✅ |
+| Turbine ZTS · 4w | 32,461 | 1.2× | 7.8 ms | 11.2 ms | 398.5% | 62 MiB | 0 | ✅ |
+| Turbine ZTS · 8w | 36,160 | 1.3× | 6.9 ms | 10.9 ms | 436.0% | 77 MiB | 0 | ✅ |
+| Turbine ZTS · 4w · persistent | 21,915 | 0.8× | 11.6 ms | 13.8 ms | 350.7% | 59 MiB | 0 | ✅ |
+| Turbine ZTS · 8w · persistent | 25,788 | 1.0× | 9.8 ms | 12.3 ms | 391.4% | 69 MiB | 0 | ✅ |
+| FrankenPHP (ZTS) · 4w | 22,642 | 0.8× | 10.8 ms | 32.8 ms | 473.6% | 63 MiB | 0 | ✅ |
+| FrankenPHP (ZTS) · 8w | 22,555 | 0.8× | 10.8 ms | 33.8 ms | 472.6% | 56 MiB | 0 | ✅ |
+| FrankenPHP (ZTS) · 4w · worker | 21,849 | 0.8× | 11.1 ms | 34.5 ms | 473.1% | 62 MiB | 0 | ✅ |
+| FrankenPHP (ZTS) · 8w · worker | 22,297 | 0.8× | 10.9 ms | 34.4 ms | 471.6% | 56 MiB | 0 | ✅ |
+| Nginx + FPM · 4w | 23,703 | 0.9× | 10.7 ms | 13.3 ms | 397.7% | 32 MiB | 0 | ✅ |
+| Nginx + FPM · 8w | 27,135 | baseline | 9.3 ms | 11.6 ms | 426.3% | 36 MiB | 0 | ✅ |
 
 ## Laravel
 
@@ -55,20 +55,20 @@ _Laravel 13 — mixed JSON routes: GET /, GET /user/:id, POST /user (stateless, 
 
 | Server | Req/s | vs baseline | p50 | p99 | Avg CPU | Peak Mem | Errors | Status |
 |--------|------:|:-----------:|----:|----:|:-------:|---------:|-------:|:-------|
-| Turbine NTS · 4w | 152 | 0.1× | 1683.9 ms | 1729.0 ms | 403.8% | 97 MiB | 0 | ✅ |
-| Turbine NTS · 8w | 773 | 0.3× | 329.0 ms | 349.7 ms | 782.5% | 103 MiB | 0 | ✅ |
-| Turbine NTS · 4w · persistent | 4,858 | 1.8× | 52.3 ms | 56.1 ms | 481.1% | 108 MiB | 0 | ✅ |
-| Turbine NTS · 8w · persistent | 5,862 | 2.1× | 43.4 ms | 50.0 ms | 661.2% | 287 MiB | 0 | ✅ |
-| Turbine ZTS · 4w | 140 | 0.1× | 1812.5 ms | 1853.7 ms | 403.8% | 101 MiB | 0 | ✅ |
-| Turbine ZTS · 8w | 755 | 0.3× | 338.2 ms | 355.5 ms | 783.6% | 115 MiB | 0 | ✅ |
-| Turbine ZTS · 4w · persistent | 4,577 | 1.6× | 55.8 ms | 58.8 ms | 480.9% | 117 MiB | 0 | ✅ |
-| Turbine ZTS · 8w · persistent | 5,484 | 2.0× | 46.3 ms | 53.2 ms | 665.5% | 296 MiB | 0 | ✅ |
-| FrankenPHP (ZTS) · 4w | 1,493 | 0.5× | 169.2 ms | 197.5 ms | 765.6% | 94 MiB | 0 | ✅ |
-| FrankenPHP (ZTS) · 8w | 2,912 | 1.0× | 87.3 ms | 103.0 ms | 745.9% | 87 MiB | 0 | ✅ |
-| FrankenPHP (ZTS) · 4w · worker | 1,506 | 0.5× | 169.0 ms | 185.1 ms | 766.1% | 92 MiB | 0 | ✅ |
-| FrankenPHP (ZTS) · 8w · worker | 2,931 | 1.1× | 86.6 ms | 103.5 ms | 746.0% | 85 MiB | 0 | ✅ |
-| Nginx + FPM · 4w | 1,826 | 0.7× | 139.8 ms | 151.5 ms | 426.1% | 67 MiB | 0 | ✅ |
-| Nginx + FPM · 8w | 2,775 | baseline | 91.7 ms | 101.4 ms | 708.5% | 75 MiB | 0 | ✅ |
+| Turbine NTS · 4w | 151 | 0.1× | 1685.2 ms | 1708.8 ms | 403.0% | 93 MiB | 0 | ✅ |
+| Turbine NTS · 8w | 748 | 0.3× | 341.9 ms | 357.2 ms | 783.7% | 102 MiB | 0 | ✅ |
+| Turbine NTS · 4w · persistent | 4,710 | 1.7× | 54.2 ms | 57.8 ms | 484.0% | 107 MiB | 0 | ✅ |
+| Turbine NTS · 8w · persistent | 5,586 | 2.0× | 45.5 ms | 52.5 ms | 661.7% | 284 MiB | 0 | ✅ |
+| Turbine ZTS · 4w | 139 | 0.0× | 1826.9 ms | 1874.2 ms | 402.7% | 103 MiB | 0 | ✅ |
+| Turbine ZTS · 8w | 730 | 0.3× | 350.6 ms | 370.1 ms | 783.4% | 116 MiB | 0 | ✅ |
+| Turbine ZTS · 4w · persistent | 4,372 | 1.6× | 58.4 ms | 61.7 ms | 481.0% | 117 MiB | 0 | ✅ |
+| Turbine ZTS · 8w · persistent | 4,976 | 1.8× | 51.1 ms | 57.9 ms | 634.6% | 280 MiB | 0 | ✅ |
+| FrankenPHP (ZTS) · 4w | 1,436 | 0.5× | 177.3 ms | 193.8 ms | 766.8% | 91 MiB | 0 | ✅ |
+| FrankenPHP (ZTS) · 8w | 2,858 | 1.0× | 89.0 ms | 103.8 ms | 747.1% | 85 MiB | 0 | ✅ |
+| FrankenPHP (ZTS) · 4w · worker | 1,473 | 0.5× | 173.0 ms | 189.7 ms | 766.3% | 90 MiB | 0 | ✅ |
+| FrankenPHP (ZTS) · 8w · worker | 2,879 | 1.0× | 88.7 ms | 103.7 ms | 747.0% | 86 MiB | 0 | ✅ |
+| Nginx + FPM · 4w | 1,792 | 0.6× | 142.3 ms | 155.3 ms | 426.2% | 68 MiB | 0 | ✅ |
+| Nginx + FPM · 8w | 2,814 | baseline | 90.3 ms | 99.8 ms | 713.0% | 76 MiB | 0 | ✅ |
 
 ## Symfony
 
@@ -76,20 +76,20 @@ _Symfony 7 — mixed JSON routes: GET /, GET /user/:id, POST /user (prod env, ca
 
 | Server | Req/s | vs baseline | p50 | p99 | Avg CPU | Peak Mem | Errors | Status |
 |--------|------:|:-----------:|----:|----:|:-------:|---------:|-------:|:-------|
-| Turbine NTS · 4w | 498 | 0.1× | 512.9 ms | 524.6 ms | 413.0% | 80 MiB | 0 | ✅ |
-| Turbine NTS · 8w | 782 | 0.2× | 323.9 ms | 370.8 ms | 781.4% | 87 MiB | 0 | ✅ |
-| Turbine NTS · 4w · persistent | 0 | 0.0× | 0.0 ms | 0.0 ms | — | — | 0 | ✅ |
-| Turbine NTS · 8w · persistent | 0 | 0.0× | 0.0 ms | 0.0 ms | — | — | 0 | ✅ |
-| Turbine ZTS · 4w | 468 | 0.1× | 545.2 ms | 556.1 ms | 410.2% | 85 MiB | 0 | ✅ |
-| Turbine ZTS · 8w | 751 | 0.2× | 338.3 ms | 360.6 ms | 782.5% | 96 MiB | 0 | ✅ |
-| Turbine ZTS · 4w · persistent | 0 | 0.0× | 0.0 ms | 0.0 ms | — | — | 0 | ✅ |
-| Turbine ZTS · 8w · persistent | 0 | 0.0× | 0.0 ms | 0.0 ms | — | — | 0 | ✅ |
-| FrankenPHP (ZTS) · 4w | 4,618 | 1.2× | 54.8 ms | 72.3 ms | 721.9% | 72 MiB | 0 | ✅ |
-| FrankenPHP (ZTS) · 8w | 4,662 | 1.2× | 54.3 ms | 71.7 ms | 722.8% | 70 MiB | 0 | ✅ |
-| FrankenPHP (ZTS) · 4w · worker | 4,679 | 1.2× | 54.1 ms | 71.1 ms | 722.1% | 71 MiB | 0 | ✅ |
-| FrankenPHP (ZTS) · 8w · worker | 4,707 | 1.2× | 53.8 ms | 71.0 ms | 720.5% | 73 MiB | 0 | ✅ |
-| Nginx + FPM · 4w | 2,700 | 0.7× | 94.5 ms | 99.5 ms | 433.4% | 44 MiB | 0 | ✅ |
-| Nginx + FPM · 8w | 3,958 | baseline | 64.3 ms | 71.8 ms | 681.8% | 50 MiB | 0 | ✅ |
+| Turbine NTS · 4w | 481 | 0.1× | 533.7 ms | 557.8 ms | 411.2% | 77 MiB | 0 | ✅ |
+| Turbine NTS · 8w | 767 | 0.2× | 334.2 ms | 347.8 ms | 782.9% | 83 MiB | 0 | ✅ |
+| Turbine NTS · 4w · persistent | 15,524 | 4.0× | 16.4 ms | 20.2 ms | 430.2% | 72 MiB | 0 | ✅ |
+| Turbine NTS · 8w · persistent | 15,594 | 4.0× | 16.3 ms | 19.6 ms | 451.5% | 77 MiB | 0 | ✅ |
+| Turbine ZTS · 4w | 446 | 0.1× | 574.7 ms | 591.2 ms | 407.9% | 87 MiB | 0 | ✅ |
+| Turbine ZTS · 8w | 752 | 0.2× | 338.4 ms | 358.1 ms | 783.3% | 102 MiB | 0 | ✅ |
+| Turbine ZTS · 4w · persistent | 11,808 | 3.0× | 21.5 ms | 24.9 ms | 437.8% | 79 MiB | 0 | ✅ |
+| Turbine ZTS · 8w · persistent | 14,309 | 3.7× | 17.8 ms | 21.3 ms | 473.4% | 92 MiB | 0 | ✅ |
+| FrankenPHP (ZTS) · 4w | 4,744 | 1.2× | 53.5 ms | 70.6 ms | 725.5% | 70 MiB | 0 | ✅ |
+| FrankenPHP (ZTS) · 8w | 4,688 | 1.2× | 54.1 ms | 71.2 ms | 723.1% | 73 MiB | 0 | ✅ |
+| FrankenPHP (ZTS) · 4w · worker | 4,740 | 1.2× | 53.5 ms | 70.6 ms | 724.9% | 72 MiB | 0 | ✅ |
+| FrankenPHP (ZTS) · 8w · worker | 4,612 | 1.2× | 55.0 ms | 73.1 ms | 724.2% | 71 MiB | 0 | ✅ |
+| Nginx + FPM · 4w | 2,646 | 0.7× | 96.5 ms | 103.2 ms | 432.8% | 44 MiB | 0 | ✅ |
+| Nginx + FPM · 8w | 3,879 | baseline | 65.6 ms | 74.0 ms | 677.4% | 50 MiB | 0 | ✅ |
 
 ## Phalcon
 
@@ -99,16 +99,16 @@ _Phalcon Micro — mixed JSON routes: GET /, GET /user/:id, POST /user_
 
 | Server | Req/s | vs baseline | p50 | p99 | Avg CPU | Peak Mem | Errors | Status |
 |--------|------:|:-----------:|----:|----:|:-------:|---------:|-------:|:-------|
-| Turbine NTS · 4w | 14,665 | 0.8× | 17.3 ms | 20.4 ms | 385.9% | 61 MiB | 0 | ✅ |
-| Turbine NTS · 8w | 18,197 | 1.0× | 13.9 ms | 16.9 ms | 433.7% | 68 MiB | 0 | ✅ |
-| Turbine NTS · 4w · persistent | 16,048 | 0.9× | 15.9 ms | 18.6 ms | 382.3% | 60 MiB | 0 | ✅ |
-| Turbine NTS · 8w · persistent | 20,031 | 1.1× | 12.7 ms | 16.0 ms | 425.7% | 61 MiB | 0 | ✅ |
-| Turbine ZTS · 4w | 19,054 | 1.1× | 13.3 ms | 16.5 ms | 458.4% | 70 MiB | 0 | ✅ |
-| Turbine ZTS · 8w | 21,295 | 1.2× | 11.8 ms | 15.8 ms | 500.6% | 79 MiB | 0 | ✅ |
-| Turbine ZTS · 4w · persistent | 16,345 | 0.9× | 15.6 ms | 18.7 ms | 442.6% | 67 MiB | 0 | ✅ |
-| Turbine ZTS · 8w · persistent | 16,731 | 0.9× | 15.2 ms | 18.4 ms | 461.8% | 76 MiB | 0 | ✅ |
-| Nginx + FPM · 4w | 16,033 | 0.9× | 15.8 ms | 19.1 ms | 449.9% | 33 MiB | 0 | ✅ |
-| Nginx + FPM · 8w | 18,128 | baseline | 14.0 ms | 17.1 ms | 494.3% | 37 MiB | 0 | ✅ |
+| Turbine NTS · 4w | 14,827 | 0.8× | 17.1 ms | 20.2 ms | 384.8% | 61 MiB | 0 | ✅ |
+| Turbine NTS · 8w | 18,916 | 1.0× | 13.4 ms | 16.7 ms | 434.0% | 68 MiB | 0 | ✅ |
+| Turbine NTS · 4w · persistent | 18,619 | 1.0× | 13.7 ms | 16.5 ms | 392.4% | 57 MiB | 0 | ✅ |
+| Turbine NTS · 8w · persistent | 19,638 | 1.1× | 12.9 ms | 15.8 ms | 422.6% | 60 MiB | 0 | ✅ |
+| Turbine ZTS · 4w | 19,218 | 1.1× | 13.2 ms | 16.7 ms | 459.6% | 71 MiB | 0 | ✅ |
+| Turbine ZTS · 8w | 20,855 | 1.1× | 12.1 ms | 16.1 ms | 501.7% | 77 MiB | 0 | ✅ |
+| Turbine ZTS · 4w · persistent | 15,007 | 0.8× | 16.9 ms | 20.1 ms | 424.6% | 65 MiB | 0 | ✅ |
+| Turbine ZTS · 8w · persistent | 16,740 | 0.9× | 15.2 ms | 18.3 ms | 460.8% | 75 MiB | 0 | ✅ |
+| Nginx + FPM · 4w | 16,193 | 0.9× | 15.7 ms | 18.7 ms | 452.3% | 32 MiB | 0 | ✅ |
+| Nginx + FPM · 8w | 18,212 | baseline | 13.9 ms | 16.8 ms | 491.0% | 37 MiB | 0 | ✅ |
 
 ## PHP Scripts
 
@@ -120,20 +120,20 @@ _50 KB HTML response — SSR page simulation._
 
 | Server | Req/s | vs baseline | p50 | p99 | Avg CPU | Peak Mem | Errors | Status |
 |--------|------:|:-----------:|----:|----:|:-------:|---------:|-------:|:-------|
-| Turbine NTS · 4w | 16,603 | 1.3× | 15.3 ms | 18.6 ms | 342.6% | 57 MiB | 0 | ✅ |
-| Turbine NTS · 8w | 20,309 | 1.6× | 12.4 ms | 16.2 ms | 379.4% | 67 MiB | 0 | ✅ |
-| Turbine NTS · 4w · persistent | 17,395 | 1.4× | 14.6 ms | 17.4 ms | 328.7% | 60 MiB | 0 | ✅ |
-| Turbine NTS · 8w · persistent | 20,942 | 1.7× | 12.1 ms | 15.5 ms | 368.2% | 62 MiB | 0 | ✅ |
-| Turbine ZTS · 4w | 23,619 | 1.9× | 10.7 ms | 14.3 ms | 389.6% | 77 MiB | 0 | ✅ |
-| Turbine ZTS · 8w | 26,885 | 2.1× | 9.2 ms | 14.8 ms | 428.1% | 96 MiB | 0 | ✅ |
-| Turbine ZTS · 4w · persistent | 16,477 | 1.3× | 15.4 ms | 19.0 ms | 383.5% | 74 MiB | 0 | ✅ |
-| Turbine ZTS · 8w · persistent | 17,867 | 1.4× | 14.2 ms | 17.6 ms | 399.1% | 91 MiB | 0 | ✅ |
-| FrankenPHP (ZTS) · 4w | 12,455 | 1.0× | 19.9 ms | 49.8 ms | 401.5% | 62 MiB | 0 | ✅ |
-| FrankenPHP (ZTS) · 8w | 12,675 | 1.0× | 19.6 ms | 49.1 ms | 401.8% | 61 MiB | 0 | ✅ |
-| FrankenPHP (ZTS) · 4w · worker | 12,530 | 1.0× | 19.8 ms | 49.4 ms | 400.3% | 63 MiB | 0 | ✅ |
-| FrankenPHP (ZTS) · 8w · worker | 12,607 | 1.0× | 19.7 ms | 49.4 ms | 401.8% | 58 MiB | 0 | ✅ |
-| Nginx + FPM · 4w | 10,918 | 0.9× | 23.2 ms | 27.9 ms | 336.0% | 33 MiB | 0 | ✅ |
-| Nginx + FPM · 8w | 12,561 | baseline | 20.2 ms | 24.6 ms | 376.5% | 38 MiB | 0 | ✅ |
+| Turbine NTS · 4w | 17,815 | 1.4× | 14.2 ms | 17.7 ms | 343.2% | 63 MiB | 0 | ✅ |
+| Turbine NTS · 8w | 20,202 | 1.6× | 12.5 ms | 16.2 ms | 374.2% | 66 MiB | 0 | ✅ |
+| Turbine NTS · 4w · persistent | 18,508 | 1.5× | 13.7 ms | 16.9 ms | 329.2% | 64 MiB | 0 | ✅ |
+| Turbine NTS · 8w · persistent | 20,641 | 1.7× | 12.2 ms | 15.6 ms | 360.7% | 60 MiB | 0 | ✅ |
+| Turbine ZTS · 4w | 24,354 | 2.0× | 10.3 ms | 14.1 ms | 391.6% | 78 MiB | 0 | ✅ |
+| Turbine ZTS · 8w | 26,151 | 2.1× | 9.5 ms | 14.9 ms | 431.0% | 100 MiB | 0 | ✅ |
+| Turbine ZTS · 4w · persistent | 15,250 | 1.2× | 16.7 ms | 20.0 ms | 367.2% | 71 MiB | 0 | ✅ |
+| Turbine ZTS · 8w · persistent | 18,134 | 1.5× | 14.0 ms | 17.4 ms | 398.7% | 89 MiB | 0 | ✅ |
+| FrankenPHP (ZTS) · 4w | 12,598 | 1.0× | 19.6 ms | 49.5 ms | 400.4% | 64 MiB | 0 | ✅ |
+| FrankenPHP (ZTS) · 8w | 12,504 | 1.0× | 19.8 ms | 49.3 ms | 404.1% | 63 MiB | 0 | ✅ |
+| FrankenPHP (ZTS) · 4w · worker | 12,462 | 1.0× | 19.9 ms | 49.2 ms | 402.4% | 59 MiB | 0 | ✅ |
+| FrankenPHP (ZTS) · 8w · worker | 12,656 | 1.0× | 19.6 ms | 49.4 ms | 397.9% | 56 MiB | 0 | ✅ |
+| Nginx + FPM · 4w | 10,907 | 0.9× | 23.3 ms | 28.1 ms | 337.8% | 33 MiB | 0 | ✅ |
+| Nginx + FPM · 8w | 12,461 | baseline | 20.4 ms | 24.9 ms | 377.5% | 37 MiB | 0 | ✅ |
 
 ### PDF Binary 50 KB
 
@@ -141,20 +141,20 @@ _50 KB `application/pdf` binary response._
 
 | Server | Req/s | vs baseline | p50 | p99 | Avg CPU | Peak Mem | Errors | Status |
 |--------|------:|:-----------:|----:|----:|:-------:|---------:|-------:|:-------|
-| Turbine NTS · 4w | 18,366 | 1.4× | 13.8 ms | 17.2 ms | 353.3% | 58 MiB | 0 | ✅ |
-| Turbine NTS · 8w | 20,316 | 1.6× | 12.4 ms | 16.1 ms | 379.6% | 64 MiB | 0 | ✅ |
-| Turbine NTS · 4w · persistent | 20,304 | 1.6× | 12.4 ms | 16.0 ms | 360.5% | 56 MiB | 0 | ✅ |
-| Turbine NTS · 8w · persistent | 20,880 | 1.6× | 12.1 ms | 15.7 ms | 365.6% | 63 MiB | 0 | ✅ |
-| Turbine ZTS · 4w | 23,671 | 1.9× | 10.6 ms | 14.2 ms | 389.6% | 76 MiB | 0 | ✅ |
-| Turbine ZTS · 8w | 26,747 | 2.1× | 9.3 ms | 14.5 ms | 430.6% | 95 MiB | 0 | ✅ |
-| Turbine ZTS · 4w · persistent | 15,461 | 1.2× | 16.4 ms | 19.7 ms | 351.1% | 67 MiB | 0 | ✅ |
-| Turbine ZTS · 8w · persistent | 20,025 | 1.6× | 12.6 ms | 16.8 ms | 431.3% | 78 MiB | 0 | ✅ |
-| FrankenPHP (ZTS) · 4w | 12,412 | 1.0× | 19.9 ms | 49.2 ms | 399.4% | 61 MiB | 0 | ✅ |
-| FrankenPHP (ZTS) · 8w | 12,691 | 1.0× | 19.6 ms | 47.9 ms | 400.6% | 62 MiB | 0 | ✅ |
-| FrankenPHP (ZTS) · 4w · worker | 12,567 | 1.0× | 19.7 ms | 48.8 ms | 401.8% | 63 MiB | 0 | ✅ |
-| FrankenPHP (ZTS) · 8w · worker | 12,501 | 1.0× | 19.7 ms | 49.5 ms | 398.0% | 60 MiB | 0 | ✅ |
-| Nginx + FPM · 4w | 10,794 | 0.8× | 23.5 ms | 28.6 ms | 337.3% | 33 MiB | 0 | ✅ |
-| Nginx + FPM · 8w | 12,739 | baseline | 19.9 ms | 24.4 ms | 377.5% | 38 MiB | 0 | ✅ |
+| Turbine NTS · 4w | 17,670 | 1.4× | 14.3 ms | 17.9 ms | 341.6% | 62 MiB | 0 | ✅ |
+| Turbine NTS · 8w | 20,724 | 1.7× | 12.2 ms | 16.0 ms | 387.8% | 63 MiB | 0 | ✅ |
+| Turbine NTS · 4w · persistent | 17,903 | 1.5× | 14.2 ms | 17.4 ms | 322.3% | 63 MiB | 0 | ✅ |
+| Turbine NTS · 8w · persistent | 20,779 | 1.7× | 12.1 ms | 15.7 ms | 361.3% | 56 MiB | 0 | ✅ |
+| Turbine ZTS · 4w | 23,788 | 1.9× | 10.6 ms | 14.1 ms | 389.2% | 74 MiB | 0 | ✅ |
+| Turbine ZTS · 8w | 26,528 | 2.2× | 9.4 ms | 14.7 ms | 432.6% | 94 MiB | 0 | ✅ |
+| Turbine ZTS · 4w · persistent | 17,404 | 1.4× | 14.6 ms | 18.2 ms | 382.7% | 67 MiB | 0 | ✅ |
+| Turbine ZTS · 8w · persistent | 18,248 | 1.5× | 13.9 ms | 17.3 ms | 403.3% | 91 MiB | 0 | ✅ |
+| FrankenPHP (ZTS) · 4w | 12,442 | 1.0× | 19.9 ms | 49.2 ms | 400.8% | 64 MiB | 0 | ✅ |
+| FrankenPHP (ZTS) · 8w | 12,423 | 1.0× | 19.9 ms | 49.6 ms | 401.6% | 63 MiB | 0 | ✅ |
+| FrankenPHP (ZTS) · 4w · worker | 12,368 | 1.0× | 19.9 ms | 49.9 ms | 399.7% | 59 MiB | 0 | ✅ |
+| FrankenPHP (ZTS) · 8w · worker | 12,385 | 1.0× | 19.9 ms | 50.2 ms | 399.5% | 57 MiB | 0 | ✅ |
+| Nginx + FPM · 4w | 10,752 | 0.9× | 23.6 ms | 27.9 ms | 336.8% | 33 MiB | 0 | ✅ |
+| Nginx + FPM · 8w | 12,315 | baseline | 20.4 ms | 29.2 ms | 379.1% | 37 MiB | 0 | ✅ |
 
 ### Random 50 KB
 
@@ -162,20 +162,20 @@ _50 KB incompressible random data — stress-tests compression bypass._
 
 | Server | Req/s | vs baseline | p50 | p99 | Avg CPU | Peak Mem | Errors | Status |
 |--------|------:|:-----------:|----:|----:|:-------:|---------:|-------:|:-------|
-| Turbine NTS · 4w | 15,643 | 1.5× | 16.2 ms | 20.3 ms | 387.4% | 60 MiB | 0 | ✅ |
-| Turbine NTS · 8w | 16,919 | 1.6× | 14.9 ms | 18.6 ms | 411.1% | 65 MiB | 0 | ✅ |
-| Turbine NTS · 4w · persistent | 17,120 | 1.6× | 14.8 ms | 18.5 ms | 398.3% | 58 MiB | 0 | ✅ |
-| Turbine NTS · 8w · persistent | 17,411 | 1.6× | 14.5 ms | 17.9 ms | 402.4% | 59 MiB | 0 | ✅ |
-| Turbine ZTS · 4w | 17,251 | 1.6× | 14.7 ms | 18.0 ms | 426.3% | 73 MiB | 0 | ✅ |
-| Turbine ZTS · 8w | 18,837 | 1.8× | 13.4 ms | 17.5 ms | 461.7% | 93 MiB | 0 | ✅ |
-| Turbine ZTS · 4w · persistent | 12,543 | 1.2× | 20.2 ms | 23.1 ms | 369.9% | 64 MiB | 0 | ✅ |
-| Turbine ZTS · 8w · persistent | 15,704 | 1.5× | 16.1 ms | 19.6 ms | 459.9% | 78 MiB | 0 | ✅ |
-| FrankenPHP (ZTS) · 4w | 10,478 | 1.0× | 23.3 ms | 58.2 ms | 418.2% | 62 MiB | 0 | ✅ |
-| FrankenPHP (ZTS) · 8w | 10,705 | 1.0× | 22.9 ms | 56.7 ms | 419.0% | 64 MiB | 0 | ✅ |
-| FrankenPHP (ZTS) · 4w · worker | 10,587 | 1.0× | 23.1 ms | 57.8 ms | 417.1% | 62 MiB | 0 | ✅ |
-| FrankenPHP (ZTS) · 8w · worker | 10,681 | 1.0× | 22.9 ms | 57.9 ms | 417.6% | 62 MiB | 0 | ✅ |
-| Nginx + FPM · 4w | 9,683 | 0.9× | 26.1 ms | 31.4 ms | 369.1% | 33 MiB | 0 | ✅ |
-| Nginx + FPM · 8w | 10,586 | baseline | 23.9 ms | 29.4 ms | 391.7% | 38 MiB | 0 | ✅ |
+| Turbine NTS · 4w | 16,597 | 1.5× | 15.2 ms | 19.1 ms | 394.1% | 61 MiB | 0 | ✅ |
+| Turbine NTS · 8w | 17,051 | 1.6× | 14.8 ms | 18.8 ms | 419.7% | 65 MiB | 0 | ✅ |
+| Turbine NTS · 4w · persistent | 10,581 | 1.0× | 24.1 ms | 26.5 ms | 239.4% | 62 MiB | 0 | ✅ |
+| Turbine NTS · 8w · persistent | 17,334 | 1.6× | 14.6 ms | 18.2 ms | 408.5% | 59 MiB | 0 | ✅ |
+| Turbine ZTS · 4w | 18,021 | 1.7× | 14.1 ms | 17.5 ms | 436.9% | 74 MiB | 0 | ✅ |
+| Turbine ZTS · 8w | 19,119 | 1.8× | 13.2 ms | 17.6 ms | 472.7% | 91 MiB | 0 | ✅ |
+| Turbine ZTS · 4w · persistent | 14,672 | 1.4× | 17.3 ms | 20.6 ms | 411.2% | 63 MiB | 0 | ✅ |
+| Turbine ZTS · 8w · persistent | 14,921 | 1.4× | 16.9 ms | 21.0 ms | 454.4% | 76 MiB | 0 | ✅ |
+| FrankenPHP (ZTS) · 4w | 10,741 | 1.0× | 22.8 ms | 56.8 ms | 422.1% | 66 MiB | 0 | ✅ |
+| FrankenPHP (ZTS) · 8w | 10,561 | 1.0× | 23.1 ms | 58.5 ms | 418.7% | 64 MiB | 0 | ✅ |
+| FrankenPHP (ZTS) · 4w · worker | 10,706 | 1.0× | 22.9 ms | 57.0 ms | 415.1% | 60 MiB | 0 | ✅ |
+| FrankenPHP (ZTS) · 8w · worker | 10,541 | 1.0× | 23.2 ms | 57.1 ms | 418.0% | 60 MiB | 0 | ✅ |
+| Nginx + FPM · 4w | 9,459 | 0.9× | 26.9 ms | 31.6 ms | 363.1% | 34 MiB | 0 | ✅ |
+| Nginx + FPM · 8w | 10,795 | baseline | 23.5 ms | 28.3 ms | 403.7% | 38 MiB | 0 | ✅ |
 
 ---
 
