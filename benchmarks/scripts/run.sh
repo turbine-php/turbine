@@ -277,6 +277,29 @@ bench_container() {
         return 0
     fi
 
+    # ── Warm framework caches inside the container ─────────────────────────
+    # FPM's entrypoint already does this (see fpm-entrypoint.sh).  The
+    # published Turbine images may or may not have the warmup baked in yet,
+    # so we do it from the bench script so results are comparable regardless
+    # of the image version.  Harmless no-op for non-framework scenarios
+    # (hello.php, pdf_50k.php) — artisan/bin/console simply won't exist.
+    if [[ "$image" == "$TURBINE_IMAGE_NTS" || "$image" == "$TURBINE_IMAGE_ZTS" ]]; then
+        docker exec bench-server sh -c '
+            export PATH=/opt/php-embed/bin:$PATH
+            if [ -f /var/www/html/artisan ]; then
+                cd /var/www/html
+                php artisan config:cache  >/dev/null 2>&1 || true
+                php artisan route:cache   >/dev/null 2>&1 || true
+                php artisan view:cache    >/dev/null 2>&1 || true
+            fi
+            if [ -f /var/www/html/bin/console ]; then
+                cd /var/www/html
+                php bin/console cache:clear  --env=prod --no-debug >/dev/null 2>&1 || true
+                php bin/console cache:warmup --env=prod --no-debug >/dev/null 2>&1 || true
+            fi
+        ' >/dev/null 2>&1 || true
+    fi
+
     local preflight_ok=1
     if [[ "$lua_script" == "$WRK_LUA_FRAMEWORK" ]]; then
         # Framework benchmarks rotate through 3 routes — validate all of them.
