@@ -3475,8 +3475,16 @@ async fn handle_request_inner(
     // ── Fast path for persistent workers ──────────────────────────
     // The persistent worker already has the application bootstrapped — we only need
     // to send the HTTP request data via the binary protocol.
+    //
+    // Dispatch is ALWAYS lock-free through `ThreadDispatch` for both
+    // thread and process worker modes — server startup guarantees
+    // `state.thread_dispatch = Some(...)` whenever `state.worker_pool`
+    // is initialised (see ThreadDispatch construction in `run_server`).
+    // The previous `else` branch that went through `pool_mutex.lock()`
+    // on the hot path was therefore unreachable; removing it shrinks
+    // this function and makes it obvious that persistent dispatch is
+    // entirely lock-free.
     if state.persistent_workers {
-        // ── Thread-mode: lock-free channel dispatch ──────────────────
         if let Some(ref td) = state.thread_dispatch {
             let timeout_dur = if state.max_wait_time > 0 {
                 std::time::Duration::from_secs(state.max_wait_time)
@@ -3652,269 +3660,19 @@ async fn handle_request_inner(
                 }
             }
         }
-        // ── Process-mode: mutex-based dispatch (existing) ─────────────
-        if let Some(ref pool_mutex) = state.worker_pool {
-            let permit = if let Some(ref sem) = state.worker_semaphore {
-                let sem_arc = sem.clone();
-                let timeout_dur = if state.max_wait_time > 0 {
-                    std::time::Duration::from_secs(state.max_wait_time)
-                } else if state.request_timeout.is_zero() {
-                    std::time::Duration::from_secs(60)
-                } else {
-                    state.request_timeout
-                };
-                match tokio::time::timeout(timeout_dur, sem_arc.acquire_owned()).await {
-                    Ok(Ok(permit)) => Some(permit),
-                    Ok(Err(_)) => {
-                        return Ok(build_response(
-                            503,
-                            "text/plain",
-                            b"Worker pool closed".to_vec(),
-                            &[],
-                        ));
-                    }
-                    Err(_) => {
-                        state.metrics.record_request(
-                            &php_path,
-                            504,
-                            request_start.elapsed().as_micros() as u64,
-                            0,
-                        );
-                        return Ok(build_response(
-                            504,
-                            "text/plain",
-                            b"Request timeout waiting for worker".to_vec(),
-                            &[],
-                        ));
-                    }
-                }
-            } else {
-                None
-            };
-
-            let server_port = state
-                .listen
-                .split(':')
-                .next_back()
-                .and_then(|p| p.parse::<u16>().ok())
-                .unwrap_or(8080);
-            let full_uri_owned;
-            let full_uri: &str = if request.query_string.is_empty() {
-                &request.path
-            } else {
-                full_uri_owned = format!("{}?{}", request.path, request.query_string);
-                &full_uri_owned
-            };
-            let headers_vec: Vec<(&str, &str)> = request
-                .headers
-                .iter()
-                .map(|(k, v)| (k.as_str(), v.as_str()))
-                .collect();
-            let content_type = request.content_type.as_deref().unwrap_or("");
-            let cookie_header = request
-                .headers
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("Cookie"))
-                .map(|(_, v)| v.as_str())
-                .unwrap_or("");
-            let document_root = &app.document_root_str;
-            let script_filename = format!("{}/{}", &app.document_root_str, &php_path);
-            let script_name = format!("/{}", &php_path);
-            let per = PersistentRequest {
-                method: &request.method,
-                uri: full_uri,
-                body: &request.body,
-                client_ip: &client_ip_str,
-                port: server_port,
-                is_https: state.is_tls,
-                headers: &headers_vec,
-                script_filename: &script_filename,
-                query_string: &request.query_string,
-                document_root,
-                content_type,
-                cookie: cookie_header,
-                path_info: &request.path,
-                script_name: &script_name,
-            };
-            let encoded = encode_request(&per);
-
-            let (worker_idx, resp_fd) = {
-                let mut pool = pool_mutex.lock();
-                let worker_idx = match pool.get_idle_worker() {
-                    Some(idx) => idx,
-                    None => {
-                        // Reap dead persistent workers and respawn them
-                        if state.worker_mode == WorkerMode::Thread {
-                            let _ = pool.reap_and_respawn_persistent_threaded(
-                                &state.persistent_app_root,
-                                state.worker_boot.as_deref(),
-                                state.worker_handler.as_deref(),
-                                state.worker_cleanup.as_deref(),
-                            );
-                        } else {
-                            let _ = pool.reap_and_respawn_persistent(
-                                &state.persistent_app_root,
-                                state.worker_boot.as_deref(),
-                                state.worker_handler.as_deref(),
-                                state.worker_cleanup.as_deref(),
-                            );
-                        }
-                        match pool.get_idle_worker() {
-                            Some(idx) => idx,
-                            None => {
-                                return Ok(build_response(
-                                    503,
-                                    "text/plain",
-                                    b"All workers busy".to_vec(),
-                                    &[],
-                                ));
-                            }
-                        }
-                    }
-                };
-
-                let resp_fd = if let Some(worker) = pool.worker_mut(worker_idx) {
-                    worker.mark_busy();
-                    if let Err(e) = worker.send_request(&encoded) {
-                        error!(worker = worker_idx, error = %e, "Failed to send to persistent worker");
-                        pool.return_worker(worker_idx);
-                        return Ok(build_response(
-                            502,
-                            "text/plain",
-                            b"Worker communication error".to_vec(),
-                            &[],
-                        ));
-                    }
-                    worker.resp_fd()
-                } else {
-                    return Ok(build_response(
-                        502,
-                        "text/plain",
-                        b"Worker unavailable".to_vec(),
-                        &[],
-                    ));
-                };
-                (worker_idx, resp_fd)
-            };
-
-            // Spawn an independent task that:
-            // 1. Holds the semaphore permit (keeps it alive until worker finishes)
-            // 2. Reads the response from the worker
-            // 3. Returns the worker to the idle pool
-            // This task will NOT be cancelled if the parent handler is cancelled
-            // (e.g. client disconnects), preventing worker starvation.
-            let return_state = state.clone();
-            let reader_handle = tokio::spawn(async move {
-                let _permit_guard = permit; // Hold permit until task completes
-                let result: std::io::Result<_> =
-                    match turbine_worker::async_io::AsyncPipe::new(resp_fd) {
-                        Ok(mut pipe) => turbine_worker::decode_response_async(&mut pipe).await,
-                        Err(e) => Err(e),
-                    };
-                if let Some(ref pool_mutex) = return_state.worker_pool {
-                    let mut pool = pool_mutex.lock();
-                    if result.is_ok() {
-                        if return_state.persistent_workers {
-                            pool.return_worker_persistent(
-                                worker_idx,
-                                &return_state.persistent_app_root,
-                                return_state.worker_boot.as_deref(),
-                                return_state.worker_handler.as_deref(),
-                                return_state.worker_cleanup.as_deref(),
-                            );
-                        } else {
-                            pool.return_worker(worker_idx);
-                        }
-                    } else {
-                        // Decode failed — pipe is desynced, don't return worker to idle.
-                        // Mark it for reaping so it will be respawned on next dispatch.
-                        if let Some(worker) = pool.worker_mut(worker_idx) {
-                            let _ = worker.terminate();
-                        }
-                    }
-                }
-                result
-            });
-
-            let bin_result = reader_handle
-                .await
-                .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())));
-
-            match bin_result {
-                Ok(resp) => {
-                    let mut body = resp.body;
-                    let mut status_code = resp.status;
-
-                    let elapsed_us = request_start.elapsed().as_micros() as u64;
-                    let php_content_type = resp
-                        .headers
-                        .iter()
-                        .find(|(k, _)| k.eq_ignore_ascii_case("Content-Type"))
-                        .map(|(_, v)| v.as_str());
-                    let mut content_type = php_content_type
-                        .unwrap_or_else(|| detect_content_type(&body))
-                        .to_string();
-                    let mut resp_headers = resp.headers;
-
-                    postprocess_php_response(
-                        &state,
-                        &mut body,
-                        &mut status_code,
-                        &mut content_type,
-                        &mut resp_headers,
-                    );
-
-                    state.security.record_request(client_ip, false);
-                    state.metrics.record_request(
-                        &php_path,
-                        status_code,
-                        elapsed_us,
-                        body.len() as u64,
-                    );
-
-                    debug!(method = %request.method, path = %request.path, worker = worker_idx, status = status_code, elapsed_us = elapsed_us, bytes = body.len(), "Persistent fast-path completed");
-                    write_access_log(
-                        &state,
-                        &request.method,
-                        &request.path,
-                        status_code,
-                        request_start,
-                        &client_ip_str,
-                    );
-
-                    let extra_headers: Vec<(&str, &str)> = resp_headers
-                        .iter()
-                        .filter(|(k, _)| {
-                            !k.eq_ignore_ascii_case("Content-Type")
-                                && !k.eq_ignore_ascii_case("Content-Length")
-                        })
-                        .map(|(k, v)| (k.as_str(), v.as_str()))
-                        .collect();
-
-                    return Ok(build_response(
-                        status_code,
-                        &content_type,
-                        body,
-                        &extra_headers,
-                    ));
-                }
-                Err(e) => {
-                    error!(worker = worker_idx, error = %e, "Persistent worker response decode error");
-                    state.metrics.record_request(
-                        &php_path,
-                        502,
-                        request_start.elapsed().as_micros() as u64,
-                        0,
-                    );
-                    return Ok(build_response(
-                        502,
-                        "text/plain",
-                        format!("Worker error: {e}").into_bytes(),
-                        &[],
-                    ));
-                }
-            }
-        }
+        // No ThreadDispatch but persistent_workers=true is a startup bug
+        // (the dispatch is always built when persistent workers spawn
+        // successfully).  Fail loud rather than silently falling through.
+        error!(
+            "persistent dispatch: state.thread_dispatch is None — \
+             persistent workers were never ready"
+        );
+        return Ok(build_response(
+            500,
+            "text/plain",
+            b"Server configuration error: persistent workers unavailable".to_vec(),
+            &[],
+        ));
     }
 
     // --- Validate request path ---
