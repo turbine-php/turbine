@@ -96,6 +96,42 @@ validate_response() {
     [[ "$ok" == 1 ]] && return 0 || return 1
 }
 
+# ── Validate the 3 framework routes used by wrk-framework.lua ─────────────────
+# Hits GET /, GET /user/1, POST /user — the exact mix that wrk will rotate
+# through. If any route returns non-2xx or a tiny body, the benchmark numbers
+# are meaningless (wrk might be measuring fast error pages on 2 of 3 routes
+# while the 3rd one works). Returns 0 only if ALL three routes pass.
+validate_framework_routes() {
+    local label="$1"
+    local base_url="$2"   # e.g. http://127.0.0.1:8080
+    local ok=1
+
+    # GET /
+    if ! validate_response "${label}/GET/" "${base_url}/" 1; then
+        ok=0
+    fi
+
+    # GET /user/1
+    if ! validate_response "${label}/GET/user/1" "${base_url}/user/1" 1; then
+        ok=0
+    fi
+
+    # POST /user — validate_response only does GETs, do it inline
+    local status body size
+    status=$(curl -s -o /tmp/bench_body.txt -w "%{http_code}" -X POST --max-time 5 \
+        "${base_url}/user" 2>/dev/null)
+    body=$(head -c 200 /tmp/bench_body.txt 2>/dev/null)
+    size=$(wc -c < /tmp/bench_body.txt 2>/dev/null | tr -d ' ')
+    log "  VALIDATE ${label}/POST/user: HTTP ${status}, ${size} bytes, body: ${body:0:120}"
+    if [[ "$status" != 2* ]] || [[ -z "$body" ]]; then
+        log "  WARNING: ${label}/POST/user returned HTTP ${status} — route broken"
+        ok=0
+    fi
+    rm -f /tmp/bench_body.txt
+
+    [[ "$ok" == 1 ]] && return 0 || return 1
+}
+
 # ── Collect docker stats while benchmark runs ─────────────────────────────────
 # Uses --no-stream in a loop to produce clean newline-delimited output.
 # Streaming mode uses \r (carriage return) which corrupts the stats file.
@@ -207,7 +243,12 @@ bench_container() {
     fi
 
     local preflight_ok=1
-    validate_response "$label" "$url" || preflight_ok=0
+    if [[ "$lua_script" == "$WRK_LUA_FRAMEWORK" ]]; then
+        # Framework benchmarks rotate through 3 routes — validate all of them.
+        validate_framework_routes "$label" "http://127.0.0.1:${BENCH_PORT}" || preflight_ok=0
+    else
+        validate_response "$label" "$url" || preflight_ok=0
+    fi
 
     log "  Warmup ${label}..."
     if [[ "$preflight_ok" == 0 ]]; then
@@ -480,6 +521,45 @@ done
 # ─── Laravel note: full app dir is mounted (not just public/) so autoloader works ───
 # Turbine uses [sandbox] front_controller=true to route to public/index.php
 
+# ─── Symfony ─────────────────────────────────────────────────────────────────
+log "==> Scenario: Symfony (GET /, GET /user/:id, POST /user)"
+for W in 4 8; do
+    for P in "" "-p"; do
+        KEY="turbine_nts_${W}w${P//-/_}"
+        BENCH_LUA_SCRIPT="$WRK_LUA_FRAMEWORK"
+        save_result symfony "$KEY" \
+            "$(bench_container "nts${P}/${W}w/symfony" "$TURBINE_IMAGE_NTS" "/" \
+                -v /var/www/symfony:/var/www/html \
+                -v "/etc/turbine/symfony-nts-${W}w${P}.toml:/var/www/html/turbine.toml:ro")"
+    done
+    for P in "" "-p"; do
+        KEY="turbine_zts_${W}w${P//-/_}"
+        BENCH_LUA_SCRIPT="$WRK_LUA_FRAMEWORK"
+        save_result symfony "$KEY" \
+            "$(bench_container "zts${P}/${W}w/symfony" "$TURBINE_IMAGE_ZTS" "/" \
+                -v /var/www/symfony:/var/www/html \
+                -v "/etc/turbine/symfony-zts-${W}w${P}.toml:/var/www/html/turbine.toml:ro")"
+    done
+    BENCH_LUA_SCRIPT="$WRK_LUA_FRAMEWORK"
+    save_result symfony "frankenphp_${W}w" \
+        "$(bench_container "frankenphp/${W}w/symfony" "$FRANKENPHP_IMAGE" "/" \
+            -e SERVER_NAME=:80 \
+            -v /var/www/symfony:/app \
+            -v "/etc/frankenphp/symfony-${W}w.Caddyfile:/etc/caddy/Caddyfile")"
+    BENCH_LUA_SCRIPT="$WRK_LUA_FRAMEWORK"
+    save_result symfony "frankenphp_${W}w_worker" \
+        "$(bench_container "frankenphp/${W}w-worker/symfony" "$FRANKENPHP_IMAGE" "/" \
+            -e SERVER_NAME=:80 \
+            -v /var/www/symfony:/app \
+            -v "/etc/frankenphp/symfony-${W}w-worker.Caddyfile:/etc/caddy/Caddyfile")"
+    BENCH_LUA_SCRIPT="$WRK_LUA_FRAMEWORK"
+    save_result symfony "nginx_fpm_${W}w" \
+        "$(bench_container "fpm/${W}w/symfony" "$FPM_IMAGE" "/" \
+            -e WORKERS=${W} \
+            -e APP_ROOT=/var/www/html/public \
+            -v /var/www/symfony:/var/www/html)"
+done
+
 # ─── Phalcon (Turbine only + Nginx+FPM — Phalcon incompatible with FrankenPHP) ───────
 log "==> Scenario: Phalcon (GET /, GET /user/:id, POST /user)"
 for W in 4 8; do
@@ -537,6 +617,9 @@ SCENARIO_META = {
     },
     'laravel': {
         'description': 'Laravel 13 — mixed JSON routes: GET /, GET /user/:id, POST /user (stateless, no database)',
+    },
+    'symfony': {
+        'description': 'Symfony 7 — mixed JSON routes: GET /, GET /user/:id, POST /user (prod env, cached routes/config)',
     },
     'phalcon': {
         'description': 'Phalcon Micro — mixed JSON routes: GET /, GET /user/:id, POST /user',

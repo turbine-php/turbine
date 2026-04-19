@@ -227,6 +227,111 @@ if ($app->resolved('auth')) { $app->make('auth')->forgetGuards(); }
 \Illuminate\Support\Facades\Facade::clearResolvedInstances();
 PHPEOF
 
+log "Creating Symfony 7 project (this may take a few minutes)..."
+COMPOSER_ALLOW_SUPERUSER=1 composer create-project "symfony/skeleton:^7.0" /var/www/symfony \
+    --quiet --no-interaction --prefer-dist
+cd /var/www/symfony
+COMPOSER_ALLOW_SUPERUSER=1 composer require symfony/runtime symfony/framework-bundle \
+    --quiet --no-interaction
+cd /
+
+# Benchmark routes for Symfony (GET /, GET /user/:id, POST /user)
+mkdir -p /var/www/symfony/src/Controller
+cat > /var/www/symfony/src/Controller/BenchController.php << 'PHPEOF'
+<?php
+declare(strict_types=1);
+namespace App\Controller;
+
+use Symfony\Component\HttpFoundation\JsonResponse;
+use Symfony\Component\HttpFoundation\Response;
+
+class BenchController
+{
+    public function index(): Response
+    {
+        return new JsonResponse(['status' => 'ok', 'framework' => 'Symfony', 'php' => PHP_VERSION]);
+    }
+
+    public function userGet(string $id): Response
+    {
+        return new JsonResponse([
+            'id'    => (int) $id,
+            'name'  => 'User ' . $id,
+            'email' => 'user' . $id . '@example.com',
+        ]);
+    }
+
+    public function userPost(): Response
+    {
+        return new JsonResponse(['status' => 'created', 'id' => random_int(1, 100000)], 201);
+    }
+}
+PHPEOF
+
+cat > /var/www/symfony/config/routes.yaml << 'YAMLEOF'
+bench_index:
+    path: /
+    controller: App\Controller\BenchController::index
+    methods: [GET]
+bench_user_get:
+    path: /user/{id}
+    controller: App\Controller\BenchController::userGet
+    methods: [GET]
+bench_user_post:
+    path: /user
+    controller: App\Controller\BenchController::userPost
+    methods: [POST]
+YAMLEOF
+
+# Prod mode: no debug, no profiler, cached routes/config
+cat > /var/www/symfony/.env.local << 'ENVEOF'
+APP_ENV=prod
+APP_DEBUG=0
+ENVEOF
+
+# Warm cache for prod environment so first request isn't slow
+cd /var/www/symfony
+php bin/console cache:clear --env=prod --no-debug 2>/dev/null || true
+php bin/console cache:warmup --env=prod --no-debug 2>/dev/null || true
+cd /
+
+chown -R www-data:www-data \
+    /var/www/symfony/var
+chmod -R ug+rw \
+    /var/www/symfony/var
+
+# Turbine persistent-worker files for Symfony
+cat > /var/www/symfony/turbine-boot.php << 'PHPEOF'
+<?php
+declare(strict_types=1);
+require __DIR__.'/vendor/autoload_runtime.php';
+$_SERVER['APP_ENV']   = $_ENV['APP_ENV']   = 'prod';
+$_SERVER['APP_DEBUG'] = $_ENV['APP_DEBUG'] = '0';
+require __DIR__.'/vendor/autoload.php';
+$GLOBALS['__turbine_kernel'] = new \App\Kernel('prod', false);
+$GLOBALS['__turbine_kernel']->boot();
+PHPEOF
+
+cat > /var/www/symfony/turbine-handler.php << 'PHPEOF'
+<?php
+declare(strict_types=1);
+$kernel   = $GLOBALS['__turbine_kernel'];
+$request  = \Symfony\Component\HttpFoundation\Request::createFromGlobals();
+$response = $kernel->handle($request);
+$response->send();
+$kernel->terminate($request, $response);
+gc_collect_cycles();
+PHPEOF
+
+cat > /var/www/symfony/turbine-cleanup.php << 'PHPEOF'
+<?php
+declare(strict_types=1);
+$kernel = $GLOBALS['__turbine_kernel'];
+if (method_exists($kernel, 'reset')) {
+    $kernel->reset();
+}
+PHPEOF
+
 # ── 7. Turbine config files (all apps × modes × worker counts) ────────────────
 # Naming: {app}-{nts|zts}-{N}w[-p].toml
 #   nts = worker_mode "process"   persistent_workers false/true
@@ -287,6 +392,15 @@ for W in 4 8; do
     make_turbine_toml /etc/turbine/phalcon-nts-${W}w-p.toml ${W} process true  '["phalcon.so"]'
     make_turbine_toml /etc/turbine/phalcon-zts-${W}w.toml   ${W} thread  false '["phalcon.so"]'
     make_turbine_toml /etc/turbine/phalcon-zts-${W}w-p.toml ${W} thread  true  '["phalcon.so"]'
+
+    # Symfony — same pattern as Laravel (framework mode, front controller, worker files)
+    SYMFONY_INI=$'[php.ini]\nerror_reporting = "0"\ndisplay_errors = "Off"\n"date.timezone" = "UTC"\n"realpath_cache_size" = "4096k"\n"realpath_cache_ttl" = "600"'
+    SYMFONY_SANDBOX=$'[sandbox]\nexecution_mode = "framework"\nfront_controller = true'
+    SYMFONY_BOOT=$'worker_boot = "turbine-boot.php"\nworker_handler = "turbine-handler.php"\nworker_cleanup = "turbine-cleanup.php"'
+    make_turbine_toml /etc/turbine/symfony-nts-${W}w.toml   ${W} process false "[]" "$SYMFONY_INI" "" "$SYMFONY_SANDBOX"
+    make_turbine_toml /etc/turbine/symfony-nts-${W}w-p.toml ${W} process true  "[]" "$SYMFONY_INI" "$SYMFONY_BOOT" "$SYMFONY_SANDBOX"
+    make_turbine_toml /etc/turbine/symfony-zts-${W}w.toml   ${W} thread  false "[]" "$SYMFONY_INI" "" "$SYMFONY_SANDBOX"
+    make_turbine_toml /etc/turbine/symfony-zts-${W}w-p.toml ${W} thread  true  "[]" "$SYMFONY_INI" "$SYMFONY_BOOT" "$SYMFONY_SANDBOX"
 done
 
 # ── 8. FrankenPHP worker scripts ──────────────────────────────────────────────
@@ -372,6 +486,32 @@ PHPEOF
 # NOTE: phalcon worker.php is kept for reference but NOT used in benchmarks
 # since Phalcon is incompatible with FrankenPHP's ZTS threading model.
 
+# Symfony worker — bootstrap Kernel once, handle many requests
+cat > /var/www/symfony/public/worker.php << 'PHPEOF'
+<?php
+require __DIR__ . '/../vendor/autoload.php';
+
+$_SERVER['APP_ENV']   = $_ENV['APP_ENV']   = 'prod';
+$_SERVER['APP_DEBUG'] = $_ENV['APP_DEBUG'] = '0';
+
+$kernel = new \App\Kernel('prod', false);
+$kernel->boot();
+
+$running = true;
+
+while ($running && ($running = \frankenphp_handle_request(function () use ($kernel) {
+    $request  = \Symfony\Component\HttpFoundation\Request::createFromGlobals();
+    $response = $kernel->handle($request);
+    $response->send();
+    $kernel->terminate($request, $response);
+    if (method_exists($kernel, 'reset')) {
+        $kernel->reset();
+    }
+}))) {
+    gc_collect_cycles();
+}
+PHPEOF
+
 # ── 9. FrankenPHP Caddyfile templates ────────────────────────────────────────
 # Only for apps that run on FrankenPHP: raw, laravel, php-bench (NOT phalcon)
 log "Creating FrankenPHP Caddyfile templates..."
@@ -413,8 +553,8 @@ make_caddyfile() {
 }
 
 for W in 4 8; do
-    # Apps that run on FrankenPHP (raw, laravel, php-bench — NOT phalcon)
-    for APP in raw laravel; do
+    # Apps that run on FrankenPHP (raw, laravel, symfony — NOT phalcon)
+    for APP in raw laravel symfony; do
         make_caddyfile /etc/frankenphp/${APP}-${W}w.Caddyfile         ${W} /app/public
         make_caddyfile /etc/frankenphp/${APP}-${W}w-worker.Caddyfile  ${W} /app/public /app/public/worker.php
     done

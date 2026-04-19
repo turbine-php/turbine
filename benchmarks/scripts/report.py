@@ -207,6 +207,7 @@ def render_report(data: dict, version: str, date: str) -> str:
 
     raw        = scenarios.get("raw_php", {})
     laravel    = scenarios.get("laravel", {})
+    symfony    = scenarios.get("symfony", {})
     phalcon    = scenarios.get("phalcon", {})
     php_scripts = scenarios.get("php_scripts", {})
 
@@ -263,6 +264,12 @@ def render_report(data: dict, version: str, date: str) -> str:
         f"_{laravel.get('description', 'Laravel framework, single JSON route, no database.')}_",
         "",
         render_table(laravel),
+        "",
+        "## Symfony",
+        "",
+        f"_{symfony.get('description', 'Symfony framework, mixed JSON routes.')}_",
+        "",
+        render_table(symfony),
         "",
         "## Phalcon",
         "",
