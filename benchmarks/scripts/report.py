@@ -60,6 +60,35 @@ def fmt_errors(value) -> str:
         return "—"
 
 
+def is_suspect(data: dict) -> tuple[bool, str]:
+    """Return (suspect, reason).  A benchmark row is suspect if:
+    - preflight validation failed (too small body, non-2xx, or error page), OR
+    - wrk reported any non-2xx responses during the run.
+    """
+    if data.get("preflight_ok") is False:
+        return True, "preflight failed"
+    non_2xx = data.get("req_non_2xx", 0) or 0
+    if non_2xx > 0:
+        bad = data.get("first_bad_status", 0) or 0
+        ratio = non_2xx / max(1, (data.get("req_2xx", 0) + non_2xx))
+        return True, f"{non_2xx} non-2xx ({ratio:.0%}), first={bad}"
+    return False, ""
+
+
+def fmt_rps_with_flag(data: dict) -> str:
+    suspect, _ = is_suspect(data)
+    rps = fmt_rps(data.get("rps"))
+    return f"{rps} ⚠️" if suspect else rps
+
+
+def fmt_status_col(data: dict) -> str:
+    """Compact status column: ✅ / ⚠️ <reason>."""
+    suspect, reason = is_suspect(data)
+    if not suspect:
+        return "✅"
+    return f"⚠️ {reason}"
+
+
 def speedup(a_rps, b_rps) -> str:
     """Return 'Xa' speedup of a vs b."""
     try:
@@ -111,21 +140,22 @@ def render_table(scenario: dict) -> str:
         baseline_key = servers[-1]
     baseline_rps = scenario.get(baseline_key, {}).get("rps", 0)
 
-    header = "| Server | Req/s | vs baseline | p50 | p99 | Avg CPU | Peak Mem | Errors |"
-    sep    = "|--------|------:|:-----------:|----:|----:|:-------:|---------:|-------:|"
+    header = "| Server | Req/s | vs baseline | p50 | p99 | Avg CPU | Peak Mem | Errors | Status |"
+    sep    = "|--------|------:|:-----------:|----:|----:|:-------:|---------:|-------:|:-------|"
     rows   = [header, sep]
 
     for key in servers:
         data  = scenario[key]
         label = SERVER_LABELS.get(key, key)
-        rps   = fmt_rps(data.get("rps"))
+        rps   = fmt_rps_with_flag(data)
         p50   = fmt_ms(data.get("latency_p50"))
         p99   = fmt_ms(data.get("latency_p99"))
         cpu   = fmt_cpu(data.get("avg_cpu_pct"))
         mem   = fmt_mem(data.get("peak_mem_mib"))
         errs  = fmt_errors(data.get("req_errors"))
+        status = fmt_status_col(data)
         vs    = speedup(data.get("rps", 0), baseline_rps) if key != baseline_key else "baseline"
-        rows.append(f"| {label} | {rps} | {vs} | {p50} | {p99} | {cpu} | {mem} | {errs} |")
+        rows.append(f"| {label} | {rps} | {vs} | {p50} | {p99} | {cpu} | {mem} | {errs} | {status} |")
 
     return "\n".join(rows)
 
@@ -141,6 +171,8 @@ def render_php_scripts_section(php_scenario: dict) -> str:
     """Render 4 sub-tables, one per PHP script."""
     scripts  = php_scenario.get("scripts", list(PHP_SCRIPT_LABELS.keys()))
     servers  = [s for s in SERVER_ORDER if s in php_scenario]
+    if not servers:
+        return "_No data available._"
     baseline_key = "nginx_fpm" if "nginx_fpm" in php_scenario else servers[-1]
 
     lines = []
@@ -211,6 +243,12 @@ def render_report(data: dict, version: str, date: str) -> str:
         "Results depend heavily on architecture, application design, dependencies, stack, "
         "and workload characteristics. The goal is **not** to declare any runtime better or worse — "
         "choosing the right tool depends on many factors beyond raw throughput.",
+        "",
+        "> **Status column:** `✅` = preflight passed and all responses were 2xx. "
+        "`⚠️` = the row returned non-2xx responses or failed preflight validation "
+        "(tiny response body, wrong content-type, 404/5xx before the run). "
+        "Req/s for flagged rows is **not comparable** to healthy rows — the server "
+        "may be returning fast error pages.",
         "",
         "---",
         "",

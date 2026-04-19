@@ -12,3 +12,5 @@ Cargo.lock
 .vscode/
 /dev
 /examples/wordpress/public
+# Benchmark scripts' python cache
+benchmarks/scripts/__pycache__/

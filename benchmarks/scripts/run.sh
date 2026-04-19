@@ -64,22 +64,36 @@ wait_http() {
 }
 
 # ── Validate response body ─ log response for debugging, warn on suspect results ──
+# Usage: validate_response <label> <url> [min_body_bytes]
+# Returns: 0 if response is 2xx with >= min_body_bytes, 1 otherwise.
+# The third argument lets callers enforce an expected body size (e.g. 50 KB
+# scripts must return >= 45 KB; anything smaller means the request hit an
+# error page that the server happened to deliver as 200).
 validate_response() {
     local label="$1"
     local url="$2"
+    local min_size="${3:-1}"
     local body status
     status=$(curl -s -o /tmp/bench_body.txt -w "%{http_code}" --max-time 5 "$url" 2>/dev/null)
     body=$(head -c 500 /tmp/bench_body.txt 2>/dev/null)
     local size
     size=$(wc -c < /tmp/bench_body.txt 2>/dev/null | tr -d ' ')
     log "  VALIDATE ${label}: HTTP ${status}, ${size} bytes, body: ${body:0:120}"
-    if [[ "$status" == "404" || "$status" == "403" || "$status" == "502" ]]; then
+    local ok=1
+    if [[ "$status" != 2* ]]; then
         log "  WARNING: ${label} returned HTTP ${status} — PHP may not be executing!"
+        ok=0
     fi
-    if [[ -z "$body" || "$body" == *"404"* || "$body" == *"Not Found"* ]]; then
+    if [[ -z "$body" || "$body" == *"Not Found"* ]]; then
         log "  WARNING: ${label} response looks like an error page"
+        ok=0
+    fi
+    if [[ "$size" -lt "$min_size" ]]; then
+        log "  WARNING: ${label} response is ${size} bytes (expected >= ${min_size}) — benchmark result unreliable"
+        ok=0
     fi
     rm -f /tmp/bench_body.txt
+    [[ "$ok" == 1 ]] && return 0 || return 1
 }
 
 # ── Collect docker stats while benchmark runs ─────────────────────────────────
@@ -151,6 +165,8 @@ print(json.dumps({
     'latency_max':  round(float(data.get('latency_max_ms', 0)), 2),
     'req_2xx':      int(data.get('req_2xx', 0)),
     'req_errors':   int(data.get('req_errors', 0)),
+    'req_non_2xx':  int(data.get('req_non_2xx', 0)),
+    'first_bad_status': int(data.get('first_bad_status', 0)),
     'avg_cpu_pct':  round(float(sys.argv[2]), 1) if sys.argv[2] not in ('N/A', '') else None,
     'peak_mem_mib': round(float(sys.argv[3]))     if sys.argv[3] not in ('N/A', '') else None,
 }))
@@ -190,9 +206,13 @@ bench_container() {
         return 0
     fi
 
-    validate_response "$label" "$url"
+    local preflight_ok=1
+    validate_response "$label" "$url" || preflight_ok=0
 
     log "  Warmup ${label}..."
+    if [[ "$preflight_ok" == 0 ]]; then
+        log "  !!! ${label} failed preflight validation — reported req/s will be flagged as suspect"
+    fi
     wrk -c "$WARMUP_CONNECTIONS" -d "${WARMUP_DURATION}s" -t 2 \
         "$url" >/dev/null 2>&1 || true
 
@@ -224,7 +244,12 @@ bench_container() {
 
     log "  ${label}: $(python3 -c "import json; d=json.load(open('$result_file')); print(d.get('rps',0))" 2>/dev/null || echo '?') req/s"
 
-    parse_wrk "$result_file" "$avg_cpu" "$peak_mem"
+    local parsed
+    parsed=$(parse_wrk "$result_file" "$avg_cpu" "$peak_mem")
+    if [[ "$preflight_ok" == 0 ]]; then
+        parsed=$(python3 -c "import json,sys; d=json.loads(sys.argv[1]); d['preflight_ok']=False; print(json.dumps(d))" "$parsed")
+    fi
+    echo "$parsed"
     rm -f "$stats_file" "$result_file"
 }
 
@@ -263,14 +288,32 @@ bench_php_scripts() {
         return 0
     fi
 
-    # Validate first script to confirm PHP is executing
-    validate_response "${label}/${scripts[0]}" "http://127.0.0.1:${BENCH_PORT}/${scripts[0]}"
+    # Expected minimum body size per script — catches servers that return tiny
+    # error pages at 200 OK (rare but happens with mis-configured Caddy / nginx).
+    # Map is intentionally coarse: anything > 40 KB is "large", everything else
+    # is "just needs a body".
+    expected_min_size_for() {
+        case "$1" in
+            html_50k.php|pdf_50k.php|random_50k.php) echo 40000 ;;
+            *)                                       echo 1 ;;
+        esac
+    }
 
     local results=()
     for script in "${scripts[@]}"; do
         local url="http://127.0.0.1:${BENCH_PORT}/${script}"
         local stats_file="/tmp/stats_${RANDOM}.txt"
         local result_file="/tmp/result_${RANDOM}.json"
+        local min_size
+        min_size=$(expected_min_size_for "$script")
+
+        # Validate EACH script individually — catches cases where one script
+        # happens to error out while others work (e.g. missing extension).
+        local script_ok=1
+        if ! validate_response "${label}/${script}" "$url" "$min_size"; then
+            script_ok=0
+            log "  !!! ${label}/${script} failed validation — reported req/s will be flagged as suspect"
+        fi
 
         log "  Warmup ${label}/${script}..."
         wrk -c "$WARMUP_CONNECTIONS" -d "${WARMUP_DURATION}s" -t 2 \
@@ -291,7 +334,14 @@ bench_php_scripts() {
         stats=$(parse_stats "$stats_file")
         avg_cpu=$(echo "$stats" | awk '{print $1}')
         peak_mem=$(echo "$stats" | awk '{print $2}')
-        results+=("$(parse_wrk "$result_file" "$avg_cpu" "$peak_mem")")
+        local parsed
+        parsed=$(parse_wrk "$result_file" "$avg_cpu" "$peak_mem")
+
+        # Tag the result with preflight_ok so the reporter can mark it.
+        if [[ "$script_ok" == 0 ]]; then
+            parsed=$(python3 -c "import json,sys; d=json.loads(sys.argv[1]); d['preflight_ok']=False; print(json.dumps(d))" "$parsed")
+        fi
+        results+=("$parsed")
         rm -f "$stats_file" "$result_file"
     done
 
