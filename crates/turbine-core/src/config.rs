@@ -44,6 +44,8 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub websocket: WebsocketConfig,
     #[serde(default)]
+    pub async_io: AsyncIoConfig,
+    #[serde(default)]
     pub worker_pools: Vec<WorkerPoolRouteConfig>,
     #[serde(default)]
     pub virtual_hosts: Vec<VirtualHostConfig>,
@@ -565,6 +567,49 @@ fn default_ws_max_frame_size() -> usize {
 }
 fn default_ws_idle_secs() -> u64 {
     300
+}
+
+/// Async I/O primitives exposed to PHP via `/_/async/*`.  See
+/// `docs/shared-state.md`.
+#[derive(Debug, Deserialize, Clone)]
+pub struct AsyncIoConfig {
+    /// Enable endpoints and inject `turbine_async_*()` helpers.  Off by
+    /// default because file I/O helpers are a footgun without a path
+    /// safelist.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Paths that are allowed for read/write.  All resolved paths must
+    /// be a descendant of one of these canonicalised roots.  Empty =
+    /// reject everything (the endpoints exist but return 403).
+    #[serde(default)]
+    pub allowed_roots: Vec<String>,
+    /// Maximum bytes per read or write call.  Protects against a rogue
+    /// worker blowing up memory via a single huge request.
+    #[serde(default = "default_async_max_io_bytes")]
+    pub max_io_bytes: usize,
+    /// Maximum timer delay (milliseconds).  Prevents accidental multi-hour
+    /// timers that would survive config reloads silently.
+    #[serde(default = "default_async_max_timer_ms")]
+    pub max_timer_ms: u64,
+}
+
+impl Default for AsyncIoConfig {
+    fn default() -> Self {
+        AsyncIoConfig {
+            enabled: false,
+            allowed_roots: Vec::new(),
+            max_io_bytes: default_async_max_io_bytes(),
+            max_timer_ms: default_async_max_timer_ms(),
+        }
+    }
+}
+
+fn default_async_max_io_bytes() -> usize {
+    16 * 1024 * 1024 // 16 MiB
+}
+
+fn default_async_max_timer_ms() -> u64 {
+    60 * 60 * 1000 // 1 hour
 }
 
 /// Route-based worker pool splitting configuration.

@@ -17,7 +17,7 @@ turbine-php-sys = { workspace = true }
 turbine-security = { workspace = true }
 turbine-metrics = { workspace = true }
 turbine-cache = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["fs", "io-util", "time", "sync"] }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 http-body-util = { workspace = true }

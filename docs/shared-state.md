@@ -308,3 +308,115 @@ turbine_ws_subscribers(string $channel): int
   wrap the publish layer and switch `Message::Binary` → `Message::Text`
   in a fork.
 
+---
+
+# Async I/O
+
+Non-blocking file I/O plus deferred timers, exposed to PHP via
+`/_/async/*`.
+
+## Honest performance note
+
+A single `turbine_async_read()` call from PHP is **no faster** than
+`file_get_contents` — the PHP worker still blocks on the HTTP
+round-trip.  The win is:
+
+1. **`turbine_async_parallel([...])`** — runs many ops concurrently in
+   the tokio runtime via `curl_multi_exec`.  Wall-clock latency
+   collapses to `max(op_i)` instead of `sum(op_i)`.
+2. **`turbine_async_timer()`** — schedules a task-queue push to fire
+   after a delay, without tying up a PHP worker for the duration.
+
+Everything else is a building block for the parallel executor.
+
+## Enable
+
+```toml
+[async_io]
+enabled       = true
+allowed_roots = ["/var/www/uploads", "/tmp/turbine-cache"]
+max_io_bytes  = 16777216       # 16 MiB per op
+max_timer_ms  = 3600000        # 1 hour ceiling on timer delay
+```
+
+`allowed_roots` is **mandatory** for file I/O to work.  Every path is
+canonicalised and verified to live under one of the configured roots —
+symlinks out of bounds, `..` escapes, and absent roots all return
+`403 path not allowed`.  Timers do not touch the filesystem and work
+regardless of `allowed_roots`.
+
+Timers require `[task_queue] enabled = true` (they schedule a push
+onto the queue).
+
+## PHP API
+
+```php
+turbine_async_read(string $path, int $offset = 0, int $length = 0): ?string
+turbine_async_write(string $path, string $data, bool $append = false): bool
+turbine_async_timer(string $channel, string $payload, int $delay_ms): bool
+turbine_async_parallel(array $ops): array
+```
+
+### Parallel reads (real speedup)
+
+```php
+$files = turbine_async_parallel([
+    ['read', '/var/www/uploads/a.json'],
+    ['read', '/var/www/uploads/b.json'],
+    ['read', '/var/www/uploads/c.json'],
+    ['http', 'GET', 'https://api.example.com/users/42'],
+]);
+// $files[0..2] = string|null (file contents)
+// $files[3]    = ['status' => int, 'body' => string]
+```
+
+Three disk reads + one HTTP fetch run concurrently.  Wall time ≈ the
+slowest of the four.
+
+### Deferred task (timer)
+
+```php
+// Bounce an email retry 30 seconds out without holding this PHP worker.
+turbine_async_timer('emails', json_encode([
+    'to' => 'user@example.com',
+    'retry' => 1,
+]), 30_000);
+```
+
+The request returns immediately; the `emails` task-queue consumer
+picks up the job 30 s later.
+
+## HTTP API
+
+| Method | Path | Query | Body | Response |
+|---|---|---|---|---|
+| `POST` | `/_/async/read`  | `offset?`, `length?` | path (plain text) | raw file bytes / 404 |
+| `POST` | `/_/async/write` | `path`, `append?=1` | raw data | `{"bytes":<n>}` |
+| `POST` | `/_/async/timer` | `channel`, `delay_ms` | raw payload | `202 {"scheduled":true}` |
+| `GET`  | `/_/async/stats` | — | — | `{"reads":N,"writes":N,"timers_scheduled":N,"timers_fired":N,"allowed_roots":N}` |
+
+## Design notes
+
+- **Backed by `tokio::fs`** (blocking ops on the tokio blocking thread
+  pool).  Reads honour `offset`/`length` so a 10 MiB file can be
+  sliced in 1 KiB chunks without loading the whole thing.
+- **Path safety:** `std::fs::canonicalize` resolves symlinks
+  *before* the prefix check.  For writes whose target doesn't yet
+  exist, the parent is canonicalised and the filename joined back.
+- **Timers are best-effort:** if the task-queue channel is full when
+  the timer fires, the payload is dropped silently.  Producers that
+  need durability should push immediately and implement their own
+  retry.
+
+## Limits
+
+- File I/O outside the allowed roots is rejected — there is no
+  per-call override.
+- No `sleep` / coroutine-yield primitive: the PHP request blocks on
+  the HTTP round-trip by design.  If you want to deliver a response
+  then keep working, push onto the task queue and let a consumer
+  handle the follow-up.
+- No directory listing, no stat, no unlink — intentional minimalism.
+  Use `scandir`/`unlink` in PHP; they're already non-blocking enough
+  for typical workloads.
+

@@ -537,6 +537,206 @@ if (!function_exists('turbine_ws_subscribers')) {
 "#
 }
 
+/// PHP helpers for the async-I/O primitives.
+///
+/// Performance note: calling a single `turbine_async_read` from PHP is
+/// no faster than `file_get_contents` — the PHP worker still blocks.
+/// The real win is `turbine_async_parallel()`, which uses
+/// `curl_multi_exec` to run many helpers concurrently and returns only
+/// when all complete (wall-clock latency collapses to `max(op_i)`).
+pub fn php_turbine_async_functions() -> &'static str {
+    r#"if (!function_exists('turbine_async_endpoint')) {
+    function turbine_async_endpoint(): array {
+        static $base = null, $token = null;
+        if ($base === null) {
+            $base  = getenv('TURBINE_TABLE_URL')
+                  ?: ('http://127.0.0.1:' . ($_SERVER['SERVER_PORT'] ?? '8080'));
+            $token = getenv('TURBINE_TOKEN') ?: '';
+        }
+        return [$base, $token];
+    }
+}
+
+if (!function_exists('turbine_async_read')) {
+    function turbine_async_read(string $path, int $offset = 0, int $length = 0): ?string {
+        [$base, $token] = turbine_async_endpoint();
+        $q = '/_/async/read';
+        $params = [];
+        if ($offset > 0) $params[] = 'offset=' . $offset;
+        if ($length > 0) $params[] = 'length=' . $length;
+        if ($params) $q .= '?' . implode('&', $params);
+        $url = rtrim($base, '/') . $q;
+        $headers = ['Expect:', 'Content-Type: text/plain'];
+        if ($token !== '') $headers[] = 'Authorization: Bearer ' . $token;
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_CUSTOMREQUEST     => 'POST',
+            CURLOPT_POSTFIELDS        => $path,
+            CURLOPT_RETURNTRANSFER    => true,
+            CURLOPT_TIMEOUT_MS        => 10_000,
+            CURLOPT_CONNECTTIMEOUT_MS => 500,
+            CURLOPT_HTTPHEADER        => $headers,
+            CURLOPT_TCP_KEEPALIVE     => 1,
+        ]);
+        $body = curl_exec($ch);
+        $code = curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+        curl_close($ch);
+        return ($code === 200 && $body !== false) ? (string)$body : null;
+    }
+}
+
+if (!function_exists('turbine_async_write')) {
+    function turbine_async_write(string $path, string $data, bool $append = false): bool {
+        [$base, $token] = turbine_async_endpoint();
+        $q = '/_/async/write?path=' . rawurlencode($path);
+        if ($append) $q .= '&append=1';
+        $url = rtrim($base, '/') . $q;
+        $headers = ['Expect:', 'Content-Type: application/octet-stream'];
+        if ($token !== '') $headers[] = 'Authorization: Bearer ' . $token;
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_CUSTOMREQUEST     => 'POST',
+            CURLOPT_POSTFIELDS        => $data,
+            CURLOPT_RETURNTRANSFER    => true,
+            CURLOPT_TIMEOUT_MS        => 10_000,
+            CURLOPT_CONNECTTIMEOUT_MS => 500,
+            CURLOPT_HTTPHEADER        => $headers,
+            CURLOPT_TCP_KEEPALIVE     => 1,
+        ]);
+        curl_exec($ch);
+        $code = curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+        curl_close($ch);
+        return $code === 200;
+    }
+}
+
+if (!function_exists('turbine_async_timer')) {
+    /** Schedule a push of $payload onto task-queue channel $channel after $delay_ms. */
+    function turbine_async_timer(string $channel, string $payload, int $delay_ms): bool {
+        [$base, $token] = turbine_async_endpoint();
+        $url = rtrim($base, '/') . '/_/async/timer?channel=' . rawurlencode($channel)
+             . '&delay_ms=' . $delay_ms;
+        $headers = ['Expect:', 'Content-Type: application/octet-stream'];
+        if ($token !== '') $headers[] = 'Authorization: Bearer ' . $token;
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_CUSTOMREQUEST     => 'POST',
+            CURLOPT_POSTFIELDS        => $payload,
+            CURLOPT_RETURNTRANSFER    => true,
+            CURLOPT_TIMEOUT_MS        => 2000,
+            CURLOPT_CONNECTTIMEOUT_MS => 500,
+            CURLOPT_HTTPHEADER        => $headers,
+        ]);
+        curl_exec($ch);
+        $code = curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+        curl_close($ch);
+        return $code === 202;
+    }
+}
+
+if (!function_exists('turbine_async_parallel')) {
+    /**
+     * Run an array of operations concurrently via curl_multi_exec.
+     *
+     * Each op is one of:
+     *   ['read',  $path, $offset = 0, $length = 0]
+     *   ['write', $path, $data, $append = false]
+     *   ['http',  $method, $url, $body = null, $headers = []]
+     *
+     * Returns an array of results in the same order:
+     *   read  -> string|null
+     *   write -> bool
+     *   http  -> ['status' => int, 'body' => string] | null
+     *
+     * Wall-clock latency is max(op_i), not sum — the tokio runtime runs
+     * these in parallel.
+     */
+    function turbine_async_parallel(array $ops): array {
+        [$base, $token] = turbine_async_endpoint();
+        $mh = curl_multi_init();
+        $handles = [];
+        foreach ($ops as $i => $op) {
+            $kind = $op[0] ?? '';
+            $ch = curl_init();
+            $headers = ['Expect:'];
+            if ($token !== '') $headers[] = 'Authorization: Bearer ' . $token;
+
+            switch ($kind) {
+                case 'read':
+                    $q = '/_/async/read';
+                    $params = [];
+                    if (($op[2] ?? 0) > 0) $params[] = 'offset=' . (int)$op[2];
+                    if (($op[3] ?? 0) > 0) $params[] = 'length=' . (int)$op[3];
+                    if ($params) $q .= '?' . implode('&', $params);
+                    curl_setopt_array($ch, [
+                        CURLOPT_URL           => rtrim($base, '/') . $q,
+                        CURLOPT_CUSTOMREQUEST => 'POST',
+                        CURLOPT_POSTFIELDS    => (string)$op[1],
+                        CURLOPT_HTTPHEADER    => array_merge($headers, ['Content-Type: text/plain']),
+                    ]);
+                    break;
+                case 'write':
+                    $q = '/_/async/write?path=' . rawurlencode((string)$op[1]);
+                    if (!empty($op[3])) $q .= '&append=1';
+                    curl_setopt_array($ch, [
+                        CURLOPT_URL           => rtrim($base, '/') . $q,
+                        CURLOPT_CUSTOMREQUEST => 'POST',
+                        CURLOPT_POSTFIELDS    => (string)$op[2],
+                        CURLOPT_HTTPHEADER    => array_merge($headers, ['Content-Type: application/octet-stream']),
+                    ]);
+                    break;
+                case 'http':
+                    $urlOp = (string)$op[2];
+                    $hOp   = array_merge($op[4] ?? [], ['Expect:']);
+                    curl_setopt_array($ch, [
+                        CURLOPT_URL           => $urlOp,
+                        CURLOPT_CUSTOMREQUEST => (string)$op[1],
+                        CURLOPT_HTTPHEADER    => $hOp,
+                    ]);
+                    if (isset($op[3]) && $op[3] !== null) {
+                        curl_setopt($ch, CURLOPT_POSTFIELDS, (string)$op[3]);
+                    }
+                    break;
+                default:
+                    curl_close($ch);
+                    continue 2;
+            }
+            curl_setopt_array($ch, [
+                CURLOPT_RETURNTRANSFER    => true,
+                CURLOPT_TIMEOUT_MS        => 30_000,
+                CURLOPT_CONNECTTIMEOUT_MS => 1000,
+                CURLOPT_TCP_KEEPALIVE     => 1,
+            ]);
+            curl_multi_add_handle($mh, $ch);
+            $handles[$i] = [$ch, $kind];
+        }
+
+        // Drive.
+        do {
+            $status = curl_multi_exec($mh, $active);
+            if ($active) curl_multi_select($mh, 1.0);
+        } while ($active && $status === CURLM_OK);
+
+        $results = [];
+        foreach ($handles as $i => [$ch, $kind]) {
+            $body = curl_multi_getcontent($ch);
+            $code = curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+            curl_multi_remove_handle($mh, $ch);
+            curl_close($ch);
+            switch ($kind) {
+                case 'read':  $results[$i] = ($code === 200) ? (string)$body : null; break;
+                case 'write': $results[$i] = $code === 200; break;
+                case 'http':  $results[$i] = ['status' => (int)$code, 'body' => (string)$body]; break;
+            }
+        }
+        curl_multi_close($mh);
+        ksort($results);
+        return array_values($results);
+    }
+}
+"#
+}
+
 // ── Worker Pool Route Matching ────────────────────────────────────────────
 
 /// Match a request path against a route pattern (supports trailing *).

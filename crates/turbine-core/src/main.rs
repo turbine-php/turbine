@@ -40,6 +40,7 @@ use turbine_worker::{encode_native_request, write_to_fd, NativeResponse};
 
 mod acme;
 mod admin;
+mod async_io;
 mod cli;
 mod compat;
 mod config;
@@ -53,6 +54,7 @@ mod shared_table;
 mod task_queue;
 mod websocket;
 
+use async_io::AsyncIo;
 use path_guard::RequestGuard;
 use shared_table::SharedTable;
 use task_queue::TaskQueue;
@@ -923,6 +925,8 @@ struct ServerState {
     task_max_wait_ms: u64,
     /// WebSocket hub exposed via `/_/ws/*`.  `None` when disabled.
     ws_hub: Option<Arc<WsHub>>,
+    /// Async-I/O handle exposed via `/_/async/*`.  `None` when disabled.
+    async_io: Option<Arc<AsyncIo>>,
     /// Virtual host map: lowercase domain → resolved vhost with pre-computed AppStructure.
     /// Empty = no virtual hosting (use global app_structure).
     virtual_hosts: std::collections::HashMap<String, Arc<VhostResolved>>,
@@ -1288,6 +1292,15 @@ fn cmd_serve(
     if config.websocket.enabled {
         php_bootstrap = format!("{}{}", features::php_turbine_ws_functions(), php_bootstrap);
         info!("PHP turbine_ws_*() helpers injected into bootstrap");
+    }
+    // Inject turbine_async_* PHP helpers if async_io is enabled
+    if config.async_io.enabled {
+        php_bootstrap = format!(
+            "{}{}",
+            features::php_turbine_async_functions(),
+            php_bootstrap
+        );
+        info!("PHP turbine_async_*() helpers injected into bootstrap");
     }
 
     // --- Virtual hosting ---
@@ -2028,6 +2041,20 @@ fn cmd_serve(
                 None
             },
             task_max_wait_ms: config.task_queue.max_wait_ms,
+            async_io: if config.async_io.enabled {
+                Some(Arc::new(AsyncIo::new(
+                    config
+                        .async_io
+                        .allowed_roots
+                        .iter()
+                        .map(std::path::PathBuf::from)
+                        .collect(),
+                    config.async_io.max_io_bytes,
+                    config.async_io.max_timer_ms,
+                )))
+            } else {
+                None
+            },
             ws_hub: if config.websocket.enabled {
                 Some(Arc::new(WsHub::new(WsConfig {
                     max_channels: config.websocket.max_channels,
@@ -2209,6 +2236,20 @@ fn cmd_serve(
                 None
             },
             task_max_wait_ms: config.task_queue.max_wait_ms,
+            async_io: if config.async_io.enabled {
+                Some(Arc::new(AsyncIo::new(
+                    config
+                        .async_io
+                        .allowed_roots
+                        .iter()
+                        .map(std::path::PathBuf::from)
+                        .collect(),
+                    config.async_io.max_io_bytes,
+                    config.async_io.max_timer_ms,
+                )))
+            } else {
+                None
+            },
             ws_hub: if config.websocket.enabled {
                 Some(Arc::new(WsHub::new(WsConfig {
                     max_channels: config.websocket.max_channels,
@@ -3378,6 +3419,18 @@ async fn handle_request_inner(
         // publish endpoint and the subscriber upgrade handshake.
         if state.ws_hub.is_some() && clean_path.starts_with("/_/ws") {
             return Ok(admin::handle_websocket(
+                &state,
+                req,
+                req_method.as_str(),
+                &clean_path,
+                remote_addr,
+            )
+            .await);
+        }
+
+        // ── Async I/O primitives ─────────────────────────────────────────
+        if state.async_io.is_some() && clean_path.starts_with("/_/async") {
+            return Ok(admin::handle_async_io(
                 &state,
                 req,
                 req_method.as_str(),

@@ -14,6 +14,7 @@ use bytes::Bytes;
 use http_body_util::Full;
 use hyper::{body::Incoming, Request, Response};
 
+use crate::async_io::AsyncIoError;
 use crate::compat::{self, FullHttpRequest};
 use crate::shared_table::TableError;
 use crate::task_queue::QueueError;
@@ -369,6 +370,169 @@ pub async fn handle_websocket(
                 return json_err(404, "{\"error\":\"not a channel\"}");
             }
             websocket::handle_ws_upgrade(hub, req, channel)
+        }
+        _ => build_response(404, "text/plain", b"Not found".to_vec(), &[]),
+    }
+}
+
+fn map_async_err(e: AsyncIoError) -> HyperResponse {
+    match e {
+        AsyncIoError::PathNotAllowed => json_err(403, "{\"error\":\"path not allowed\"}"),
+        AsyncIoError::TooLarge(n) => build_response(
+            413,
+            "application/json",
+            format!("{{\"error\":\"payload too large\",\"max\":{n}}}").into_bytes(),
+            &[],
+        ),
+        AsyncIoError::Io(err) => build_response(
+            502,
+            "application/json",
+            format!("{{\"error\":\"io\",\"kind\":\"{:?}\"}}", err.kind()).into_bytes(),
+            &[],
+        ),
+        AsyncIoError::TimerWithoutQueue => {
+            json_err(409, "{\"error\":\"timer requires [task_queue] enabled\"}")
+        }
+        AsyncIoError::DelayTooLong(n) => build_response(
+            400,
+            "application/json",
+            format!("{{\"error\":\"delay too long\",\"max_ms\":{n}}}").into_bytes(),
+            &[],
+        ),
+    }
+}
+
+/// Async-I/O endpoints (`/_/async/*`).  Callers must check the path
+/// prefix and `state.async_io.is_some()` before invoking.
+pub async fn handle_async_io(
+    state: &ServerState,
+    req: Request<Incoming>,
+    method: &str,
+    clean_path: &str,
+    remote_addr: SocketAddr,
+) -> HyperResponse {
+    let Some(io) = state.async_io.as_ref().cloned() else {
+        return build_response(404, "text/plain", b"Not found".to_vec(), &[]);
+    };
+    let qs = req.uri().query().unwrap_or("").to_string();
+    let sub = clean_path.strip_prefix("/_/async").unwrap_or("");
+
+    match (method, sub) {
+        ("GET", "/stats") => {
+            let s = io.stats();
+            let body = format!(
+                "{{\"reads\":{},\"writes\":{},\"timers_scheduled\":{},\"timers_fired\":{},\"allowed_roots\":{}}}",
+                s.reads, s.writes, s.timers_scheduled, s.timers_fired, s.allowed_roots
+            );
+            build_response(200, "application/json", body.into_bytes(), &[])
+        }
+        ("POST", "/read") => {
+            // Body carries the path as a plain string.  Query has offset/length.
+            let offset: u64 = query_param(&qs, "offset")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let length: usize = query_param(&qs, "length")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let (inner_req, _) = match FullHttpRequest::from_hyper(
+                req,
+                remote_addr,
+                &state.upload_tmp_dir,
+                &state.upload_security,
+                Some(4096),
+            )
+            .await
+            {
+                Ok(pair) => pair,
+                Err(_) => return json_err(400, "{\"error\":\"invalid request\"}"),
+            };
+            let path = match std::str::from_utf8(&inner_req.body) {
+                Ok(s) => s.trim().to_string(),
+                Err(_) => return json_err(400, "{\"error\":\"non-utf8 path\"}"),
+            };
+            match io.read(&path, offset, length).await {
+                Ok(bytes) => build_response(200, "application/octet-stream", bytes, &[]),
+                Err(AsyncIoError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                    build_response(404, "text/plain", Vec::new(), &[])
+                }
+                Err(e) => map_async_err(e),
+            }
+        }
+        ("POST", "/write") => {
+            let Some(path) = query_param(&qs, "path").map(str::to_string) else {
+                return json_err(400, "{\"error\":\"missing path\"}");
+            };
+            let append = query_param(&qs, "append")
+                .map(|v| matches!(v, "1" | "true"))
+                .unwrap_or(false);
+            let (inner_req, _) = match FullHttpRequest::from_hyper(
+                req,
+                remote_addr,
+                &state.upload_tmp_dir,
+                &state.upload_security,
+                Some(
+                    state
+                        .max_body_bytes
+                        .unwrap_or(16 * 1024 * 1024)
+                        .max(1_048_576),
+                ),
+            )
+            .await
+            {
+                Ok(pair) => pair,
+                Err(compat::RequestBuildError::PayloadTooLarge) => {
+                    return json_err(413, "{\"error\":\"payload too large\"}");
+                }
+                Err(_) => return json_err(400, "{\"error\":\"invalid request\"}"),
+            };
+            match io.write(&path, &inner_req.body, append).await {
+                Ok(n) => build_response(
+                    200,
+                    "application/json",
+                    format!("{{\"bytes\":{n}}}").into_bytes(),
+                    &[],
+                ),
+                Err(e) => map_async_err(e),
+            }
+        }
+        ("POST", "/timer") => {
+            // Schedule a push to task_queue after delay_ms.
+            let Some(channel) = query_param(&qs, "channel").map(str::to_string) else {
+                return json_err(400, "{\"error\":\"missing channel\"}");
+            };
+            let delay_ms: u64 = match query_param(&qs, "delay_ms").and_then(|s| s.parse().ok()) {
+                Some(v) => v,
+                None => return json_err(400, "{\"error\":\"missing delay_ms\"}"),
+            };
+            let (inner_req, _) = match FullHttpRequest::from_hyper(
+                req,
+                remote_addr,
+                &state.upload_tmp_dir,
+                &state.upload_security,
+                Some(state.max_body_bytes.unwrap_or(1_048_576).max(1_048_576)),
+            )
+            .await
+            {
+                Ok(pair) => pair,
+                Err(compat::RequestBuildError::PayloadTooLarge) => {
+                    return json_err(413, "{\"error\":\"payload too large\"}");
+                }
+                Err(_) => return json_err(400, "{\"error\":\"invalid request\"}"),
+            };
+            match io.schedule_timer(
+                state.task_queue.clone(),
+                channel,
+                inner_req.body,
+                std::time::Duration::from_millis(delay_ms),
+            ) {
+                Ok(()) => build_response(
+                    202,
+                    "application/json",
+                    b"{\"scheduled\":true}".to_vec(),
+                    &[],
+                ),
+                Err(e) => map_async_err(e),
+            }
         }
         _ => build_response(404, "text/plain", b"Not found".to_vec(), &[]),
     }
