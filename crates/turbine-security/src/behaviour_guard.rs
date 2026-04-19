@@ -1,7 +1,11 @@
 //! Behaviour Guard — per-IP rate limiting, scanning detection, and SQLi accumulation.
 //!
-//! Maintains lock-free per-IP profiles using DashMap. All operations are O(1).
-//! Overhead: ~80ns per check.
+//! Maintains lock-free per-IP profiles using DashMap.  All mutable state
+//! inside each profile is stored as atomics so the hot path (`check_request`)
+//! only holds a DashMap shard **read** lock — multiple threads serving the
+//! same IP never serialise on each other.  Writes only happen when a new IP
+//! is first seen or when we need to rebuild the map after an IP-rotation
+//! flood (bounded by `max_profiles`).
 //!
 //! Detection strategies:
 //! - Rate limiting: > N requests/second from a single IP
@@ -9,7 +13,7 @@
 //! - SQLi accumulation: block IP after M SQLi attempts
 
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
@@ -45,48 +49,32 @@ impl Default for BehaviourConfig {
 }
 
 /// Per-IP profile tracking request patterns.
+///
+/// Every field is atomic so the DashMap shard lock only needs to be held
+/// in read mode while we touch the profile — hot-path mutations happen
+/// without serialising threads that share an IP.  `block_until_ns == 0`
+/// is the canonical "no block deadline" sentinel (zero is unreachable
+/// once `start` is set; the first increment is well after start-of-day).
 struct IpProfile {
-    /// Requests in the current window.
-    request_count: u32,
-    /// Error responses in the current window.
-    error_count: u32,
-    /// SQLi attempts.
-    sqli_attempts: u32,
-    /// Window start time.
-    window_start: Instant,
-    /// Whether this IP is currently blocked.
-    blocked: bool,
-    /// When the block expires (if blocked).
-    block_until: Option<Instant>,
+    request_count: AtomicU32,
+    error_count: AtomicU32,
+    sqli_attempts: AtomicU32,
+    /// Window start timestamp, nanoseconds since `BehaviourGuard.start`.
+    window_start_ns: AtomicU64,
+    blocked: AtomicBool,
+    /// Block deadline in ns since `start`; `0` means "no deadline set".
+    block_until_ns: AtomicU64,
 }
 
 impl IpProfile {
-    fn new() -> Self {
+    fn new(now_ns: u64) -> Self {
         IpProfile {
-            request_count: 0,
-            error_count: 0,
-            sqli_attempts: 0,
-            window_start: Instant::now(),
-            blocked: false,
-            block_until: None,
-        }
-    }
-
-    /// Reset the window if it has expired.
-    fn maybe_reset_window(&mut self, window_duration: Duration) {
-        if self.window_start.elapsed() > window_duration {
-            self.request_count = 0;
-            self.error_count = 0;
-            self.window_start = Instant::now();
-
-            // Unblock if the block has expired
-            if let Some(until) = self.block_until {
-                if Instant::now() > until {
-                    self.blocked = false;
-                    self.block_until = None;
-                    self.sqli_attempts = 0;
-                }
-            }
+            request_count: AtomicU32::new(0),
+            error_count: AtomicU32::new(0),
+            sqli_attempts: AtomicU32::new(0),
+            window_start_ns: AtomicU64::new(now_ns),
+            blocked: AtomicBool::new(false),
+            block_until_ns: AtomicU64::new(0),
         }
     }
 }
@@ -97,6 +85,10 @@ pub struct BehaviourGuard {
     total_blocked: AtomicU64,
     /// Soft cap on tracked IPs to bound memory under IP-rotation DoS.
     max_profiles: usize,
+    /// Reference instant against which every `*_ns` field is measured.
+    /// Using a monotonic offset lets us store deadlines in `AtomicU64`
+    /// without needing a lock or `parking_lot::Mutex<Instant>`.
+    start: Instant,
 }
 
 impl BehaviourGuard {
@@ -105,8 +97,8 @@ impl BehaviourGuard {
     }
 
     pub fn with_config(config: BehaviourConfig) -> Self {
-        // Use 8× CPU count as shard count (min 32) to reduce contention
-        // when many IPs map to the same shard under high RPS.
+        // Use 8× CPU count as shard count (min 32) to reduce DashMap shard
+        // contention when many distinct IPs hash to the same shard.
         let cpus = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
@@ -116,43 +108,73 @@ impl BehaviourGuard {
             profiles: DashMap::with_capacity_and_shard_amount(256, shards),
             total_blocked: AtomicU64::new(0),
             max_profiles: 100_000,
+            start: Instant::now(),
         }
     }
 
-    /// Check if a request from this IP should be allowed.
-    pub fn check_request(&self, ip: IpAddr) -> Verdict {
-        let window = Duration::from_secs(self.config.window_seconds);
+    /// Monotonic "now", expressed as nanoseconds elapsed since `self.start`.
+    /// Saturating so a (practically impossible) backwards-going clock can't
+    /// produce a nonsense deadline — it just clamps to 0.
+    #[inline]
+    fn now_ns(&self) -> u64 {
+        Instant::now()
+            .saturating_duration_since(self.start)
+            .as_nanos() as u64
+    }
 
-        // DoS guard: if the tracked-IP map has grown past the soft cap and
-        // this IP is unknown, don't insert a new profile (allow through).
-        // Legitimate traffic is almost entirely repeat-IPs; rotating-IP
-        // attacks would otherwise exhaust memory.
-        if self.profiles.len() >= self.max_profiles && !self.profiles.contains_key(&ip) {
-            return Verdict::Allow;
-        }
+    /// Evaluate rate limit + scanning + block state for a profile.
+    ///
+    /// Callers pass a borrowed `&IpProfile` obtained either from a DashMap
+    /// read lock (`.get`) on the fast path or from a freshly-inserted
+    /// `.entry()` write lock on the slow path.  All mutations happen via
+    /// atomic ops so the shard lock can stay in read mode throughout.
+    fn evaluate(&self, profile: &IpProfile, ip: IpAddr, now_ns: u64) -> Verdict {
+        let window_ns = self.config.window_seconds.saturating_mul(1_000_000_000);
 
-        let mut profile = self.profiles.entry(ip).or_insert_with(IpProfile::new);
-        profile.maybe_reset_window(window);
-
-        // Check if IP is blocked
-        if profile.blocked {
-            if let Some(until) = profile.block_until {
-                if Instant::now() < until {
-                    self.total_blocked.fetch_add(1, Ordering::Relaxed);
-                    return Verdict::Block(format!("IP {ip} is temporarily blocked"));
+        // Step 1 — window rollover.  A single CAS installs the new window
+        // start; losers skip the reset (another thread already did it).
+        let win_start = profile.window_start_ns.load(Ordering::Acquire);
+        if window_ns > 0 && now_ns.saturating_sub(win_start) > window_ns {
+            if profile
+                .window_start_ns
+                .compare_exchange(win_start, now_ns, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                profile.request_count.store(0, Ordering::Release);
+                profile.error_count.store(0, Ordering::Release);
+                let bu = profile.block_until_ns.load(Ordering::Acquire);
+                if bu != 0 && bu <= now_ns {
+                    profile.blocked.store(false, Ordering::Release);
+                    profile.block_until_ns.store(0, Ordering::Release);
+                    profile.sqli_attempts.store(0, Ordering::Release);
                 }
-                // Block expired
-                profile.blocked = false;
-                profile.block_until = None;
             }
         }
 
-        // Rate limiting — only check after a minimum burst
-        profile.request_count += 1;
-        if profile.request_count > 10 {
-            let elapsed = profile.window_start.elapsed().as_secs_f64().max(0.001);
-            let rps = profile.request_count as f64 / elapsed;
+        // Step 2 — still-blocked check (cheap fast fail).
+        if profile.blocked.load(Ordering::Acquire) {
+            let bu = profile.block_until_ns.load(Ordering::Acquire);
+            if bu != 0 && now_ns < bu {
+                self.total_blocked.fetch_add(1, Ordering::Relaxed);
+                return Verdict::Block(format!("IP {ip} is temporarily blocked"));
+            }
+            // Expired block — clear and fall through.
+            profile.blocked.store(false, Ordering::Release);
+            profile.block_until_ns.store(0, Ordering::Release);
+        }
 
+        // Step 3 — increment request count and rate-limit check.  We use
+        // `fetch_add` on the atomic so concurrent requests from the same
+        // IP never serialise on a RefMut lock.
+        let count = profile.request_count.fetch_add(1, Ordering::Relaxed) + 1;
+        if count > 10 {
+            let win_start = profile.window_start_ns.load(Ordering::Acquire);
+            // Floor at 1 ms to avoid a division-by-near-zero that would
+            // explode the computed RPS when the first burst arrives inside
+            // the same millisecond as the window start.
+            let elapsed_ns = now_ns.saturating_sub(win_start).max(1_000_000);
+            let elapsed_secs = elapsed_ns as f64 / 1_000_000_000.0;
+            let rps = count as f64 / elapsed_secs;
             if rps > self.config.max_rps as f64 {
                 self.total_blocked.fetch_add(1, Ordering::Relaxed);
                 return Verdict::Block(format!(
@@ -162,23 +184,27 @@ impl BehaviourGuard {
             }
         }
 
-        // Scanning detection
-        if profile.request_count >= self.config.scanning_min_requests {
-            let error_rate = profile.error_count as f64 / profile.request_count as f64;
+        // Step 4 — scanning detection (error rate > threshold).
+        if count >= self.config.scanning_min_requests {
+            let errors = profile.error_count.load(Ordering::Acquire);
+            let error_rate = errors as f64 / count as f64;
             if error_rate > self.config.scanning_error_rate {
                 warn!(
                     ip = %ip,
                     error_rate = error_rate,
-                    requests = profile.request_count,
+                    requests = count,
                     "Scanning behaviour detected"
                 );
-                profile.blocked = true;
-                profile.block_until = Some(Instant::now() + Duration::from_secs(300));
+                profile.blocked.store(true, Ordering::Release);
+                profile.block_until_ns.store(
+                    now_ns.saturating_add(300 * 1_000_000_000),
+                    Ordering::Release,
+                );
                 self.total_blocked.fetch_add(1, Ordering::Relaxed);
                 return Verdict::Block(format!(
                     "Scanning detected: {:.0}% error rate over {} requests",
                     error_rate * 100.0,
-                    profile.request_count
+                    count
                 ));
             }
         }
@@ -186,33 +212,72 @@ impl BehaviourGuard {
         Verdict::Allow
     }
 
+    /// Check if a request from this IP should be allowed.
+    pub fn check_request(&self, ip: IpAddr) -> Verdict {
+        // DoS guard: if the tracked-IP map has grown past the soft cap and
+        // this IP is unknown, don't insert a new profile (allow through).
+        // Legitimate traffic is almost entirely repeat-IPs; rotating-IP
+        // attacks would otherwise exhaust memory.
+        if self.profiles.len() >= self.max_profiles && !self.profiles.contains_key(&ip) {
+            return Verdict::Allow;
+        }
+
+        let now_ns = self.now_ns();
+
+        // Fast path: IP already known — DashMap shard READ lock only.
+        // `get` returns a Ref<'_> guard; multiple concurrent requests for
+        // the same IP can take the shard in read mode simultaneously,
+        // which is the whole point of this redesign.
+        if let Some(profile) = self.profiles.get(&ip) {
+            return self.evaluate(&profile, ip, now_ns);
+        }
+
+        // Slow path: first request from this IP — entry() takes a write
+        // lock on the shard to insert.  `or_insert_with` only runs the
+        // closure when we actually need to create a new profile, so races
+        // where another thread inserted the same IP first degrade to a
+        // plain read (no extra profile allocation).
+        let entry = self
+            .profiles
+            .entry(ip)
+            .or_insert_with(|| IpProfile::new(now_ns));
+        self.evaluate(&entry, ip, now_ns)
+    }
+
     /// Record a completed request result for an IP.
     pub fn record_request(&self, ip: IpAddr, was_error: bool) {
-        if let Some(mut profile) = self.profiles.get_mut(&ip) {
-            if was_error {
-                profile.error_count += 1;
-            }
+        if !was_error {
+            return;
+        }
+        if let Some(profile) = self.profiles.get(&ip) {
+            profile.error_count.fetch_add(1, Ordering::Relaxed);
         }
     }
 
     /// Record a SQLi attempt from an IP. Blocks after threshold.
     pub fn record_sqli_attempt(&self, ip: IpAddr) {
-        // Same DoS guard as check_request.
         if self.profiles.len() >= self.max_profiles && !self.profiles.contains_key(&ip) {
             return;
         }
-        let mut profile = self.profiles.entry(ip).or_insert_with(IpProfile::new);
-        profile.sqli_attempts += 1;
+        let now_ns = self.now_ns();
+        let profile = self
+            .profiles
+            .entry(ip)
+            .or_insert_with(|| IpProfile::new(now_ns));
+        let attempts = profile.sqli_attempts.fetch_add(1, Ordering::Relaxed) + 1;
 
-        if profile.sqli_attempts >= self.config.sqli_block_threshold {
+        if attempts >= self.config.sqli_block_threshold {
             warn!(
                 ip = %ip,
-                attempts = profile.sqli_attempts,
+                attempts = attempts,
                 "Blocking IP after repeated SQLi attempts"
             );
-            profile.blocked = true;
-            // Block for 10 minutes
-            profile.block_until = Some(Instant::now() + Duration::from_secs(600));
+            profile.blocked.store(true, Ordering::Release);
+            // Block for 10 minutes.
+            profile.block_until_ns.store(
+                now_ns.saturating_add(600 * 1_000_000_000),
+                Ordering::Release,
+            );
         }
     }
 
@@ -229,34 +294,33 @@ impl BehaviourGuard {
     /// Manually unblock an IP address, clearing its block state and SQLi counter.
     /// Returns `true` if the IP was found and unblocked, `false` if it was not tracked.
     pub fn unblock_ip(&self, ip: IpAddr) -> bool {
-        if let Some(mut profile) = self.profiles.get_mut(&ip) {
-            profile.blocked = false;
-            profile.block_until = None;
-            profile.sqli_attempts = 0;
+        if let Some(profile) = self.profiles.get(&ip) {
+            profile.blocked.store(false, Ordering::Release);
+            profile.block_until_ns.store(0, Ordering::Release);
+            profile.sqli_attempts.store(0, Ordering::Release);
             true
         } else {
             false
         }
     }
 
-    /// Returns the list of currently blocked IPs with their block expiry time as
-    /// seconds from now (None = block has no expiry / already expired).
+    /// Returns the list of currently blocked IPs with their block expiry time
+    /// as seconds from now (None = no deadline / already expired).
     pub fn blocked_ips(&self) -> Vec<(IpAddr, Option<u64>)> {
-        let now = Instant::now();
+        let now_ns = self.now_ns();
         self.profiles
             .iter()
             .filter_map(|entry| {
                 let profile = entry.value();
-                if !profile.blocked {
+                if !profile.blocked.load(Ordering::Acquire) {
                     return None;
                 }
-                let secs_remaining = profile.block_until.and_then(|until| {
-                    if until > now {
-                        Some(until.duration_since(now).as_secs())
-                    } else {
-                        None
-                    }
-                });
+                let bu = profile.block_until_ns.load(Ordering::Acquire);
+                let secs_remaining = if bu > now_ns {
+                    Some(Duration::from_nanos(bu - now_ns).as_secs())
+                } else {
+                    None
+                };
                 Some((*entry.key(), secs_remaining))
             })
             .collect()
