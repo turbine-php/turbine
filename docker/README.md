@@ -100,6 +100,21 @@ The app root is `/var/www/html` by default (set via the `-r` flag in `CMD`). Mou
 -v /path/to/my-app:/var/www/html
 ```
 
+### Framework cache warmup
+
+On startup the entrypoint automatically warms framework caches so per-request mode performs competitively with FPM out of the box:
+
+- **Laravel** — detected by `artisan` in the app root. Runs `artisan config:cache`, `route:cache`, and `view:cache`.
+- **Symfony** — detected by `bin/console` in the app root. Runs `cache:clear --env=prod` and `cache:warmup --env=prod`.
+
+This requires the app root to be writable (cache files go to `bootstrap/cache/` or `var/cache/`). If you mount the app as read-only or cache at build time, set `TURBINE_SKIP_FRAMEWORK_CACHE=1` to disable it:
+
+```bash
+docker run -e TURBINE_SKIP_FRAMEWORK_CACHE=1 ...
+```
+
+Without these caches a per-request Laravel round-trip takes ~15–25 ms (full framework bootstrap); with them, ~2–3 ms.
+
 ### Changing PHP Versions
 
 Edit the `ARG` at the top of the Dockerfile:
