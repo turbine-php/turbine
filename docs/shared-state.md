@@ -211,3 +211,100 @@ for i in 1 2 3 4; do php consumer.php & done
 - No atomic multi-key transactions.
 - `del` is fire-and-forget from PHP's point of view (no error on missing
   key — returns `false`).
+
+---
+
+# WebSocket Hub
+
+Real-time fan-out primitive. Clients upgrade to `/_/ws/{channel}` and
+subscribe; anyone can publish (PHP, other HTTP callers, Rust code) and
+the frame lands on every live subscriber of that channel.
+
+This is the third Swoole-style primitive, alongside `SharedTable` and
+`TaskQueue`.
+
+## Enable
+
+```toml
+[websocket]
+enabled          = true
+max_channels     = 128
+channel_capacity = 256       # max in-flight frames per channel
+max_frame_size   = 65536     # bytes
+idle_timeout_secs = 300      # 0 disables idle eviction
+```
+
+## Subscribing (from anywhere — browser, Node, Go, PHP CLI)
+
+```js
+// In a browser
+const ws = new WebSocket('ws://localhost:8080/_/ws/orders');
+ws.binaryType = 'arraybuffer';
+ws.onmessage = (ev) => {
+    const msg = new TextDecoder().decode(ev.data);
+    console.log('order event', msg);
+};
+```
+
+Turbine's WS server is **server-push only**. Data frames sent by the
+client are silently dropped. Control frames (ping/pong/close) are
+handled normally.
+
+## Publishing (server-side)
+
+From PHP:
+
+```php
+turbine_ws_publish('orders', json_encode(['id' => 42, 'status' => 'paid']));
+// returns int — number of subscribers that got the frame (0 is valid)
+```
+
+From any HTTP client:
+
+```sh
+curl -X POST 'http://localhost:8080/_/ws/publish?channel=orders' \
+     -H 'Authorization: Bearer <token>' \
+     --data-binary @payload.json
+```
+
+## PHP API
+
+```php
+turbine_ws_publish(string $channel, string $payload): ?int
+turbine_ws_subscribers(string $channel): int
+```
+
+## HTTP API
+
+| Method | Path | Query | Body | Response |
+|---|---|---|---|---|
+| `GET`    | `/_/ws/{channel}`     | — | Upgrade headers | `101 Switching Protocols` |
+| `POST`   | `/_/ws/publish`       | `channel` | raw payload | `{"delivered":<u32>}` |
+| `GET`    | `/_/ws/subscribers`   | `channel` | — | `{"subscribers":<usize>}` |
+| `GET`    | `/_/ws/stats`         | — | — | `{"channels":N,"published":N,"subscribed":N,"rejected":N}` |
+
+## Design notes
+
+- **Backend:** one `tokio::sync::broadcast` sender per channel.
+  `channel_capacity` bounds in-flight frames — subscribers that fall
+  behind are kicked with a Policy close frame, not silently stalling
+  the producer.
+- **Handshake:** standard RFC 6455 (SHA-1 + base64 of key + magic).
+- **Server-push only:** inbound data frames are dropped by design.
+  If you need bidirectional messaging, build a request/response pair
+  on top of `turbine_ws_publish` + `turbine_task_push`.
+- **Auth:** subscribers hit the same `/_/` prefix and pass through
+  the dashboard token check. For public-facing real-time apps, put
+  an authenticated PHP endpoint in front that generates short-lived
+  tickets and bounces the subscriber to a token-less Turbine channel,
+  or run WS on a separate internal port behind your auth proxy.
+
+## Limits
+
+- Single-process only (same as the other primitives).
+- Slow subscribers are dropped at the broadcast-capacity boundary —
+  no per-subscriber buffering.
+- Payloads are delivered as binary frames. If you need text frames,
+  wrap the publish layer and switch `Message::Binary` → `Message::Text`
+  in a fork.
+

@@ -32,6 +32,7 @@ toml = { workspace = true }
 clap = { workspace = true }
 multer = { workspace = true }
 futures-core = { workspace = true }
+futures-util = { workspace = true }
 flate2 = { workspace = true }
 brotli = { workspace = true }
 zstd = { workspace = true }
@@ -42,6 +43,9 @@ thiserror = { workspace = true }
 mimalloc = { workspace = true }
 libc = { workspace = true }
 dashmap = { workspace = true }
+tokio-tungstenite = { workspace = true }
+sha1 = { workspace = true }
+base64 = { workspace = true }
 
 # ACME auto-provisioning (optional, behind `acme` feature)
 instant-acme = { workspace = true, optional = true }

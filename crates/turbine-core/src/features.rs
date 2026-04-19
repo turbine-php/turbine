@@ -477,6 +477,66 @@ if (!function_exists('turbine_task_stats')) {
 "#
 }
 
+/// PHP helpers for the WebSocket hub.  Only the server-side publish API
+/// is exposed — a subscriber is an external WS client (browser, Node,
+/// Go, etc.) that upgrades to `/_/ws/{channel}`.
+pub fn php_turbine_ws_functions() -> &'static str {
+    r#"if (!function_exists('turbine_ws_publish')) {
+    function turbine_ws_publish(string $channel, string $payload): ?int {
+        static $base = null, $token = null;
+        if ($base === null) {
+            $base  = getenv('TURBINE_TABLE_URL')
+                  ?: ('http://127.0.0.1:' . ($_SERVER['SERVER_PORT'] ?? '8080'));
+            $token = getenv('TURBINE_TOKEN') ?: '';
+        }
+        $url = rtrim($base, '/') . '/_/ws/publish?channel=' . rawurlencode($channel);
+        $headers = ['Expect:', 'Content-Type: application/octet-stream'];
+        if ($token !== '') $headers[] = 'Authorization: Bearer ' . $token;
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_CUSTOMREQUEST     => 'POST',
+            CURLOPT_POSTFIELDS        => $payload,
+            CURLOPT_RETURNTRANSFER    => true,
+            CURLOPT_TIMEOUT_MS        => 2000,
+            CURLOPT_CONNECTTIMEOUT_MS => 500,
+            CURLOPT_HTTPHEADER        => $headers,
+            CURLOPT_TCP_KEEPALIVE     => 1,
+        ]);
+        $resp = curl_exec($ch);
+        $code = curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+        curl_close($ch);
+        if ($resp === false || $code !== 200) return null;
+        return preg_match('/"delivered":(\d+)/', (string)$resp, $m) ? (int)$m[1] : 0;
+    }
+}
+
+if (!function_exists('turbine_ws_subscribers')) {
+    function turbine_ws_subscribers(string $channel): int {
+        static $base = null, $token = null;
+        if ($base === null) {
+            $base  = getenv('TURBINE_TABLE_URL')
+                  ?: ('http://127.0.0.1:' . ($_SERVER['SERVER_PORT'] ?? '8080'));
+            $token = getenv('TURBINE_TOKEN') ?: '';
+        }
+        $url = rtrim($base, '/') . '/_/ws/subscribers?channel=' . rawurlencode($channel);
+        $headers = ['Expect:'];
+        if ($token !== '') $headers[] = 'Authorization: Bearer ' . $token;
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER    => true,
+            CURLOPT_TIMEOUT_MS        => 2000,
+            CURLOPT_CONNECTTIMEOUT_MS => 500,
+            CURLOPT_HTTPHEADER        => $headers,
+        ]);
+        $resp = curl_exec($ch);
+        curl_close($ch);
+        if ($resp === false) return 0;
+        return preg_match('/"subscribers":(\d+)/', (string)$resp, $m) ? (int)$m[1] : 0;
+    }
+}
+"#
+}
+
 // ── Worker Pool Route Matching ────────────────────────────────────────────
 
 /// Match a request path against a route pattern (supports trailing *).

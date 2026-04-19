@@ -42,6 +42,8 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub task_queue: TaskQueueConfig,
     #[serde(default)]
+    pub websocket: WebsocketConfig,
+    #[serde(default)]
     pub worker_pools: Vec<WorkerPoolRouteConfig>,
     #[serde(default)]
     pub virtual_hosts: Vec<VirtualHostConfig>,
@@ -520,6 +522,49 @@ fn default_task_channel_capacity() -> usize {
 
 fn default_task_max_wait_ms() -> u64 {
     30_000
+}
+
+/// In-process WebSocket hub.  Exposes `/_/ws/{channel}` for clients to
+/// subscribe, `/_/ws/publish` for server-side producers, and injects
+/// `turbine_ws_publish()` into the PHP bootstrap.
+#[derive(Debug, Deserialize, Clone)]
+pub struct WebsocketConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_ws_max_channels")]
+    pub max_channels: usize,
+    #[serde(default = "default_ws_channel_capacity")]
+    pub channel_capacity: usize,
+    #[serde(default = "default_ws_max_frame_size")]
+    pub max_frame_size: usize,
+    /// Close connections idle for this many seconds.  0 disables.
+    #[serde(default = "default_ws_idle_secs")]
+    pub idle_timeout_secs: u64,
+}
+
+impl Default for WebsocketConfig {
+    fn default() -> Self {
+        WebsocketConfig {
+            enabled: false,
+            max_channels: default_ws_max_channels(),
+            channel_capacity: default_ws_channel_capacity(),
+            max_frame_size: default_ws_max_frame_size(),
+            idle_timeout_secs: default_ws_idle_secs(),
+        }
+    }
+}
+
+fn default_ws_max_channels() -> usize {
+    128
+}
+fn default_ws_channel_capacity() -> usize {
+    256
+}
+fn default_ws_max_frame_size() -> usize {
+    65_536
+}
+fn default_ws_idle_secs() -> u64 {
+    300
 }
 
 /// Route-based worker pool splitting configuration.

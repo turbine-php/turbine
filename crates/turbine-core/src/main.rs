@@ -39,6 +39,7 @@ use turbine_worker::pool::{
 use turbine_worker::{encode_native_request, write_to_fd, NativeResponse};
 
 mod acme;
+mod admin;
 mod cli;
 mod compat;
 mod config;
@@ -50,10 +51,12 @@ mod io_uring_backend;
 mod path_guard;
 mod shared_table;
 mod task_queue;
+mod websocket;
 
 use path_guard::RequestGuard;
-use shared_table::{SharedTable, TableError};
-use task_queue::{QueueError, TaskQueue};
+use shared_table::SharedTable;
+use task_queue::TaskQueue;
+use websocket::{WsConfig, WsHub};
 
 use cli::{Cli, Command};
 use compat::{AppDetector, AppStructure, FullHttpRequest};
@@ -918,6 +921,8 @@ struct ServerState {
     /// from the config so a malicious/buggy client can't tie up a
     /// connection forever.
     task_max_wait_ms: u64,
+    /// WebSocket hub exposed via `/_/ws/*`.  `None` when disabled.
+    ws_hub: Option<Arc<WsHub>>,
     /// Virtual host map: lowercase domain → resolved vhost with pre-computed AppStructure.
     /// Empty = no virtual hosting (use global app_structure).
     virtual_hosts: std::collections::HashMap<String, Arc<VhostResolved>>,
@@ -1278,6 +1283,11 @@ fn cmd_serve(
             php_bootstrap
         );
         info!("PHP turbine_task_*() helpers injected into bootstrap");
+    }
+    // Inject turbine_ws_* PHP helpers if websocket is enabled
+    if config.websocket.enabled {
+        php_bootstrap = format!("{}{}", features::php_turbine_ws_functions(), php_bootstrap);
+        info!("PHP turbine_ws_*() helpers injected into bootstrap");
     }
 
     // --- Virtual hosting ---
@@ -2018,6 +2028,16 @@ fn cmd_serve(
                 None
             },
             task_max_wait_ms: config.task_queue.max_wait_ms,
+            ws_hub: if config.websocket.enabled {
+                Some(Arc::new(WsHub::new(WsConfig {
+                    max_channels: config.websocket.max_channels,
+                    channel_capacity: config.websocket.channel_capacity,
+                    max_frame_size: config.websocket.max_frame_size,
+                    idle_timeout_secs: config.websocket.idle_timeout_secs,
+                })))
+            } else {
+                None
+            },
             virtual_hosts: virtual_hosts.clone(),
         });
 
@@ -2189,6 +2209,16 @@ fn cmd_serve(
                 None
             },
             task_max_wait_ms: config.task_queue.max_wait_ms,
+            ws_hub: if config.websocket.enabled {
+                Some(Arc::new(WsHub::new(WsConfig {
+                    max_channels: config.websocket.max_channels,
+                    channel_capacity: config.websocket.channel_capacity,
+                    max_frame_size: config.websocket.max_frame_size,
+                    idle_timeout_secs: config.websocket.idle_timeout_secs,
+                })))
+            } else {
+                None
+            },
             virtual_hosts: virtual_hosts.clone(),
         });
 
@@ -3318,367 +3348,43 @@ async fn handle_request_inner(
         }
 
         // ── Shared table (Swoole\Table equivalent) ───────────────────────
-        // These endpoints are active only when `[shared_table] enabled = true`.
-        // `key` and `ttl_ms` come from the query string; the value (for SET)
-        // is the raw request body so binary-safe payloads work transparently.
-        if let Some(table) = state.shared_table.as_ref() {
-            if clean_path.starts_with("/_/table") {
-                // Parse query parameters manually (no url_form dep for internal API).
-                let qs = req.uri().query().unwrap_or("");
-                let key = query_param(qs, "key");
-                let ttl_ms: u64 = query_param(qs, "ttl_ms")
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0);
-                let delta: i64 = query_param(qs, "delta")
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(1);
-
-                // Dispatch on method + subpath.
-                let sub = clean_path.strip_prefix("/_/table").unwrap_or("");
-                match (req_method.as_str(), sub) {
-                    ("GET", "/size") => {
-                        let body = format!(
-                            "{{\"size\":{},\"evictions\":{}}}",
-                            table.size(),
-                            table.evictions()
-                        );
-                        return Ok(build_response(
-                            200,
-                            "application/json",
-                            body.into_bytes(),
-                            &[],
-                        ));
-                    }
-                    ("GET", "/exists") => {
-                        let k = match key {
-                            Some(k) => k,
-                            None => {
-                                return Ok(build_response(
-                                    400,
-                                    "application/json",
-                                    b"{\"error\":\"missing key\"}".to_vec(),
-                                    &[],
-                                ))
-                            }
-                        };
-                        let code = if table.exists(k) { 200 } else { 404 };
-                        return Ok(build_response(
-                            code,
-                            "application/json",
-                            format!("{{\"exists\":{}}}", code == 200).into_bytes(),
-                            &[],
-                        ));
-                    }
-                    ("GET", "" | "/" | "/get") => {
-                        let k = match key {
-                            Some(k) => k,
-                            None => {
-                                return Ok(build_response(
-                                    400,
-                                    "application/json",
-                                    b"{\"error\":\"missing key\"}".to_vec(),
-                                    &[],
-                                ))
-                            }
-                        };
-                        return Ok(match table.get(k) {
-                            Some(v) => build_response(200, "application/octet-stream", v, &[]),
-                            None => build_response(404, "text/plain", Vec::new(), &[]),
-                        });
-                    }
-                    ("POST", "/incr") => {
-                        let k = match key {
-                            Some(k) => k.to_string(),
-                            None => {
-                                return Ok(build_response(
-                                    400,
-                                    "application/json",
-                                    b"{\"error\":\"missing key\"}".to_vec(),
-                                    &[],
-                                ))
-                            }
-                        };
-                        return Ok(match table.incr(&k, delta) {
-                            Ok(v) => build_response(
-                                200,
-                                "application/json",
-                                format!("{{\"value\":{v}}}").into_bytes(),
-                                &[],
-                            ),
-                            Err(TableError::Full(n)) => build_response(
-                                507,
-                                "application/json",
-                                format!("{{\"error\":\"table full\",\"max_entries\":{n}}}")
-                                    .into_bytes(),
-                                &[],
-                            ),
-                            Err(TableError::NotACounter(_)) => build_response(
-                                409,
-                                "application/json",
-                                b"{\"error\":\"key exists but is not a counter\"}".to_vec(),
-                                &[],
-                            ),
-                        });
-                    }
-                    ("POST", "" | "/" | "/set") => {
-                        let k = match key {
-                            Some(k) => k.to_string(),
-                            None => {
-                                return Ok(build_response(
-                                    400,
-                                    "application/json",
-                                    b"{\"error\":\"missing key\"}".to_vec(),
-                                    &[],
-                                ))
-                            }
-                        };
-                        // Read the request body — capped at `max_body_bytes` so
-                        // a rogue PHP worker cannot fill memory with one call.
-                        let (inner_req, _) = match FullHttpRequest::from_hyper(
-                            req,
-                            remote_addr,
-                            &state.upload_tmp_dir,
-                            &state.upload_security,
-                            Some(state.max_body_bytes.unwrap_or(1_048_576).max(1_048_576)),
-                        )
-                        .await
-                        {
-                            Ok(pair) => pair,
-                            Err(compat::RequestBuildError::PayloadTooLarge) => {
-                                return Ok(build_response(
-                                    413,
-                                    "application/json",
-                                    b"{\"error\":\"payload too large\"}".to_vec(),
-                                    &[],
-                                ))
-                            }
-                            Err(_) => {
-                                return Ok(build_response(
-                                    400,
-                                    "application/json",
-                                    b"{\"error\":\"invalid request\"}".to_vec(),
-                                    &[],
-                                ))
-                            }
-                        };
-                        let ttl = if ttl_ms > 0 {
-                            Some(std::time::Duration::from_millis(ttl_ms))
-                        } else {
-                            None
-                        };
-                        return Ok(match table.set(k, inner_req.body, ttl) {
-                            Ok(()) => build_response(204, "text/plain", Vec::new(), &[]),
-                            Err(TableError::Full(n)) => build_response(
-                                507,
-                                "application/json",
-                                format!("{{\"error\":\"table full\",\"max_entries\":{n}}}")
-                                    .into_bytes(),
-                                &[],
-                            ),
-                            Err(TableError::NotACounter(_)) => build_response(
-                                500,
-                                "application/json",
-                                b"{\"error\":\"internal\"}".to_vec(),
-                                &[],
-                            ),
-                        });
-                    }
-                    ("DELETE", "/clear") => {
-                        let n = table.clear();
-                        return Ok(build_response(
-                            200,
-                            "application/json",
-                            format!("{{\"cleared\":{n}}}").into_bytes(),
-                            &[],
-                        ));
-                    }
-                    ("DELETE", "" | "/" | "/del") => {
-                        let k = match key {
-                            Some(k) => k,
-                            None => {
-                                return Ok(build_response(
-                                    400,
-                                    "application/json",
-                                    b"{\"error\":\"missing key\"}".to_vec(),
-                                    &[],
-                                ))
-                            }
-                        };
-                        let removed = table.del(k);
-                        return Ok(build_response(
-                            200,
-                            "application/json",
-                            format!("{{\"deleted\":{removed}}}").into_bytes(),
-                            &[],
-                        ));
-                    }
-                    _ => {
-                        // Unknown subpath under /_/table — fall through to 404.
-                    }
-                }
-            }
+        // Extracted to `admin::handle_shared_table` for readability.
+        if state.shared_table.is_some() && clean_path.starts_with("/_/table") {
+            return Ok(admin::handle_shared_table(
+                &state,
+                req,
+                req_method.as_str(),
+                &clean_path,
+                remote_addr,
+            )
+            .await);
         }
 
         // ── Task queue (Swoole task worker equivalent) ───────────────────
-        // Endpoints active only when `[task_queue] enabled = true`.  The
-        // `channel` and `wait_ms`/`delta` parameters come from the query
-        // string; the job payload (for push) is the raw request body so
-        // callers can send binary data without base64.
-        if let Some(queue) = state.task_queue.as_ref() {
-            if clean_path.starts_with("/_/task") {
-                let qs = req.uri().query().unwrap_or("");
-                let channel = query_param(qs, "channel");
-                let wait_ms: u64 = query_param(qs, "wait_ms")
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0)
-                    .min(state.task_max_wait_ms);
-                let sub = clean_path.strip_prefix("/_/task").unwrap_or("");
-                match (req_method.as_str(), sub) {
-                    ("GET", "/stats") => {
-                        let s = queue.stats();
-                        let body = format!(
-                            "{{\"channels\":{},\"pushed\":{},\"popped\":{},\"rejected\":{}}}",
-                            s.channels, s.pushed, s.popped, s.rejected
-                        );
-                        return Ok(build_response(
-                            200,
-                            "application/json",
-                            body.into_bytes(),
-                            &[],
-                        ));
-                    }
-                    ("GET", "/size") => {
-                        let c = match channel {
-                            Some(c) => c,
-                            None => {
-                                return Ok(build_response(
-                                    400,
-                                    "application/json",
-                                    b"{\"error\":\"missing channel\"}".to_vec(),
-                                    &[],
-                                ))
-                            }
-                        };
-                        return Ok(build_response(
-                            200,
-                            "application/json",
-                            format!("{{\"size\":{}}}", queue.size(c)).into_bytes(),
-                            &[],
-                        ));
-                    }
-                    ("POST", "" | "/" | "/push") => {
-                        let c = match channel {
-                            Some(c) => c.to_string(),
-                            None => {
-                                return Ok(build_response(
-                                    400,
-                                    "application/json",
-                                    b"{\"error\":\"missing channel\"}".to_vec(),
-                                    &[],
-                                ))
-                            }
-                        };
-                        let (inner_req, _) = match FullHttpRequest::from_hyper(
-                            req,
-                            remote_addr,
-                            &state.upload_tmp_dir,
-                            &state.upload_security,
-                            Some(state.max_body_bytes.unwrap_or(1_048_576).max(1_048_576)),
-                        )
-                        .await
-                        {
-                            Ok(pair) => pair,
-                            Err(compat::RequestBuildError::PayloadTooLarge) => {
-                                return Ok(build_response(
-                                    413,
-                                    "application/json",
-                                    b"{\"error\":\"payload too large\"}".to_vec(),
-                                    &[],
-                                ))
-                            }
-                            Err(_) => {
-                                return Ok(build_response(
-                                    400,
-                                    "application/json",
-                                    b"{\"error\":\"invalid request\"}".to_vec(),
-                                    &[],
-                                ))
-                            }
-                        };
-                        return Ok(match queue.push(&c, inner_req.body) {
-                            Ok(id) => build_response(
-                                200,
-                                "application/json",
-                                format!("{{\"id\":{id}}}").into_bytes(),
-                                &[],
-                            ),
-                            Err(QueueError::Full(_, n)) => build_response(
-                                507,
-                                "application/json",
-                                format!("{{\"error\":\"channel full\",\"capacity\":{n}}}")
-                                    .into_bytes(),
-                                &[],
-                            ),
-                            Err(QueueError::TooManyChannels(n)) => build_response(
-                                507,
-                                "application/json",
-                                format!("{{\"error\":\"too many channels\",\"max\":{n}}}")
-                                    .into_bytes(),
-                                &[],
-                            ),
-                        });
-                    }
-                    ("POST", "/pop") | ("GET", "/pop") => {
-                        let c = match channel {
-                            Some(c) => c.to_string(),
-                            None => {
-                                return Ok(build_response(
-                                    400,
-                                    "application/json",
-                                    b"{\"error\":\"missing channel\"}".to_vec(),
-                                    &[],
-                                ))
-                            }
-                        };
-                        let wait = std::time::Duration::from_millis(wait_ms);
-                        return Ok(match queue.pop(&c, wait).await {
-                            Some(job) => {
-                                let id_str = job.id.to_string();
-                                build_response(
-                                    200,
-                                    "application/octet-stream",
-                                    job.payload,
-                                    &[("X-Task-Id", id_str.as_str())],
-                                )
-                            }
-                            None => build_response(204, "text/plain", Vec::new(), &[]),
-                        });
-                    }
-                    ("DELETE", "/clear") => {
-                        let c = match channel {
-                            Some(c) => c,
-                            None => {
-                                return Ok(build_response(
-                                    400,
-                                    "application/json",
-                                    b"{\"error\":\"missing channel\"}".to_vec(),
-                                    &[],
-                                ))
-                            }
-                        };
-                        let n = queue.clear(c);
-                        return Ok(build_response(
-                            200,
-                            "application/json",
-                            format!("{{\"cleared\":{n}}}").into_bytes(),
-                            &[],
-                        ));
-                    }
-                    _ => {
-                        // Unknown subpath under /_/task — fall through to 404.
-                    }
-                }
-            }
+        // Extracted to `admin::handle_task_queue` for readability.
+        if state.task_queue.is_some() && clean_path.starts_with("/_/task") {
+            return Ok(admin::handle_task_queue(
+                &state,
+                req,
+                req_method.as_str(),
+                &clean_path,
+                remote_addr,
+            )
+            .await);
+        }
+
+        // ── WebSocket hub ────────────────────────────────────────────────
+        // Extracted to `admin::handle_websocket`.  Drives both the HTTP
+        // publish endpoint and the subscriber upgrade handshake.
+        if state.ws_hub.is_some() && clean_path.starts_with("/_/ws") {
+            return Ok(admin::handle_websocket(
+                &state,
+                req,
+                req_method.as_str(),
+                &clean_path,
+                remote_addr,
+            )
+            .await);
         }
 
         return Ok(build_response(
