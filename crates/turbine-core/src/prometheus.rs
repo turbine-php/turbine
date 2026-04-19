@@ -14,8 +14,8 @@ use bytes::Bytes;
 use http_body_util::Full;
 use hyper::Response;
 
-use crate::ServerState;
 use crate::build_response;
+use crate::ServerState;
 
 type HyperResponse = Response<Full<Bytes>>;
 
@@ -148,11 +148,7 @@ pub fn render(state: &ServerState) -> String {
             "# HELP turbine_async_timers_fired_total Timers that fired and enqueued a task."
         );
         let _ = writeln!(out, "# TYPE turbine_async_timers_fired_total counter");
-        let _ = writeln!(
-            out,
-            "turbine_async_timers_fired_total {}",
-            s.timers_fired
-        );
+        let _ = writeln!(out, "turbine_async_timers_fired_total {}", s.timers_fired);
 
         let _ = writeln!(
             out,

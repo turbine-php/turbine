@@ -73,9 +73,9 @@ use config::RuntimeConfig;
 use response::{
     parse_turbine_response_envelope, postprocess_php_response, response_prevents_caching,
 };
-use tls::{build_tls_acceptor, build_tls_acceptor_with_sni};
 #[cfg(target_os = "linux")]
 use tls::{bind_reuseport_linux, set_busy_poll};
+use tls::{build_tls_acceptor, build_tls_acceptor_with_sni};
 
 /// Result shared between the singleflight leader and its followers.
 ///

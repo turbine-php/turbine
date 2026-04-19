@@ -17,8 +17,8 @@
 
 use tracing::debug;
 
-use crate::ServerState;
 use crate::features;
+use crate::ServerState;
 
 /// Envelope markers emitted by the PHP SAPI layer.  Kept here so the
 /// parser and the emitter live next to each other.
@@ -157,7 +157,10 @@ mod tests {
         let (status, headers, body) = parse_turbine_response_envelope(wire).unwrap();
         assert_eq!(status, 201);
         assert_eq!(headers.len(), 2);
-        assert_eq!(headers[0], ("Content-Type".into(), "application/json".into()));
+        assert_eq!(
+            headers[0],
+            ("Content-Type".into(), "application/json".into())
+        );
         assert_eq!(body, b"{\"ok\":true}");
     }
 

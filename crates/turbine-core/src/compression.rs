@@ -16,8 +16,8 @@ pub fn is_compressible_content_type(content_type: &str) -> bool {
 }
 
 pub fn gzip_compress(data: &[u8], level: u32) -> Vec<u8> {
-    use flate2::Compression;
     use flate2::write::GzEncoder;
+    use flate2::Compression;
     use std::io::Write;
 
     let mut encoder = GzEncoder::new(Vec::new(), Compression::new(level));

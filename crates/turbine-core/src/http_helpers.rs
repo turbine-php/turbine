@@ -14,8 +14,8 @@ use hyper::{Response, StatusCode};
 use tracing::info;
 use turbine_metrics::MetricsCollector;
 
-use crate::ServerState;
 use crate::config;
+use crate::ServerState;
 
 pub type HyperResponse = Response<Full<Bytes>>;
 
@@ -331,16 +331,28 @@ mod tests {
 
     #[test]
     fn mime_type_mapping() {
-        assert_eq!(mime_type_for_extension("foo.css"), "text/css; charset=utf-8");
+        assert_eq!(
+            mime_type_for_extension("foo.css"),
+            "text/css; charset=utf-8"
+        );
         assert_eq!(mime_type_for_extension("a/b/c.JPG"), "image/jpeg");
-        assert_eq!(mime_type_for_extension("unknown.xyz"), "application/octet-stream");
+        assert_eq!(
+            mime_type_for_extension("unknown.xyz"),
+            "application/octet-stream"
+        );
         assert_eq!(mime_type_for_extension("noext"), "application/octet-stream");
     }
 
     #[test]
     fn detect_content_type_basic() {
         assert_eq!(detect_content_type(b"{\"x\":1}"), "application/json");
-        assert_eq!(detect_content_type(b"<!DOCTYPE html>..."), "text/html; charset=utf-8");
-        assert_eq!(detect_content_type(b"hello world"), "text/plain; charset=utf-8");
+        assert_eq!(
+            detect_content_type(b"<!DOCTYPE html>..."),
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(
+            detect_content_type(b"hello world"),
+            "text/plain; charset=utf-8"
+        );
     }
 }
