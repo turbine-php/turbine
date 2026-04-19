@@ -69,29 +69,64 @@ wait_http() {
 # The third argument lets callers enforce an expected body size (e.g. 50 KB
 # scripts must return >= 45 KB; anything smaller means the request hit an
 # error page that the server happened to deliver as 200).
+#
+# Retry logic: the server often just finished a 30s wrk burst at high RPS,
+# so a worker may still be recycling when the next curl hits. A single 502
+# right after a heavy load is usually a transient worker race (e.g. a
+# persistent worker exited before the pool reaper noticed). We retry up to
+# 3 times with a 1s backoff before declaring the endpoint broken.
 validate_response() {
     local label="$1"
     local url="$2"
     local min_size="${3:-1}"
-    local body status
-    status=$(curl -s -o /tmp/bench_body.txt -w "%{http_code}" --max-time 5 "$url" 2>/dev/null)
-    body=$(head -c 500 /tmp/bench_body.txt 2>/dev/null)
-    local size
-    size=$(wc -c < /tmp/bench_body.txt 2>/dev/null | tr -d ' ')
-    log "  VALIDATE ${label}: HTTP ${status}, ${size} bytes, body: ${body:0:120}"
-    local ok=1
-    if [[ "$status" != 2* ]]; then
-        log "  WARNING: ${label} returned HTTP ${status} — PHP may not be executing!"
-        ok=0
+    local body status size
+    local attempts=3
+    local attempt=0
+    local ok=0
+
+    while [[ $attempt -lt $attempts ]]; do
+        attempt=$((attempt + 1))
+        status=$(curl -s -o /tmp/bench_body.txt -w "%{http_code}" --max-time 5 "$url" 2>/dev/null)
+        body=$(head -c 500 /tmp/bench_body.txt 2>/dev/null)
+        size=$(wc -c < /tmp/bench_body.txt 2>/dev/null | tr -d ' ')
+        local attempt_tag=""
+        [[ $attempt -gt 1 ]] && attempt_tag=" (retry ${attempt}/${attempts})"
+        log "  VALIDATE ${label}${attempt_tag}: HTTP ${status}, ${size} bytes, body: ${body:0:120}"
+
+        local this_ok=1
+        if [[ "$status" != 2* ]]; then
+            this_ok=0
+        fi
+        if [[ -z "$body" || "$body" == *"Not Found"* ]]; then
+            this_ok=0
+        fi
+        if [[ "$size" -lt "$min_size" ]]; then
+            this_ok=0
+        fi
+
+        if [[ "$this_ok" == 1 ]]; then
+            ok=1
+            break
+        fi
+        # Transient failure: let workers settle before retrying.
+        if [[ $attempt -lt $attempts ]]; then
+            log "  (transient failure, waiting 1s before retry)"
+            sleep 1
+        fi
+    done
+
+    if [[ "$ok" == 0 ]]; then
+        if [[ "$status" != 2* ]]; then
+            log "  WARNING: ${label} returned HTTP ${status} after ${attempts} attempts — PHP may not be executing!"
+        fi
+        if [[ -z "$body" || "$body" == *"Not Found"* ]]; then
+            log "  WARNING: ${label} response looks like an error page"
+        fi
+        if [[ "$size" -lt "$min_size" ]]; then
+            log "  WARNING: ${label} response is ${size} bytes (expected >= ${min_size}) — benchmark result unreliable"
+        fi
     fi
-    if [[ -z "$body" || "$body" == *"Not Found"* ]]; then
-        log "  WARNING: ${label} response looks like an error page"
-        ok=0
-    fi
-    if [[ "$size" -lt "$min_size" ]]; then
-        log "  WARNING: ${label} response is ${size} bytes (expected >= ${min_size}) — benchmark result unreliable"
-        ok=0
-    fi
+
     rm -f /tmp/bench_body.txt
     [[ "$ok" == 1 ]] && return 0 || return 1
 }
@@ -384,6 +419,11 @@ bench_php_scripts() {
         fi
         results+=("$parsed")
         rm -f "$stats_file" "$result_file"
+
+        # Brief cool-down between scripts so workers finish recycling from the
+        # previous 30s wrk burst. Without this, the next validate_response can
+        # hit a transient 502 while a persistent worker is still being respawned.
+        sleep 2
     done
 
     docker stop bench-server >/dev/null 2>&1 || true
