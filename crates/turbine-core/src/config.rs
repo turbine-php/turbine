@@ -38,6 +38,8 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub dashboard: DashboardConfig,
     #[serde(default)]
+    pub shared_table: SharedTableConfig,
+    #[serde(default)]
     pub worker_pools: Vec<WorkerPoolRouteConfig>,
     #[serde(default)]
     pub virtual_hosts: Vec<VirtualHostConfig>,
@@ -435,6 +437,42 @@ impl Default for DashboardConfig {
             token: None,
         }
     }
+}
+
+/// Shared in-memory key/value table (Swoole\Table equivalent), exposed to
+/// PHP via HTTP endpoints under `/_/table`.  See `docs/shared-state.md`.
+#[derive(Debug, Deserialize, Clone)]
+pub struct SharedTableConfig {
+    /// Enable `/_/table/*` endpoints and inject the `turbine_table_*()` PHP
+    /// helpers into worker bootstrap.  Default: disabled.  Opt-in so that
+    /// existing deployments don't grow a new RAM-resident map surprise.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Maximum number of entries.  Writes of new keys beyond this bound
+    /// return a 507 Insufficient Storage.
+    #[serde(default = "default_shared_table_max_entries")]
+    pub max_entries: usize,
+    /// Background sweep cadence in seconds (expired entry eviction).
+    #[serde(default = "default_shared_table_sweep_secs")]
+    pub sweep_interval_secs: u64,
+}
+
+impl Default for SharedTableConfig {
+    fn default() -> Self {
+        SharedTableConfig {
+            enabled: false,
+            max_entries: default_shared_table_max_entries(),
+            sweep_interval_secs: default_shared_table_sweep_secs(),
+        }
+    }
+}
+
+fn default_shared_table_max_entries() -> usize {
+    65536
+}
+
+fn default_shared_table_sweep_secs() -> u64 {
+    5
 }
 
 /// Route-based worker pool splitting configuration.

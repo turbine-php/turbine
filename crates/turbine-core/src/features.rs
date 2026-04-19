@@ -292,6 +292,101 @@ pub fn php_turbine_log_function() -> &'static str {
 "#
 }
 
+/// PHP helper code for the shared-table API.  Six tiny wrappers that
+/// round-trip through the internal HTTP endpoints under `/_/table`.
+///
+/// Usage:
+///
+/// ```php
+/// turbine_table_set('feature:new_ui', '1', 60_000);      // 60 s TTL
+/// $v = turbine_table_get('feature:new_ui');              // string|null
+/// $n = turbine_table_incr('rate:ip:1.2.3.4', 1);         // int
+/// turbine_table_del('feature:new_ui');
+/// ```
+///
+/// The helpers accept an optional base URL and Bearer token so callers can
+/// talk to a remote Turbine or to the local one when `[dashboard] token`
+/// is set.  Defaults read from `TURBINE_TABLE_URL` and `TURBINE_TOKEN`
+/// environment variables, or fall back to `http://127.0.0.1:<SERVER_PORT>`.
+pub fn php_turbine_table_functions() -> &'static str {
+    r#"if (!function_exists('turbine_table_request')) {
+    function turbine_table_request(string $method, string $path, ?string $body = null): array {
+        static $base = null, $token = null;
+        if ($base === null) {
+            $base  = getenv('TURBINE_TABLE_URL')
+                  ?: ('http://127.0.0.1:' . ($_SERVER['SERVER_PORT'] ?? '8080'));
+            $token = getenv('TURBINE_TOKEN') ?: '';
+        }
+        $url = rtrim($base, '/') . $path;
+        $headers = ['Expect:', 'Content-Type: application/octet-stream'];
+        if ($token !== '') $headers[] = 'Authorization: Bearer ' . $token;
+
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_CUSTOMREQUEST  => $method,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT_MS     => 2000,
+            CURLOPT_CONNECTTIMEOUT_MS => 500,
+            CURLOPT_HTTPHEADER     => $headers,
+            CURLOPT_TCP_KEEPALIVE  => 1,
+        ]);
+        if ($body !== null) curl_setopt($ch, CURLOPT_POSTFIELDS, $body);
+        $resp = curl_exec($ch);
+        $code = curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+        curl_close($ch);
+        return [(int)$code, $resp === false ? '' : (string)$resp];
+    }
+}
+
+if (!function_exists('turbine_table_get')) {
+    function turbine_table_get(string $key): ?string {
+        [$code, $body] = turbine_table_request('GET', '/_/table/get?key=' . rawurlencode($key));
+        return $code === 200 ? $body : null;
+    }
+}
+
+if (!function_exists('turbine_table_set')) {
+    function turbine_table_set(string $key, string $value, int $ttl_ms = 0): bool {
+        $q = '/_/table/set?key=' . rawurlencode($key);
+        if ($ttl_ms > 0) $q .= '&ttl_ms=' . $ttl_ms;
+        [$code] = turbine_table_request('POST', $q, $value);
+        return $code === 204;
+    }
+}
+
+if (!function_exists('turbine_table_del')) {
+    function turbine_table_del(string $key): bool {
+        [$code, $body] = turbine_table_request('DELETE', '/_/table/del?key=' . rawurlencode($key));
+        return $code === 200 && str_contains($body, '"deleted":true');
+    }
+}
+
+if (!function_exists('turbine_table_exists')) {
+    function turbine_table_exists(string $key): bool {
+        [$code] = turbine_table_request('GET', '/_/table/exists?key=' . rawurlencode($key));
+        return $code === 200;
+    }
+}
+
+if (!function_exists('turbine_table_incr')) {
+    function turbine_table_incr(string $key, int $delta = 1): ?int {
+        $q = '/_/table/incr?key=' . rawurlencode($key) . '&delta=' . $delta;
+        [$code, $body] = turbine_table_request('POST', $q);
+        if ($code !== 200) return null;
+        return preg_match('/"value":(-?\d+)/', $body, $m) ? (int)$m[1] : null;
+    }
+}
+
+if (!function_exists('turbine_table_size')) {
+    function turbine_table_size(): int {
+        [$code, $body] = turbine_table_request('GET', '/_/table/size');
+        if ($code !== 200) return 0;
+        return preg_match('/"size":(\d+)/', $body, $m) ? (int)$m[1] : 0;
+    }
+}
+"#
+}
+
 // ── Worker Pool Route Matching ────────────────────────────────────────────
 
 /// Match a request path against a route pattern (supports trailing *).

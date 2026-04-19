@@ -41,6 +41,7 @@ parking_lot = { workspace = true }
 thiserror = { workspace = true }
 mimalloc = { workspace = true }
 libc = { workspace = true }
+dashmap = { workspace = true }
 
 # ACME auto-provisioning (optional, behind `acme` feature)
 instant-acme = { workspace = true, optional = true }
