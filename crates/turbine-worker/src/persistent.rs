@@ -329,28 +329,54 @@ struct DecodedRequest {
     script_name: String,
 }
 
-/// Decode a full request from the cmd pipe (blocking).
-fn decode_request_from_fd(cmd_fd: RawFd) -> io::Result<DecodedRequest> {
-    let method = read_string_fd(cmd_fd)?;
-    let uri = read_string_fd(cmd_fd)?;
-    let body = read_bytes_fd(cmd_fd)?;
-    let client_ip = read_string_fd(cmd_fd)?;
-    let port = read_u32_le_fd(cmd_fd)? as u16;
-    let is_https = read_u8_fd(cmd_fd)? != 0;
-    let hdr_count = read_u32_le_fd(cmd_fd)? as usize;
+/// Decode a full request from a `Read` source (pipe fd, in-memory buffer, etc).
+/// Mirror of the `encode_request_into` wire format.  Used by both the pipe
+/// and channel worker event loops — channel mode wraps a `&[u8]` in a
+/// `std::io::Cursor` and reuses the same decoder.
+fn decode_request_from_reader<R: Read>(r: &mut R) -> io::Result<DecodedRequest> {
+    // All read_* helpers here mirror the fd variants but work on any Read.
+    fn read_exact_n<R: Read>(r: &mut R, n: usize) -> io::Result<Vec<u8>> {
+        let mut buf = vec![0u8; n];
+        r.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+    fn read_u8_r<R: Read>(r: &mut R) -> io::Result<u8> {
+        Ok(read_exact_n(r, 1)?[0])
+    }
+    fn read_u32_le_r<R: Read>(r: &mut R) -> io::Result<u32> {
+        let b = read_exact_n(r, 4)?;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+    fn read_string_r<R: Read>(r: &mut R) -> io::Result<String> {
+        let len = read_u32_le_r(r)? as usize;
+        let bytes = read_exact_n(r, len)?;
+        String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+    fn read_bytes_r<R: Read>(r: &mut R) -> io::Result<Vec<u8>> {
+        let len = read_u32_le_r(r)? as usize;
+        read_exact_n(r, len)
+    }
+
+    let method = read_string_r(r)?;
+    let uri = read_string_r(r)?;
+    let body = read_bytes_r(r)?;
+    let client_ip = read_string_r(r)?;
+    let port = read_u32_le_r(r)? as u16;
+    let is_https = read_u8_r(r)? != 0;
+    let hdr_count = read_u32_le_r(r)? as usize;
     let mut headers = Vec::with_capacity(hdr_count);
     for _ in 0..hdr_count {
-        let name = read_string_fd(cmd_fd)?;
-        let value = read_string_fd(cmd_fd)?;
+        let name = read_string_r(r)?;
+        let value = read_string_r(r)?;
         headers.push((name, value));
     }
-    let script_filename = read_string_fd(cmd_fd)?;
-    let query_string = read_string_fd(cmd_fd)?;
-    let document_root = read_string_fd(cmd_fd)?;
-    let content_type = read_string_fd(cmd_fd)?;
-    let cookie = read_string_fd(cmd_fd)?;
-    let path_info = read_string_fd(cmd_fd)?;
-    let script_name = read_string_fd(cmd_fd)?;
+    let script_filename = read_string_r(r)?;
+    let query_string = read_string_r(r)?;
+    let document_root = read_string_r(r)?;
+    let content_type = read_string_r(r)?;
+    let cookie = read_string_r(r)?;
+    let path_info = read_string_r(r)?;
+    let script_name = read_string_r(r)?;
 
     Ok(DecodedRequest {
         method,
@@ -368,6 +394,11 @@ fn decode_request_from_fd(cmd_fd: RawFd) -> io::Result<DecodedRequest> {
         path_info,
         script_name,
     })
+}
+
+/// Decode a full request from the cmd pipe (blocking).
+fn decode_request_from_fd(cmd_fd: RawFd) -> io::Result<DecodedRequest> {
+    decode_request_from_reader(&mut FdReader(cmd_fd))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
