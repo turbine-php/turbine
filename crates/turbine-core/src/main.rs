@@ -49,9 +49,11 @@ mod features;
 mod io_uring_backend;
 mod path_guard;
 mod shared_table;
+mod task_queue;
 
 use path_guard::RequestGuard;
 use shared_table::{SharedTable, TableError};
+use task_queue::{QueueError, TaskQueue};
 
 use cli::{Cli, Command};
 use compat::{AppDetector, AppStructure, FullHttpRequest};
@@ -910,6 +912,12 @@ struct ServerState {
     /// the feature is disabled — all endpoints 404 and the PHP helpers are
     /// not injected.
     shared_table: Option<Arc<SharedTable>>,
+    /// In-process task queue exposed via `/_/task/*`. `None` when disabled.
+    task_queue: Option<Arc<TaskQueue>>,
+    /// Hard ceiling on long-poll `pop` waits, in milliseconds.  Clamped
+    /// from the config so a malicious/buggy client can't tie up a
+    /// connection forever.
+    task_max_wait_ms: u64,
     /// Virtual host map: lowercase domain → resolved vhost with pre-computed AppStructure.
     /// Empty = no virtual hosting (use global app_structure).
     virtual_hosts: std::collections::HashMap<String, Arc<VhostResolved>>,
@@ -1261,6 +1269,15 @@ fn cmd_serve(
             php_bootstrap
         );
         info!("PHP turbine_table_*() helpers injected into bootstrap");
+    }
+    // Inject turbine_task_* PHP helpers if task_queue is enabled
+    if config.task_queue.enabled {
+        php_bootstrap = format!(
+            "{}{}",
+            features::php_turbine_task_functions(),
+            php_bootstrap
+        );
+        info!("PHP turbine_task_*() helpers injected into bootstrap");
     }
 
     // --- Virtual hosting ---
@@ -1992,6 +2009,15 @@ fn cmd_serve(
             } else {
                 None
             },
+            task_queue: if config.task_queue.enabled {
+                Some(Arc::new(TaskQueue::new(
+                    config.task_queue.max_channels,
+                    config.task_queue.channel_capacity,
+                )))
+            } else {
+                None
+            },
+            task_max_wait_ms: config.task_queue.max_wait_ms,
             virtual_hosts: virtual_hosts.clone(),
         });
 
@@ -2154,6 +2180,15 @@ fn cmd_serve(
             } else {
                 None
             },
+            task_queue: if config.task_queue.enabled {
+                Some(Arc::new(TaskQueue::new(
+                    config.task_queue.max_channels,
+                    config.task_queue.channel_capacity,
+                )))
+            } else {
+                None
+            },
+            task_max_wait_ms: config.task_queue.max_wait_ms,
             virtual_hosts: virtual_hosts.clone(),
         });
 
@@ -3479,6 +3514,168 @@ async fn handle_request_inner(
                     }
                     _ => {
                         // Unknown subpath under /_/table — fall through to 404.
+                    }
+                }
+            }
+        }
+
+        // ── Task queue (Swoole task worker equivalent) ───────────────────
+        // Endpoints active only when `[task_queue] enabled = true`.  The
+        // `channel` and `wait_ms`/`delta` parameters come from the query
+        // string; the job payload (for push) is the raw request body so
+        // callers can send binary data without base64.
+        if let Some(queue) = state.task_queue.as_ref() {
+            if clean_path.starts_with("/_/task") {
+                let qs = req.uri().query().unwrap_or("");
+                let channel = query_param(qs, "channel");
+                let wait_ms: u64 = query_param(qs, "wait_ms")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0)
+                    .min(state.task_max_wait_ms);
+                let sub = clean_path.strip_prefix("/_/task").unwrap_or("");
+                match (req_method.as_str(), sub) {
+                    ("GET", "/stats") => {
+                        let s = queue.stats();
+                        let body = format!(
+                            "{{\"channels\":{},\"pushed\":{},\"popped\":{},\"rejected\":{}}}",
+                            s.channels, s.pushed, s.popped, s.rejected
+                        );
+                        return Ok(build_response(
+                            200,
+                            "application/json",
+                            body.into_bytes(),
+                            &[],
+                        ));
+                    }
+                    ("GET", "/size") => {
+                        let c = match channel {
+                            Some(c) => c,
+                            None => {
+                                return Ok(build_response(
+                                    400,
+                                    "application/json",
+                                    b"{\"error\":\"missing channel\"}".to_vec(),
+                                    &[],
+                                ))
+                            }
+                        };
+                        return Ok(build_response(
+                            200,
+                            "application/json",
+                            format!("{{\"size\":{}}}", queue.size(c)).into_bytes(),
+                            &[],
+                        ));
+                    }
+                    ("POST", "" | "/" | "/push") => {
+                        let c = match channel {
+                            Some(c) => c.to_string(),
+                            None => {
+                                return Ok(build_response(
+                                    400,
+                                    "application/json",
+                                    b"{\"error\":\"missing channel\"}".to_vec(),
+                                    &[],
+                                ))
+                            }
+                        };
+                        let (inner_req, _) = match FullHttpRequest::from_hyper(
+                            req,
+                            remote_addr,
+                            &state.upload_tmp_dir,
+                            &state.upload_security,
+                            Some(state.max_body_bytes.unwrap_or(1_048_576).max(1_048_576)),
+                        )
+                        .await
+                        {
+                            Ok(pair) => pair,
+                            Err(compat::RequestBuildError::PayloadTooLarge) => {
+                                return Ok(build_response(
+                                    413,
+                                    "application/json",
+                                    b"{\"error\":\"payload too large\"}".to_vec(),
+                                    &[],
+                                ))
+                            }
+                            Err(_) => {
+                                return Ok(build_response(
+                                    400,
+                                    "application/json",
+                                    b"{\"error\":\"invalid request\"}".to_vec(),
+                                    &[],
+                                ))
+                            }
+                        };
+                        return Ok(match queue.push(&c, inner_req.body) {
+                            Ok(id) => build_response(
+                                200,
+                                "application/json",
+                                format!("{{\"id\":{id}}}").into_bytes(),
+                                &[],
+                            ),
+                            Err(QueueError::Full(_, n)) => build_response(
+                                507,
+                                "application/json",
+                                format!("{{\"error\":\"channel full\",\"capacity\":{n}}}")
+                                    .into_bytes(),
+                                &[],
+                            ),
+                            Err(QueueError::TooManyChannels(n)) => build_response(
+                                507,
+                                "application/json",
+                                format!("{{\"error\":\"too many channels\",\"max\":{n}}}")
+                                    .into_bytes(),
+                                &[],
+                            ),
+                        });
+                    }
+                    ("POST", "/pop") | ("GET", "/pop") => {
+                        let c = match channel {
+                            Some(c) => c.to_string(),
+                            None => {
+                                return Ok(build_response(
+                                    400,
+                                    "application/json",
+                                    b"{\"error\":\"missing channel\"}".to_vec(),
+                                    &[],
+                                ))
+                            }
+                        };
+                        let wait = std::time::Duration::from_millis(wait_ms);
+                        return Ok(match queue.pop(&c, wait).await {
+                            Some(job) => {
+                                let id_str = job.id.to_string();
+                                build_response(
+                                    200,
+                                    "application/octet-stream",
+                                    job.payload,
+                                    &[("X-Task-Id", id_str.as_str())],
+                                )
+                            }
+                            None => build_response(204, "text/plain", Vec::new(), &[]),
+                        });
+                    }
+                    ("DELETE", "/clear") => {
+                        let c = match channel {
+                            Some(c) => c,
+                            None => {
+                                return Ok(build_response(
+                                    400,
+                                    "application/json",
+                                    b"{\"error\":\"missing channel\"}".to_vec(),
+                                    &[],
+                                ))
+                            }
+                        };
+                        let n = queue.clear(c);
+                        return Ok(build_response(
+                            200,
+                            "application/json",
+                            format!("{{\"cleared\":{n}}}").into_bytes(),
+                            &[],
+                        ));
+                    }
+                    _ => {
+                        // Unknown subpath under /_/task — fall through to 404.
                     }
                 }
             }

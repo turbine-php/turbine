@@ -87,7 +87,110 @@ listener. They require `[dashboard] token` authentication if configured.
 | `GET`    | `/_/table/size`   | — | — | `{"size":<usize>}` |
 | `DELETE` | `/_/table/clear`  | — | — | 204 |
 
+---
+
+# Task Queue
+
+In-process async job queue. Lets request handlers offload slow work
+(emails, webhooks, image resizing, cache warmups) to dedicated PHP CLI
+consumers without pulling in Redis, SQS, or RabbitMQ.
+
+This is the second half of Turbine's Swoole-like primitives. Together
+with `SharedTable` it covers the majority of coordination patterns
+framework users reach for.
+
+## Enable
+
+```toml
+[task_queue]
+enabled          = true
+max_channels     = 64       # distinct named queues
+channel_capacity = 10_000   # FIFO depth per channel
+max_wait_ms      = 30_000   # hard ceiling for long-poll pop
+```
+
+## PHP API
+
+```php
+turbine_task_push(string $channel, string $payload): ?int          // returns job id
+turbine_task_pop(string $channel, int $wait_ms = 0): ?array        // ['id'=>int,'payload'=>string]
+turbine_task_size(string $channel): int
+turbine_task_stats(): array                                        // channels/pushed/popped/rejected
+```
+
+`push` is fire-and-forget for the producer — it returns as soon as the
+job lands in the queue. `pop` supports long-polling: give it `wait_ms`
+and the request will block server-side (no PHP CPU used) until a job
+arrives or the wait elapses. Returns `null` on timeout.
+
+### Producer (inside a request handler)
+
+```php
+$id = turbine_task_push('email', json_encode([
+    'to'      => 'user@example.com',
+    'subject' => 'Welcome',
+]));
+if ($id === null) {
+    // queue full or too many channels
+}
+```
+
+### Consumer (a CLI script — run N copies under systemd/supervisor)
+
+```php
+// consumer.php
+while (true) {
+    $job = turbine_task_pop('email', 10_000);   // 10s long-poll
+    if ($job === null) continue;
+    try {
+        $data = json_decode($job['payload'], true);
+        send_email($data['to'], $data['subject']);
+    } catch (\Throwable $e) {
+        error_log("job {$job['id']} failed: {$e->getMessage()}");
+    }
+}
+```
+
+Run multiple consumers for parallelism:
+
+```sh
+for i in 1 2 3 4; do php consumer.php & done
+```
+
+## HTTP API
+
+| Method | Path | Query | Body | Response |
+|---|---|---|---|---|
+| `POST`   | `/_/task/push`  | `channel` | raw payload | `{"id":<u64>}` |
+| `POST`   | `/_/task/pop`   | `channel`, `wait_ms?` | — | 200 + raw body + `X-Task-Id`, 204 on timeout |
+| `GET`    | `/_/task/size`  | `channel` | — | `{"size":<usize>}` |
+| `GET`    | `/_/task/stats` | — | — | `{"channels":N,"pushed":N,"popped":N,"rejected":N}` |
+| `DELETE` | `/_/task/clear` | `channel` | — | `{"cleared":<usize>}` |
+
 ## Design notes
+
+- **Per-channel FIFO** guarded by a short `parking_lot::Mutex` critical
+  section — no await under lock.
+- **Long-poll** powered by `tokio::sync::Notify`; consumers park on the
+  server without burning CPU.
+- **Bounded:** both channel count and per-channel depth are capped.
+  Push past the cap returns 507 Insufficient Storage rather than
+  silently dropping jobs.
+- **No at-least-once:** a crash during `pop` → process loses the job.
+  If the producer requires guaranteed delivery, use a real broker.
+- **Long-poll is clamped** to `max_wait_ms`; this prevents a buggy
+  consumer from tying up a connection indefinitely.
+
+## Limits
+
+- Single-process only (same as `SharedTable`).
+- No priorities, no delayed jobs, no retry scheduling. Build these on
+  top using `SharedTable` for bookkeeping if you need them.
+- Payload size is capped at `max(max_body_bytes, 1 MB)`.
+
+---
+
+## Design notes (shared table)
 
 - **Backend:** [`dashmap`](https://crates.io/crates/dashmap) (sharded
   `parking_lot` write locks). No global mutex.

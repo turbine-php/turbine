@@ -387,6 +387,96 @@ if (!function_exists('turbine_table_size')) {
 "#
 }
 
+/// PHP helpers for the in-process task queue.  Shares the same transport
+/// layer (`turbine_table_request`) as the shared-table helpers — that
+/// function must be loaded too, which is why the task-queue block is
+/// injected after the shared-table block in `main.rs`.
+///
+/// Usage:
+///
+/// ```php
+/// $id = turbine_task_push('email', json_encode(['to' => '...']));
+/// // ... elsewhere (CLI consumer) ...
+/// while ($job = turbine_task_pop('email', 5_000)) {
+///     process($job['payload']);
+/// }
+/// ```
+pub fn php_turbine_task_functions() -> &'static str {
+    r#"if (!function_exists('turbine_task_request')) {
+    function turbine_task_request(string $method, string $path, ?string $body = null, int $timeout_ms = 2000): array {
+        static $base = null, $token = null;
+        if ($base === null) {
+            $base  = getenv('TURBINE_TABLE_URL')
+                  ?: ('http://127.0.0.1:' . ($_SERVER['SERVER_PORT'] ?? '8080'));
+            $token = getenv('TURBINE_TOKEN') ?: '';
+        }
+        $url = rtrim($base, '/') . $path;
+        $headers = ['Expect:', 'Content-Type: application/octet-stream'];
+        if ($token !== '') $headers[] = 'Authorization: Bearer ' . $token;
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_CUSTOMREQUEST     => $method,
+            CURLOPT_RETURNTRANSFER    => true,
+            CURLOPT_HEADER            => true,
+            CURLOPT_TIMEOUT_MS        => $timeout_ms,
+            CURLOPT_CONNECTTIMEOUT_MS => 1000,
+            CURLOPT_HTTPHEADER        => $headers,
+            CURLOPT_TCP_KEEPALIVE     => 1,
+        ]);
+        if ($body !== null) curl_setopt($ch, CURLOPT_POSTFIELDS, $body);
+        $resp = curl_exec($ch);
+        $code = curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+        $hlen = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+        curl_close($ch);
+        if ($resp === false) return [0, '', ''];
+        return [(int)$code, substr((string)$resp, (int)$hlen), substr((string)$resp, 0, (int)$hlen)];
+    }
+}
+
+if (!function_exists('turbine_task_push')) {
+    function turbine_task_push(string $channel, string $payload): ?int {
+        $q = '/_/task/push?channel=' . rawurlencode($channel);
+        [$code, $body] = turbine_task_request('POST', $q, $payload);
+        if ($code !== 200) return null;
+        return preg_match('/"id":(\d+)/', $body, $m) ? (int)$m[1] : null;
+    }
+}
+
+if (!function_exists('turbine_task_pop')) {
+    function turbine_task_pop(string $channel, int $wait_ms = 0): ?array {
+        $q = '/_/task/pop?channel=' . rawurlencode($channel) . '&wait_ms=' . $wait_ms;
+        [$code, $body, $headers] = turbine_task_request('POST', $q, null, $wait_ms + 2000);
+        if ($code !== 200) return null;
+        $id = 0;
+        foreach (explode("\r\n", $headers) as $h) {
+            if (stripos($h, 'X-Task-Id:') === 0) {
+                $id = (int)trim(substr($h, 10));
+                break;
+            }
+        }
+        return ['id' => $id, 'payload' => $body];
+    }
+}
+
+if (!function_exists('turbine_task_size')) {
+    function turbine_task_size(string $channel): int {
+        $q = '/_/task/size?channel=' . rawurlencode($channel);
+        [$code, $body] = turbine_task_request('GET', $q);
+        if ($code !== 200) return 0;
+        return preg_match('/"size":(\d+)/', $body, $m) ? (int)$m[1] : 0;
+    }
+}
+
+if (!function_exists('turbine_task_stats')) {
+    function turbine_task_stats(): array {
+        [$code, $body] = turbine_task_request('GET', '/_/task/stats');
+        if ($code !== 200) return [];
+        return (array)(json_decode($body, true) ?: []);
+    }
+}
+"#
+}
+
 // ── Worker Pool Route Matching ────────────────────────────────────────────
 
 /// Match a request path against a route pattern (supports trailing *).

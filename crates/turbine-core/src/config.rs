@@ -40,6 +40,8 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub shared_table: SharedTableConfig,
     #[serde(default)]
+    pub task_queue: TaskQueueConfig,
+    #[serde(default)]
     pub worker_pools: Vec<WorkerPoolRouteConfig>,
     #[serde(default)]
     pub virtual_hosts: Vec<VirtualHostConfig>,
@@ -473,6 +475,51 @@ fn default_shared_table_max_entries() -> usize {
 
 fn default_shared_table_sweep_secs() -> u64 {
     5
+}
+
+/// In-process task queue (Swoole task worker equivalent), exposed to PHP via
+/// HTTP endpoints under `/_/task`.  See `docs/shared-state.md`.
+#[derive(Debug, Deserialize, Clone)]
+pub struct TaskQueueConfig {
+    /// Enable `/_/task/*` endpoints and inject the `turbine_task_*()` PHP
+    /// helpers into worker bootstrap.  Default: disabled.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Maximum number of distinct channels (named queues) the process will
+    /// allocate.  Attempting to push to a new channel past this limit is
+    /// rejected with 507 Insufficient Storage.
+    #[serde(default = "default_task_max_channels")]
+    pub max_channels: usize,
+    /// Per-channel FIFO capacity.  Push beyond this returns 507.
+    #[serde(default = "default_task_channel_capacity")]
+    pub channel_capacity: usize,
+    /// Hard ceiling on long-poll wait for `pop` (milliseconds).  Protects
+    /// against a misconfigured consumer tying up a connection forever.
+    #[serde(default = "default_task_max_wait_ms")]
+    pub max_wait_ms: u64,
+}
+
+impl Default for TaskQueueConfig {
+    fn default() -> Self {
+        TaskQueueConfig {
+            enabled: false,
+            max_channels: default_task_max_channels(),
+            channel_capacity: default_task_channel_capacity(),
+            max_wait_ms: default_task_max_wait_ms(),
+        }
+    }
+}
+
+fn default_task_max_channels() -> usize {
+    64
+}
+
+fn default_task_channel_capacity() -> usize {
+    10_000
+}
+
+fn default_task_max_wait_ms() -> u64 {
+    30_000
 }
 
 /// Route-based worker pool splitting configuration.
