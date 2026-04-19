@@ -3531,11 +3531,11 @@ async fn handle_request_inner(
                 .map(|(k, v)| (k.as_str(), v.as_str()))
                 .collect();
             let content_type = request.content_type.as_deref().unwrap_or("");
+            // O(1): request.headers is a HashMap with lowercase keys (see compat.rs).
             let cookie_header = request
                 .headers
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("Cookie"))
-                .map(|(_, v)| v.as_str())
+                .get("cookie")
+                .map(String::as_str)
                 .unwrap_or("");
             let document_root = &app.document_root_str;
             let script_filename = format!("{}/{}", &app.document_root_str, &php_path);
@@ -4005,11 +4005,11 @@ async fn handle_request_inner(
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
         let content_type_str = request.content_type.as_deref().unwrap_or("");
+        // O(1): request.headers is a HashMap with lowercase keys (see compat.rs).
         let cookie_header = request
             .headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("Cookie"))
-            .map(|(_, v)| v.as_str())
+            .get("cookie")
+            .map(String::as_str)
             .unwrap_or("");
         let content_length: i32 = if request.body.is_empty() {
             -1
@@ -4289,11 +4289,11 @@ async fn handle_request_inner(
                         .map(|(k, v)| (k.as_str(), v.as_str()))
                         .collect();
                     let content_type = request.content_type.as_deref().unwrap_or("");
+                    // O(1): request.headers is a HashMap with lowercase keys (see compat.rs).
                     let cookie_header = request
                         .headers
-                        .iter()
-                        .find(|(k, _)| k.eq_ignore_ascii_case("Cookie"))
-                        .map(|(_, v)| v.as_str())
+                        .get("cookie")
+                        .map(String::as_str)
                         .unwrap_or("");
                     let document_root = &app.document_root_str;
                     let script_filename = abs_php_path.display().to_string();
@@ -4332,11 +4332,11 @@ async fn handle_request_inner(
                         .map(|(k, v)| (k.as_str(), v.as_str()))
                         .collect();
                     let content_type = request.content_type.as_deref().unwrap_or("");
+                    // O(1): request.headers is a HashMap with lowercase keys (see compat.rs).
                     let cookie_header = request
                         .headers
-                        .iter()
-                        .find(|(k, _)| k.eq_ignore_ascii_case("Cookie"))
-                        .map(|(_, v)| v.as_str())
+                        .get("cookie")
+                        .map(String::as_str)
                         .unwrap_or("");
                     let content_length: i32 = if request.body.is_empty() {
                         -1
