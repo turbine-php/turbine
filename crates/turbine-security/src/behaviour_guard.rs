@@ -39,7 +39,13 @@ pub struct BehaviourConfig {
 impl Default for BehaviourConfig {
     fn default() -> Self {
         BehaviourConfig {
-            max_rps: 100,
+            // `0` = rate limiting disabled.  The previous default of 100
+            // is impractical for any site served through a CDN / proxy /
+            // NAT (all traffic appears to come from one IP) or for APIs
+            // driven by a JavaScript SPA that legitimately fires tens of
+            // requests per page load.  Operators who want rate limiting
+            // should set an explicit number appropriate for their stack.
+            max_rps: 0,
             sqli_block_threshold: 3,
             scanning_error_rate: 0.5,
             scanning_min_requests: 20,
@@ -165,9 +171,10 @@ impl BehaviourGuard {
 
         // Step 3 — increment request count and rate-limit check.  We use
         // `fetch_add` on the atomic so concurrent requests from the same
-        // IP never serialise on a RefMut lock.
+        // IP never serialise on a RefMut lock.  `max_rps == 0` disables
+        // rate limiting entirely.
         let count = profile.request_count.fetch_add(1, Ordering::Relaxed) + 1;
-        if count > 10 {
+        if self.config.max_rps > 0 && count > 10 {
             let win_start = profile.window_start_ns.load(Ordering::Acquire);
             // Floor at 1 ms to avoid a division-by-near-zero that would
             // explode the computed RPS when the first burst arrives inside
@@ -619,9 +626,11 @@ mod tests {
     }
 
     #[test]
-    fn default_config_uses_100_max_rps() {
+    fn default_config_disables_rate_limit() {
         let cfg = BehaviourConfig::default();
-        assert_eq!(cfg.max_rps, 100);
+        // max_rps = 0 means rate limiting is off by default.  Operators
+        // opt in with an explicit value — see the module docs.
+        assert_eq!(cfg.max_rps, 0);
         assert_eq!(cfg.sqli_block_threshold, 3);
         assert_eq!(cfg.window_seconds, 60);
     }

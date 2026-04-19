@@ -230,7 +230,19 @@ pub struct SecurityConfig {
     pub code_injection_guard: bool,
     #[serde(default = "default_true")]
     pub behaviour_guard: bool,
-    /// Rate limit: max requests per second per IP.
+    /// Injection-filter paranoia level.
+    ///   `0` — disable pattern matching (behaviour guard still runs)
+    ///   `1` — obvious attacks only (default; very low FP rate)
+    ///   `2` — add common injection patterns (some FPs on user content)
+    ///   `3` — aggressive (high FP rate on user-generated content)
+    #[serde(default = "default_paranoia_level")]
+    pub paranoia_level: u8,
+    /// URL path prefixes to exclude from SqlGuard / CodeGuard scanning.
+    /// Matched via `starts_with`.  Behaviour guard still runs on these.
+    #[serde(default)]
+    pub exclude_paths: Vec<String>,
+    /// Rate limit: max requests per second per IP.  `0` disables rate
+    /// limiting (default).  Any non-zero value enables per-IP throttling.
     #[serde(default = "default_rate_limit_rps")]
     pub max_requests_per_second: u32,
     /// Rate limit: time window in seconds.
@@ -574,11 +586,19 @@ fn default_cors_max_age() -> u64 {
 }
 
 fn default_rate_limit_rps() -> u32 {
-    100
+    // 0 = disabled.  The previous default of 100 is impractical for any
+    // site behind a CDN/proxy/NAT (all traffic appears to come from one
+    // IP) or for SPA-driven APIs that fire many requests per page load.
+    // Operators opt in with an explicit number when they want it.
+    0
 }
 
 fn default_rate_limit_window() -> u64 {
     60
+}
+
+fn default_paranoia_level() -> u8 {
+    1
 }
 
 fn default_sqli_block_threshold() -> u32 {
@@ -783,6 +803,8 @@ impl Default for SecurityConfig {
             path_traversal_guard: true,
             code_injection_guard: true,
             behaviour_guard: true,
+            paranoia_level: default_paranoia_level(),
+            exclude_paths: Vec::new(),
             max_requests_per_second: default_rate_limit_rps(),
             rate_limit_window: default_rate_limit_window(),
             sqli_block_threshold: default_sqli_block_threshold(),

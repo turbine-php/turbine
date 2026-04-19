@@ -1351,6 +1351,8 @@ fn cmd_serve(
         sql_guard: config.security.sql_guard,
         code_injection_guard: config.security.code_injection_guard,
         behaviour_guard: config.security.behaviour_guard,
+        paranoia_level: config.security.paranoia_level,
+        exclude_paths: config.security.exclude_paths.clone(),
     };
     let behaviour_config = BehaviourConfig {
         max_rps: config.security.max_requests_per_second,
@@ -3377,10 +3379,12 @@ async fn handle_request_inner(
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
 
-        state.security.check_input(client_ip, &param_refs)
+        state
+            .security
+            .check_input(client_ip, &request.path, &param_refs)
     } else if needs_behaviour {
         // Only behaviour guard enabled — cheap per-IP check, no param work.
-        state.security.check_input(client_ip, &[])
+        state.security.check_input(client_ip, &request.path, &[])
     } else {
         turbine_security::Verdict::Allow
     };
