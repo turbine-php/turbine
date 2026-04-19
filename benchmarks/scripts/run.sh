@@ -284,20 +284,33 @@ bench_container() {
     # of the image version.  Harmless no-op for non-framework scenarios
     # (hello.php, pdf_50k.php) — artisan/bin/console simply won't exist.
     if [[ "$image" == "$TURBINE_IMAGE_NTS" || "$image" == "$TURBINE_IMAGE_ZTS" ]]; then
+        local warm_log="/tmp/warm_${RANDOM}.log"
         docker exec bench-server sh -c '
+            set -e
             export PATH=/opt/php-embed/bin:$PATH
             if [ -f /var/www/html/artisan ]; then
+                echo "[warmup] Laravel detected"
                 cd /var/www/html
-                php artisan config:cache  >/dev/null 2>&1 || true
-                php artisan route:cache   >/dev/null 2>&1 || true
-                php artisan view:cache    >/dev/null 2>&1 || true
+                php -v 2>&1 | head -1
+                php artisan config:cache  2>&1 || echo "[warmup] config:cache FAILED"
+                php artisan route:cache   2>&1 || echo "[warmup] route:cache FAILED"
+                php artisan view:cache    2>&1 || echo "[warmup] view:cache FAILED"
+                ls -la bootstrap/cache/ 2>&1 | head -10
             fi
             if [ -f /var/www/html/bin/console ]; then
+                echo "[warmup] Symfony detected"
                 cd /var/www/html
-                php bin/console cache:clear  --env=prod --no-debug >/dev/null 2>&1 || true
-                php bin/console cache:warmup --env=prod --no-debug >/dev/null 2>&1 || true
+                php -v 2>&1 | head -1
+                php bin/console cache:clear  --env=prod --no-debug 2>&1 | tail -3 || echo "[warmup] cache:clear FAILED"
+                php bin/console cache:warmup --env=prod --no-debug 2>&1 | tail -3 || echo "[warmup] cache:warmup FAILED"
             fi
-        ' >/dev/null 2>&1 || true
+        ' > "$warm_log" 2>&1 || true
+        if [ -s "$warm_log" ]; then
+            log "  --- Warmup output ---"
+            sed 's/^/  /' "$warm_log" >&2
+            log "  --- End warmup ---"
+        fi
+        rm -f "$warm_log"
     fi
 
     local preflight_ok=1
