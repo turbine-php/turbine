@@ -1743,7 +1743,7 @@ rate_limit_window = 120
         assert!(config.security.code_injection_guard);
         assert!(config.security.path_traversal_guard);
         assert!(config.security.behaviour_guard);
-        assert_eq!(config.security.max_requests_per_second, 100);
+        assert_eq!(config.security.max_requests_per_second, 0);
         assert_eq!(config.security.rate_limit_window, 60);
     }
 

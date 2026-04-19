@@ -130,10 +130,12 @@ impl TaskQueue {
 
     /// Pop a job from `channel`, waiting up to `wait` for one to arrive.
     /// Returns `None` if the wait elapses without any job.
+    ///
+    /// Auto-creates the channel (up to `max_channels`) so a consumer can
+    /// long-poll before the first producer/timer pushes, which is the
+    /// normal pattern for scheduled jobs.
     pub async fn pop(&self, channel: &str, wait: Duration) -> Option<Job> {
-        // Creating a channel on pop would let a pathological consumer
-        // allocate channels forever; avoid it.
-        let ch = self.channels.get(channel)?.clone();
+        let ch = self.channel_or_create(channel).ok()?;
 
         // Fast path: grab one if available.
         if let Some(j) = ch.queue.lock().pop_front() {
