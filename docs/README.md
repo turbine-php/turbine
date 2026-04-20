@@ -11,6 +11,8 @@ Traditional:  Client → Nginx → PHP-FPM → OPcache → PHP
 Turbine:      Client → Turbine (HTTP + PHP + OPcache)
 ```
 
+For the full end-to-end design — Rust/tokio layer, PHP worker pool, request flow, shared state, security sandbox and worker lifecycle — see [How Turbine Works](architecture.md).
+
 ## Worker Modes — The Core Choice
 
 Before anything else, choose your worker backend and execution model. These are the two most important architectural decisions in Turbine:
