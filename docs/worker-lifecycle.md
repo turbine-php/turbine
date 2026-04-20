@@ -362,19 +362,6 @@ workers still bootstrap once (loading OPcache) but use the full
 faster than per-request workers (OPcache stays warm) but doesn't get the
 framework-boot-once benefit.
 
-## Performance
-
-Benchmarks on macOS M3 (Phalcon Micro, `wrk -t4 -c50 -d15s`):
-
-| Configuration | GET /hello (req/s) | vs PHP-FPM |
-|---|---:|---:|
-| **Turbine Lightweight 8w** | **35,389** | **8.1×** |
-| Turbine Full-lifecycle 8w | 27,333 | 6.2× |
-| PHP-FPM+nginx 8w | 4,375 | 1.0× |
-
-The lightweight lifecycle adds **~28–30%** throughput on top of the already-fast
-full persistent lifecycle.
-
 ## Migration from Auto-Detection
 
 If you were using the previous auto-detection behavior (Turbine automatically
@@ -394,5 +381,5 @@ worker_handler = "turbine-handler.php"
 worker_cleanup = "turbine-cleanup.php"
 ```
 
-This gives you **the same performance** with explicit, configurable control
-over the boot and handler logic — no magic filesystem detection.
+This gives you explicit, configurable control over the boot and handler
+logic — no magic filesystem detection.
