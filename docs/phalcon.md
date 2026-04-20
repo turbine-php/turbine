@@ -2,15 +2,21 @@
 
 Turbine supports **Phalcon applications** with persistent workers for maximum performance.
 
+> **PHP build:** Phalcon is not thread-safe. Run Turbine in `worker_mode = "process"` (NTS) for Phalcon apps. Thread mode (ZTS) is not guaranteed to be safe even if the benchmark passes.
+
 ## Setup
 
-Configure `turbine.toml` with persistent workers enabled:
+Configure `turbine.toml` with persistent workers and explicit boot/handler scripts:
 
 ```toml
 [server]
 workers = 4
 listen = "0.0.0.0:8080"
+worker_mode = "process"        # Phalcon requires NTS
 persistent_workers = true
+worker_boot = "turbine-boot.php"
+worker_handler = "turbine-handler.php"
+worker_cleanup = "turbine-cleanup.php"
 worker_max_requests = 10000
 
 [php]
@@ -18,42 +24,35 @@ memory_limit = "256M"
 extensions = ["phalcon"]      # if using dynamic Phalcon extension
 ```
 
-If your Phalcon app uses `public/index.php` as a front controller, Turbine detects that pattern automatically:
-
-```
-$ turbine serve --root /path/to/phalcon-app
-[INFO] Detected front-controller application (public/index.php)
-```
+See [Worker Lifecycle](worker-lifecycle.md) for the full boot/handler/cleanup model.
 
 ## Persistent Workers
 
-Phalcon apps run in **persistent worker mode** when `persistent_workers = true`. You provide a `turbine-worker.php` bootstrap file in your project root; Turbine executes it once per worker at startup and then calls the returned application handler for each request.
+In persistent mode Phalcon boots **once per worker** and serves thousands of requests against the already-booted app. Turbine does not auto-detect Phalcon; you wire the three scripts explicitly.
 
 ### How It Works
 
-1. **Bootstrap (once per worker)**:
-   - Turbine loads `vendor/autoload.php` (Composer autoloader, if present)
-   - Turbine executes `turbine-worker.php` and keeps the returned application in memory
-2. **Per request**:
-   - Superglobals (`$_SERVER`, `$_GET`, `$_POST`, etc.) are rebuilt from the HTTP request
-   - The application processes the request and returns the response
+1. **Boot (once per worker)** — `turbine-boot.php` loads the autoloader, creates the Phalcon DI and app, and stores the app in `$GLOBALS`.
+2. **Request (every request)** — `turbine-handler.php` retrieves the app from `$GLOBALS`, dispatches the URI, and sends the response.
+3. **Cleanup (every request)** — `turbine-cleanup.php` resets response headers, session state, and any scoped services so state doesn't leak between requests.
 
-There is **no automatic Phalcon-specific bootstrap**. Turbine does not scan for `config/services.php`, `config/routes.php`, or any other Phalcon config paths. All bootstrapping is done inside your `turbine-worker.php`.
+There is **no automatic Phalcon-specific bootstrap**. Turbine does not scan for `config/services.php`, `config/routes.php`, or any other Phalcon config paths. All bootstrapping is done inside `turbine-boot.php`.
 
-## Bootstrap File
+## Boot Script
 
-Create a `turbine-worker.php` file in your project root. It must set up the Phalcon DI and application and return the application instance:
+Create `turbine-boot.php` in your project root:
 
 ```php
 <?php
-// turbine-worker.php
+// turbine-boot.php
+
+require __DIR__.'/vendor/autoload.php';
 
 use Phalcon\Di\FactoryDefault;
 use Phalcon\Mvc\Application;
 
 $di = new FactoryDefault();
 
-// Register your services
 $di->setShared('config', function () {
     return new \Phalcon\Config\Adapter\Ini(__DIR__ . '/config/app.ini');
 });
@@ -71,16 +70,14 @@ $di->setShared('db', function () use ($di) {
 require __DIR__ . '/config/routes.php';
 require __DIR__ . '/config/services.php';
 
-$application = new Application($di);
-
-return $application;
+$GLOBALS['__turbine_app'] = new Application($di);
 ```
 
 ### Phalcon Micro Apps
 
 ```php
 <?php
-// turbine-worker.php for Micro app
+// turbine-boot.php for Micro app
 use Phalcon\Mvc\Micro;
 
 $app = new Micro();
@@ -94,7 +91,47 @@ $app->get('/api/users', function () {
     return $this->response;
 });
 
-return $app;
+$GLOBALS['__turbine_app'] = $app;
+```
+
+## Handler Script
+
+```php
+<?php
+// turbine-handler.php
+
+$app = $GLOBALS['__turbine_app'];
+
+$app->response->resetHeaders();
+$app->response->setContent('');
+$app->response->setStatusCode(200);
+
+$result = $app->handle($_SERVER['REQUEST_URI'] ?? '/');
+
+if ($result instanceof \Phalcon\Http\Response) {
+    $result->send();
+} elseif (is_string($result)) {
+    echo $result;
+}
+
+gc_collect_cycles();
+```
+
+## Cleanup Script
+
+```php
+<?php
+// turbine-cleanup.php
+
+$app = $GLOBALS['__turbine_app'];
+
+$app->response->resetHeaders();
+$app->response->setContent('');
+$app->response->setStatusCode(200);
+
+if ($app->getDI()->has('session') && $app->getDI()->get('session')->isStarted()) {
+    $app->getDI()->get('session')->destroy();
+}
 ```
 
 ## Directory Structure
@@ -117,7 +154,9 @@ my-phalcon-app/
 ├── vendor/
 │   └── autoload.php
 ├── composer.json
-├── turbine-worker.php     ← Turbine bootstrap (required for persistent workers)
+├── turbine-boot.php       ← boot once per worker
+├── turbine-handler.php    ← per-request dispatch
+├── turbine-cleanup.php    ← per-request cleanup
 └── turbine.toml
 ```
 
@@ -127,12 +166,16 @@ my-phalcon-app/
 [server]
 workers = 4
 listen = "0.0.0.0:8080"
+worker_mode = "process"
 persistent_workers = true
+worker_boot = "turbine-boot.php"
+worker_handler = "turbine-handler.php"
+worker_cleanup = "turbine-cleanup.php"
 worker_max_requests = 10000
 
 [php]
 memory_limit = "256M"
-extensions = ["phalcon"]      # if using dynamic Phalcon extension
+extensions = ["phalcon"]
 
 [php.ini]
 phalcon.orm.events = "1"

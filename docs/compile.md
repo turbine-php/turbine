@@ -3,7 +3,7 @@
 ## Requirements
 
 - Rust 1.75+ (`rustup install stable`)
-- PHP 8.4+ source (downloaded automatically)
+- PHP 8.3, 8.4 or 8.5 source (downloaded automatically)
 - macOS: Homebrew
 - Linux: apt/yum build dependencies
 

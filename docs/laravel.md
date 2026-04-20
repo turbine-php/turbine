@@ -10,10 +10,7 @@ DYLD_LIBRARY_PATH="/path/to/vendor/php-embed/lib" \
   turbine serve --root . --workers 8
 ```
 
-Turbine detects the `public/index.php` front controller pattern, then:
-1. Sets document root to `public/`
-2. Routes all requests to `public/index.php`
-3. Uses persistent workers if `persistent_workers = true` in config
+Turbine serves Laravel's `public/index.php` front controller via the standard worker lifecycle. For best performance, wire explicit boot/handler/cleanup scripts so the framework boots **once per worker** instead of once per request (see [Worker Lifecycle](worker-lifecycle.md)).
 
 ## Configuration
 
@@ -24,6 +21,9 @@ Create `turbine.toml` in your Laravel project root:
 workers = 8
 listen = "0.0.0.0:8080"
 persistent_workers = true
+worker_boot = "turbine-boot.php"
+worker_handler = "turbine-handler.php"
+worker_cleanup = "turbine-cleanup.php"
 request_timeout = 30
 worker_max_requests = 10000
 
@@ -56,7 +56,11 @@ level = "info"
 
 ## How Persistent Workers Work with Laravel
 
-Turbine's persistent workers keep PHP processes alive across requests. Laravel still bootstraps on every request (`public/index.php` runs in full), but because the workers are long-lived processes, **OPcache stays warm** — all PHP files are compiled once and cached in memory. There is no per-request `fork()` overhead, and JIT-compiled code is reused across requests.
+With `worker_boot` / `worker_handler` / `worker_cleanup` set, Laravel bootstraps **once per worker** (autoloader, `bootstrap/app.php`, the HTTP kernel) and that state stays in memory for thousands of requests. Only per-request work runs on each hit: `Request::capture()`, routing, controllers, response, and the cleanup script that resets auth/session/scoped services.
+
+See [Worker Lifecycle](worker-lifecycle.md#laravel) for the full Laravel boot/handler/cleanup templates.
+
+If you omit `worker_boot`/`worker_handler`, `persistent_workers = true` still gives you warm OPcache and no per-request fork overhead, but Laravel itself bootstraps on every request.
 
 ### Traditional PHP-FPM (pm = dynamic, cold workers)
 

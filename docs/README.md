@@ -40,7 +40,7 @@ See [Worker Lifecycle](worker-lifecycle.md) for the lightweight boot/handler sys
 - **Tokio Async Tuning** — `tokio_worker_threads` controls async I/O threads for optimal HTTP connection handling
 - **Config-Driven** — Everything configured via `turbine.toml`
 - **Built-in HTTP/1.1 & HTTP/2** — Powered by Hyper (Rust), no external web server needed
-- **Embedded PHP 8.4/8.5** — Native embed SAPI, shared OPcache, JIT compilation
+- **Embedded PHP 8.3 / 8.4 / 8.5** — Native embed SAPI (NTS or ZTS), shared OPcache, JIT compilation
 - **Built-in Sandbox** — execution whitelist, data-dir guard, path-traversal guard, PHP INI hardening, heuristic SQL/code input filter (tiered by `paranoia_level`), per-IP behaviour guard (scan detection + optional rate limit). All in Rust, ~500 ns overhead. POST JSON/form bodies scanned. See [Security](security.md).
 - **Brotli, Zstd, Gzip Compression** — Automatic response compression with configurable algorithms
 - **Auto-scaling Workers** — Dynamic worker pool that scales up/down based on load

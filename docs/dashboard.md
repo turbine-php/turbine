@@ -1,6 +1,8 @@
 # Dashboard & Internal API
 
-Turbine ships with a built-in web dashboard and a set of internal management endpoints under the `/_/` prefix. These endpoints are protected by an optional Bearer token and are never routed to PHP workers.
+Turbine ships with a built-in web dashboard and a set of internal management endpoints under the `/_/` prefix. These endpoints are never routed to PHP workers.
+
+> **Security warning:** `[dashboard] token` is **optional but strongly recommended**. If no token is configured, every `/_/` endpoint — including `/_/metrics`, `/_/status`, the blocked-IP list and the live dashboard — is **publicly accessible** to anyone who can reach the listen address. Either set a token or bind Turbine behind a reverse proxy / private network.
 
 ## Dashboard UI — `/_/dashboard`
 
