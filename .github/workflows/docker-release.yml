@@ -34,6 +34,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - php_version: "8.3.20"
+            php_major: "8.3"
+            zts: "0"
+            thread_safety: "nts"
+            phalcon_version: "5.11.1"
+            phpredis_version: "6.3.0"
+
+          - php_version: "8.3.20"
+            php_major: "8.3"
+            zts: "1"
+            thread_safety: "zts"
+            phalcon_version: "5.11.1"
+            phpredis_version: "6.3.0"
+
           - php_version: "8.4.6"
             php_major: "8.4"
             zts: "0"
