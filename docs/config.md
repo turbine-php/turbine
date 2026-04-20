@@ -91,7 +91,9 @@ post_max_size = "64M"
 opcache_memory = 128
 jit_buffer_size = "64M"
 upload_tmp_dir = "/tmp/turbine-uploads"
-# OPcache preload script (path to preload file)
+# OPcache preload script (path to preload file).
+# NOTE: preloaded files are cached for the lifetime of the process.
+# Changes to preloaded files require a full restart — see docs/known-issues.md.
 # preload_script = "vendor/preload.php"
 
 # Arbitrary php.ini directives

@@ -17,7 +17,10 @@ PHP handles authentication and authorization. Turbine handles the file I/O, whic
 ```toml
 [x_sendfile]
 enabled = true
-# Base directory (prevents serving files outside this path)
+# Base directory — acts as a security boundary. Paths sent via the
+# X-Sendfile / X-Accel-Redirect headers are resolved relative to this
+# directory and cannot escape it (no `..`, no absolute paths outside root).
+# Relative values are resolved from the application root (`--root`).
 root = "private-files/"
 ```
 
