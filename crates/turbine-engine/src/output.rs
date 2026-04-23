@@ -188,58 +188,52 @@ unsafe extern "C" fn turbine_header_handler(
             // Status code is passed in the header struct's header_len field
             // (or via http_response_code). We'll also parse from "HTTP/..." headers.
         }
-        SAPI_HEADER_DELETE => {
-            if !sapi_header.is_null() {
-                let header_ptr = (*sapi_header).header;
-                let header_len = (*sapi_header).header_len;
-                if !header_ptr.is_null() && header_len > 0 {
-                    let header_bytes =
-                        std::slice::from_raw_parts(header_ptr as *const u8, header_len);
-                    if let Ok(header_str) = std::str::from_utf8(header_bytes) {
-                        let name = header_str.trim().to_lowercase();
-                        HEADER_BUFFER.with(|buf| {
-                            buf.borrow_mut().retain(|(k, _)| k.to_lowercase() != name);
-                        });
-                        trace!(header = header_str, "PHP: deleted header");
-                    }
+        SAPI_HEADER_DELETE if !sapi_header.is_null() => {
+            let header_ptr = (*sapi_header).header;
+            let header_len = (*sapi_header).header_len;
+            if !header_ptr.is_null() && header_len > 0 {
+                let header_bytes = std::slice::from_raw_parts(header_ptr as *const u8, header_len);
+                if let Ok(header_str) = std::str::from_utf8(header_bytes) {
+                    let name = header_str.trim().to_lowercase();
+                    HEADER_BUFFER.with(|buf| {
+                        buf.borrow_mut().retain(|(k, _)| k.to_lowercase() != name);
+                    });
+                    trace!(header = header_str, "PHP: deleted header");
                 }
             }
         }
-        SAPI_HEADER_REPLACE | SAPI_HEADER_ADD => {
-            if !sapi_header.is_null() {
-                let header_ptr = (*sapi_header).header;
-                let header_len = (*sapi_header).header_len;
-                if !header_ptr.is_null() && header_len > 0 {
-                    let header_bytes =
-                        std::slice::from_raw_parts(header_ptr as *const u8, header_len);
-                    if let Ok(header_str) = std::str::from_utf8(header_bytes) {
-                        // Check for HTTP status line: "HTTP/1.1 302 Found"
-                        if header_str.starts_with("HTTP/") {
-                            if let Some(code_str) = header_str.split_whitespace().nth(1) {
-                                if let Ok(code) = code_str.parse::<u16>() {
-                                    RESPONSE_CODE.with(|rc| *rc.borrow_mut() = code);
-                                    trace!(code = code, "PHP: set HTTP status code");
-                                }
+        SAPI_HEADER_REPLACE | SAPI_HEADER_ADD if !sapi_header.is_null() => {
+            let header_ptr = (*sapi_header).header;
+            let header_len = (*sapi_header).header_len;
+            if !header_ptr.is_null() && header_len > 0 {
+                let header_bytes = std::slice::from_raw_parts(header_ptr as *const u8, header_len);
+                if let Ok(header_str) = std::str::from_utf8(header_bytes) {
+                    // Check for HTTP status line: "HTTP/1.1 302 Found"
+                    if header_str.starts_with("HTTP/") {
+                        if let Some(code_str) = header_str.split_whitespace().nth(1) {
+                            if let Ok(code) = code_str.parse::<u16>() {
+                                RESPONSE_CODE.with(|rc| *rc.borrow_mut() = code);
+                                trace!(code = code, "PHP: set HTTP status code");
                             }
-                        } else if let Some((name, value)) = header_str.split_once(':') {
-                            let name = name.trim().to_string();
-                            let value = value.trim().to_string();
-
-                            if op == SAPI_HEADER_REPLACE {
-                                // Replace existing header with same name
-                                HEADER_BUFFER.with(|buf| {
-                                    let mut b = buf.borrow_mut();
-                                    b.retain(|(k, _)| !k.eq_ignore_ascii_case(&name));
-                                    b.push((name.clone(), value.clone()));
-                                });
-                            } else {
-                                // Add (allow duplicates, e.g. Set-Cookie)
-                                HEADER_BUFFER.with(|buf| {
-                                    buf.borrow_mut().push((name.clone(), value.clone()));
-                                });
-                            }
-                            trace!(name = %name, value = %value, "PHP: captured header");
                         }
+                    } else if let Some((name, value)) = header_str.split_once(':') {
+                        let name = name.trim().to_string();
+                        let value = value.trim().to_string();
+
+                        if op == SAPI_HEADER_REPLACE {
+                            // Replace existing header with same name
+                            HEADER_BUFFER.with(|buf| {
+                                let mut b = buf.borrow_mut();
+                                b.retain(|(k, _)| !k.eq_ignore_ascii_case(&name));
+                                b.push((name.clone(), value.clone()));
+                            });
+                        } else {
+                            // Add (allow duplicates, e.g. Set-Cookie)
+                            HEADER_BUFFER.with(|buf| {
+                                buf.borrow_mut().push((name.clone(), value.clone()));
+                            });
+                        }
+                        trace!(name = %name, value = %value, "PHP: captured header");
                     }
                 }
             }
