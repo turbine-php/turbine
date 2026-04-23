@@ -13,6 +13,7 @@ mod error;
 pub mod persistent;
 pub mod pool;
 mod shared_mem;
+pub mod stream;
 mod worker;
 
 pub use error::WorkerError;

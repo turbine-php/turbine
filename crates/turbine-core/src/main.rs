@@ -15,7 +15,6 @@ use clap::Parser;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -2610,7 +2609,7 @@ async fn run_hyper_server(
     info!("Server stopped");
 }
 
-type HyperResponse = Response<Full<Bytes>>;
+use http_helpers::HyperResponse;
 
 async fn handle_request(
     req: Request<Incoming>,
@@ -2700,12 +2699,12 @@ async fn handle_request(
                     parts
                         .headers
                         .insert("Content-Length", compressed.len().into());
-                    resp = Response::from_parts(parts, Full::new(Bytes::from(compressed)));
+                    resp = Response::from_parts(parts, full_body(Bytes::from(compressed)));
                 } else {
-                    resp = Response::from_parts(parts, Full::new(data));
+                    resp = Response::from_parts(parts, full_body(data));
                 }
             } else {
-                resp = Response::from_parts(parts, Full::new(data));
+                resp = Response::from_parts(parts, full_body(data));
             }
         }
     }
@@ -4105,6 +4104,218 @@ async fn handle_request_inner(
         let is_persistent = state.persistent_workers;
         let return_state = state.clone();
 
+        // ── Streaming fast path (persistent workers only) ──────────────
+        //
+        // For persistent workers we always consume the framed response
+        // protocol. We peek at the `Headers` frame here; if the response
+        // is declared streamable (SSE / `X-Accel-Buffering: no`), we hand
+        // hyper a `ChannelBody` that forwards BodyChunk frames straight
+        // to the client — giving real TTFB and true end-to-end streaming.
+        // Otherwise we collect the remaining BodyChunks into a `Vec<u8>`
+        // and fall through to the normal buffered pipeline (compression,
+        // caching, coalescing, access-log accounting).
+        if is_persistent {
+            let pipe = match turbine_worker::async_io::AsyncPipe::new(resp_fd) {
+                Ok(p) => p,
+                Err(e) => {
+                    error!(worker = worker_idx_log, error = %e, "Failed to open resp pipe");
+                    return_worker_to_pool(&return_state, pool_index, worker_idx);
+                    drop(permit);
+                    return Ok(build_response(
+                        502,
+                        "text/plain",
+                        b"Worker pipe error".to_vec(),
+                        &[],
+                    ));
+                }
+            };
+
+            let head_result = turbine_worker::stream::consume_streaming(pipe).await;
+            let mut head = match head_result {
+                Ok(h) => h,
+                Err(e) => {
+                    error!(worker = worker_idx_log, error = %e, "Failed to read response head");
+                    return_worker_to_pool(&return_state, pool_index, worker_idx);
+                    drop(permit);
+                    return Ok(build_response(
+                        500,
+                        "text/plain",
+                        b"Worker decode error".to_vec(),
+                        &[],
+                    ));
+                }
+            };
+
+            if http_helpers::response_should_stream(&head.headers) {
+                // ── True streaming response ─────────────────────────
+                // Hand the body channel to hyper; spawn a task that waits
+                // for the `End` frame, then returns the worker to the
+                // pool. The permit is moved into the watcher so back-
+                // pressure on concurrent requests is preserved.
+                let headers = head.headers;
+                let status = head.http_status;
+                let body_rx = head.body;
+                let done_rx = head.done;
+                let log_worker = worker_idx_log;
+                let watch_state = return_state.clone();
+
+                tokio::spawn(async move {
+                    let _permit_guard = permit;
+                    let result = done_rx.await;
+                    match result {
+                        Ok(Ok(_ok)) => {}
+                        Ok(Err(e)) => {
+                            warn!(worker = log_worker, error = %e, "Streaming response ended with error");
+                        }
+                        Err(_) => {
+                            warn!(worker = log_worker, "Streaming response done channel dropped");
+                        }
+                    }
+                    return_worker_to_pool(&watch_state, pool_index, worker_idx);
+                });
+
+                state.security.record_request(client_ip, false);
+                state.metrics.record_request(&php_path, status, 0, 0);
+                write_access_log(
+                    &state,
+                    &request.method,
+                    &request.path,
+                    status,
+                    request_start,
+                    &client_ip_str,
+                );
+                info!(
+                    method = %request.method,
+                    path = %request.path,
+                    worker = worker_idx_log,
+                    status = status,
+                    "Streaming response started"
+                );
+
+                return Ok(http_helpers::build_streaming_response(
+                    status, headers, body_rx,
+                ));
+            }
+
+            // ── Buffered fallback: drain remaining BodyChunks ──────
+            let mut body_buf: Vec<u8> = Vec::new();
+            while let Some(chunk_result) = head.body.recv().await {
+                match chunk_result {
+                    Ok(chunk) => body_buf.extend_from_slice(&chunk),
+                    Err(e) => {
+                        error!(worker = worker_idx_log, error = %e, "Error draining stream body");
+                        return_worker_to_pool(&return_state, pool_index, worker_idx);
+                        drop(permit);
+                        return Ok(build_response(
+                            500,
+                            "text/plain",
+                            b"Worker body error".to_vec(),
+                            &[],
+                        ));
+                    }
+                }
+            }
+            let done_result = head.done.await;
+            return_worker_to_pool(&return_state, pool_index, worker_idx);
+            drop(permit);
+
+            // Reconstruct the aggregated response and run it through the
+            // same post-processing pipeline the old non-streaming path
+            // used (postprocess → cache → coalesce → access log).
+            match done_result {
+                Ok(Ok(_)) | Ok(Err(_)) => {
+                    let mut body = body_buf;
+                    let mut status_code = head.http_status;
+                    let elapsed_us = request_start.elapsed().as_micros() as u64;
+                    let php_content_type = head
+                        .headers
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case("Content-Type"))
+                        .map(|(_, v)| v.as_str());
+                    let mut content_type = php_content_type
+                        .unwrap_or_else(|| detect_content_type(&body))
+                        .to_string();
+                    let mut resp_headers = head.headers;
+
+                    postprocess_php_response(
+                        &state,
+                        &mut body,
+                        &mut status_code,
+                        &mut content_type,
+                        &mut resp_headers,
+                    );
+
+                    state.security.record_request(client_ip, false);
+                    state.metrics.record_request(
+                        &php_path,
+                        status_code,
+                        elapsed_us,
+                        body.len() as u64,
+                    );
+                    if !response_prevents_caching(&resp_headers) {
+                        state.cache.put(
+                            &request.method,
+                            &request.path,
+                            source_hash,
+                            status_code,
+                            &content_type,
+                            &body,
+                        );
+                    }
+                    if let Some(ref mut g) = coalesce_guard {
+                        g.publish(CoalescedResponse {
+                            status: status_code,
+                            content_type: content_type.clone(),
+                            body: Bytes::copy_from_slice(&body),
+                            headers: resp_headers.clone(),
+                        });
+                    }
+
+                    info!(method = %request.method, path = %request.path, worker = worker_idx_log, status = status_code, elapsed_us = elapsed_us, bytes = body.len(), "Request completed");
+                    write_access_log(
+                        &state,
+                        &request.method,
+                        &request.path,
+                        status_code,
+                        request_start,
+                        &client_ip_str,
+                    );
+
+                    let extra_headers: Vec<(&str, &str)> = resp_headers
+                        .iter()
+                        .filter(|(k, _)| {
+                            !k.eq_ignore_ascii_case("Content-Type")
+                                && !k.eq_ignore_ascii_case("Content-Length")
+                        })
+                        .map(|(k, v)| (k.as_str(), v.as_str()))
+                        .collect();
+
+                    return Ok(build_response(
+                        status_code,
+                        &content_type,
+                        body,
+                        &extra_headers,
+                    ));
+                }
+                Err(_) => {
+                    state.security.record_request(client_ip, true);
+                    state.metrics.record_request(
+                        &php_path,
+                        502,
+                        request_start.elapsed().as_micros() as u64,
+                        0,
+                    );
+                    error!(worker = worker_idx_log, "Streaming response done channel dropped");
+                    return Ok(build_response(
+                        502,
+                        "text/plain",
+                        b"Worker response error".to_vec(),
+                        &[],
+                    ));
+                }
+            }
+        }
+
         // Use a single spawned task for both persistent and classic paths.
         // The permit is moved into the task so it's held until the worker finishes.
         enum WorkerResult {
@@ -4350,6 +4561,6 @@ async fn handle_request_inner(
 
 use compression::{is_compressible_content_type, negotiate_compression};
 use http_helpers::{
-    apply_cors_headers, build_response, cors_origin_allowed, detect_content_type, parse_php_size,
-    query_param, try_serve_static, write_access_log,
+    apply_cors_headers, build_response, cors_origin_allowed, detect_content_type, full_body,
+    parse_php_size, query_param, try_serve_static, write_access_log,
 };

@@ -10,19 +10,16 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use bytes::Bytes;
-use http_body_util::Full;
-use hyper::{body::Incoming, Request, Response};
+use hyper::{body::Incoming, Request};
 
 use crate::async_io::AsyncIoError;
 use crate::compat::{self, FullHttpRequest};
+use crate::http_helpers::HyperResponse;
 use crate::shared_table::TableError;
 use crate::task_queue::QueueError;
 use crate::websocket;
 use crate::ServerState;
 use crate::{build_response, query_param};
-
-type HyperResponse = Response<Full<Bytes>>;
 
 fn json_err(code: u16, body: &str) -> HyperResponse {
     build_response(code, "application/json", body.as_bytes().to_vec(), &[])

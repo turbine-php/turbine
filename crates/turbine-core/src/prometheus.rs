@@ -10,14 +10,9 @@
 
 use std::fmt::Write as _;
 
-use bytes::Bytes;
-use http_body_util::Full;
-use hyper::Response;
-
 use crate::build_response;
+use crate::http_helpers::HyperResponse;
 use crate::ServerState;
-
-type HyperResponse = Response<Full<Bytes>>;
 
 /// Render `/_/metrics` in Prometheus text format.
 pub fn handle_metrics(state: &ServerState) -> HyperResponse {

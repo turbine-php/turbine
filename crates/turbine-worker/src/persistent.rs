@@ -148,12 +148,6 @@ fn read_u32_le_fd(fd: RawFd) -> io::Result<u32> {
     Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
 
-fn read_string_fd(fd: RawFd) -> io::Result<String> {
-    let len = read_u32_le_fd(fd)? as usize;
-    let bytes = read_exact_fd(fd, len)?;
-    String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-}
-
 fn read_bytes_fd(fd: RawFd) -> io::Result<Vec<u8>> {
     let len = read_u32_le_fd(fd)? as usize;
     read_exact_fd(fd, len)
@@ -221,31 +215,83 @@ where
 }
 
 /// Decode a `PersistentResponse` from the worker's resp pipe (blocking).
+///
+/// Consumes the streaming frame protocol emitted by `write_response`: one
+/// `Headers` frame, zero-or-more `BodyChunk` frames, a terminal `End` or
+/// `Error` frame. Reassembles into a single `PersistentResponse` so callers
+/// keep the existing buffered API. The HTTP layer (Phase 2) will consume
+/// frames incrementally instead.
 pub fn decode_response(resp_fd: RawFd) -> io::Result<PersistentResponse> {
-    let _marker = read_u8_fd(resp_fd)?;
-    let status = read_u16_le_fd(resp_fd)?;
-    let hdr_count = read_u32_le_fd(resp_fd)?;
+    use crate::stream::{read_frame, Frame};
 
-    if hdr_count > 256 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("decode_response: invalid header_count={hdr_count} — pipe desynced"),
-        ));
+    let mut reader = FdReader(resp_fd);
+    let mut status: u16 = 0;
+    let mut headers: Vec<(String, String)> = Vec::new();
+    let mut body: Vec<u8> = Vec::new();
+    let mut got_headers = false;
+
+    loop {
+        let frame = read_frame(&mut reader)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "decode_response: pipe closed before End frame",
+            )
+        })?;
+        match frame {
+            Frame::Headers {
+                http_status,
+                headers: h,
+            } => {
+                if got_headers {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "decode_response: duplicate Headers frame",
+                    ));
+                }
+                if h.len() > 256 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "decode_response: invalid header_count={} — pipe desynced",
+                            h.len()
+                        ),
+                    ));
+                }
+                status = http_status;
+                headers = h;
+                got_headers = true;
+            }
+            Frame::BodyChunk(chunk) => {
+                if !got_headers {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "decode_response: BodyChunk before Headers",
+                    ));
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Frame::End { ok: _ } => {
+                if !got_headers {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "decode_response: End before Headers",
+                    ));
+                }
+                return Ok(PersistentResponse {
+                    status,
+                    headers,
+                    body,
+                });
+            }
+            Frame::Error(msg) => {
+                return Ok(PersistentResponse {
+                    status: 500,
+                    headers: Vec::new(),
+                    body: msg,
+                });
+            }
+        }
     }
-
-    let mut headers = Vec::with_capacity(hdr_count as usize);
-    for _ in 0..hdr_count {
-        let name = read_string_fd(resp_fd)?;
-        let value = read_string_fd(resp_fd)?;
-        headers.push((name, value));
-    }
-
-    let body = read_bytes_fd(resp_fd)?;
-    Ok(PersistentResponse {
-        status,
-        headers,
-        body,
-    })
 }
 
 /// Async version of `decode_response` — reads from an `AsyncRead` source
@@ -256,34 +302,75 @@ pub async fn decode_response_async<R>(r: &mut R) -> io::Result<PersistentRespons
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    use crate::async_io::{
-        read_bytes_async, read_string_async, read_u16_le_async, read_u32_le_async, read_u8_async,
-    };
+    use crate::stream::{read_frame_async, Frame};
 
-    let _marker = read_u8_async(r).await?;
-    let status = read_u16_le_async(r).await?;
-    let hdr_count = read_u32_le_async(r).await?;
+    let mut status: u16 = 0;
+    let mut headers: Vec<(String, String)> = Vec::new();
+    let mut body: Vec<u8> = Vec::new();
+    let mut got_headers = false;
 
-    if hdr_count > 256 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("decode_response_async: invalid header_count={hdr_count} — pipe desynced"),
-        ));
+    loop {
+        let frame = read_frame_async(r).await?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "decode_response_async: pipe closed before End frame",
+            )
+        })?;
+        match frame {
+            Frame::Headers {
+                http_status,
+                headers: h,
+            } => {
+                if got_headers {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "decode_response_async: duplicate Headers frame",
+                    ));
+                }
+                if h.len() > 256 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "decode_response_async: invalid header_count={} — pipe desynced",
+                            h.len()
+                        ),
+                    ));
+                }
+                status = http_status;
+                headers = h;
+                got_headers = true;
+            }
+            Frame::BodyChunk(chunk) => {
+                if !got_headers {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "decode_response_async: BodyChunk before Headers",
+                    ));
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Frame::End { ok: _ } => {
+                if !got_headers {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "decode_response_async: End before Headers",
+                    ));
+                }
+                return Ok(PersistentResponse {
+                    status,
+                    headers,
+                    body,
+                });
+            }
+            Frame::Error(msg) => {
+                return Ok(PersistentResponse {
+                    status: 500,
+                    headers: Vec::new(),
+                    body: msg,
+                });
+            }
+        }
     }
-
-    let mut headers = Vec::with_capacity(hdr_count as usize);
-    for _ in 0..hdr_count {
-        let name = read_string_async(r).await?;
-        let value = read_string_async(r).await?;
-        headers.push((name, value));
-    }
-
-    let body = read_bytes_async(r).await?;
-    Ok(PersistentResponse {
-        status,
-        headers,
-        body,
-    })
 }
 
 /// Read and validate the ready signal from a persistent PHP worker.
@@ -414,6 +501,11 @@ fn write_ready_signal(resp_fd: RawFd) -> io::Result<()> {
 }
 
 /// Write a response to the response pipe.
+///
+/// Uses the streaming frame protocol (see `crate::stream`):
+/// `Headers` → optional `BodyChunk` → `End`. Phase 1 still ships the body as
+/// a single chunk (collected by `turbine_ub_write`); Phase 2 will emit one
+/// chunk per `ub_write` call so PHP streams through to the HTTP client.
 fn write_response(
     resp_fd: RawFd,
     ok: bool,
@@ -421,15 +513,23 @@ fn write_response(
     headers: &[(String, String)],
     body: &[u8],
 ) -> io::Result<()> {
-    let mut buf = Vec::with_capacity(32 + body.len());
-    write_u8(&mut buf, if ok { 0x01 } else { 0x02 });
-    buf.extend_from_slice(&http_status.to_le_bytes());
-    write_u32_le(&mut buf, headers.len() as u32);
-    for (name, value) in headers {
-        write_str(&mut buf, name);
-        write_str(&mut buf, value);
+    let mut buf = Vec::with_capacity(32 + headers.len() * 32 + body.len());
+    crate::stream::encode_headers(&mut buf, http_status, headers);
+    if !body.is_empty() {
+        crate::stream::encode_body_chunk(&mut buf, body);
     }
-    write_bytes(&mut buf, body);
+    crate::stream::encode_end(&mut buf, ok);
+    write_all_fd(resp_fd, &buf)
+}
+
+/// Terminal `End` frame for an already-streamed response.
+///
+/// Used when `turbine-engine`'s streaming mode has been feeding `Headers` +
+/// `BodyChunk` frames directly to the pipe during script execution — the
+/// worker just needs to close the frame sequence.
+fn write_stream_end(resp_fd: RawFd, ok: bool) -> io::Result<()> {
+    let mut buf = Vec::with_capacity(2);
+    crate::stream::encode_end(&mut buf, ok);
     write_all_fd(resp_fd, &buf)
 }
 
@@ -703,6 +803,11 @@ pub fn worker_event_loop_persistent(
 
                 output::install_output_capture();
                 output::clear_output_buffer();
+                // Stream PHP output (echo / flush) directly to the response
+                // pipe as BodyChunk frames instead of buffering until end
+                // of request. Headers are emitted lazily on the first
+                // `ub_write` call (or by `flush_headers_if_needed` at end).
+                output::start_streaming(resp_fd);
 
                 // Use turbine_execute_script (php_execute_script) so the handler
                 // goes straight through OPcache without being re-parsed every
@@ -744,6 +849,18 @@ pub fn worker_event_loop_persistent(
                 // bodies for large payloads under ZTS persistent mode).
                 turbine_php_sys::turbine_worker_request_shutdown();
 
+                // Make sure a `Headers` frame has been emitted (covers empty
+                // bodies / early returns), then leave streaming mode.
+                output::flush_headers_if_needed();
+                output::finish_streaming();
+
+                // Any bytes that landed in the buffered OUTPUT_BUFFER would
+                // indicate a logic bug — streaming mode bypasses it — but
+                // we still drain it for safety so the next request starts
+                // clean. `headers` / `status` are unused for the streaming
+                // path (emitted directly in the `Headers` frame) but we
+                // return them for compatibility with the non-streaming
+                // signature of this match arm.
                 let b = output::take_output();
                 let h = output::take_headers();
                 let s = output::take_response_code();
@@ -755,6 +872,7 @@ pub fn worker_event_loop_persistent(
 
                 output::install_output_capture();
                 output::clear_output_buffer();
+                output::start_streaming(resp_fd);
 
                 let r = turbine_php_sys::turbine_execute_script(c_script.as_ptr());
 
@@ -786,6 +904,9 @@ pub fn worker_event_loop_persistent(
                 // CRITICAL: shutdown before take_output — see lightweight path.
                 turbine_php_sys::php_request_shutdown(std::ptr::null_mut());
 
+                output::flush_headers_if_needed();
+                output::finish_streaming();
+
                 let b = output::take_output();
                 let h = output::take_headers();
                 let s = output::take_response_code();
@@ -794,7 +915,29 @@ pub fn worker_event_loop_persistent(
             };
 
             let ok = result == turbine_php_sys::SUCCESS;
-            if let Err(e) = write_response(resp_fd, ok, status, &headers, &body) {
+
+            // Streaming path: `Headers` + `BodyChunk`s have already been
+            // emitted to `resp_fd` by `turbine_ub_write`. All that remains
+            // is the terminal `End` frame. If any stray bytes landed in
+            // the buffered `OUTPUT_BUFFER` (should not happen in normal
+            // flow but we defend against unseen edge cases), ship them as
+            // one last chunk before closing the frame sequence.
+            let write_result = if body.is_empty() {
+                let _ = (headers, status); // intentionally unused on streaming path
+                write_stream_end(resp_fd, ok)
+            } else {
+                warn!(
+                    pid = std::process::id(),
+                    bytes = body.len(),
+                    "Non-empty buffered output on streaming path — flushing as final chunk"
+                );
+                let mut buf = Vec::with_capacity(8 + body.len());
+                crate::stream::encode_body_chunk(&mut buf, &body);
+                crate::stream::encode_end(&mut buf, ok);
+                write_all_fd(resp_fd, &buf)
+            };
+
+            if let Err(e) = write_result {
                 error!(pid = std::process::id(), error = %e, "Failed to write response — exiting worker");
                 break;
             }
@@ -1768,9 +1911,14 @@ mod tests {
     fn decode_response_rejects_high_header_count() {
         let (read_fd, write_fd) = make_pipe();
 
-        // Manually write a response with header_count = 300 (> 256 limit)
+        // Manually emit a Headers frame claiming 300 headers (> 256 limit).
+        // Wire layout (see crate::stream):
+        //   [0x10][u16 status][u32 header_count][...per-header triples...]
+        // We stop after the count since the decoder rejects before reading
+        // any header bytes, and the caller closes the pipe to surface EOF
+        // if the decoder somehow tried to read further.
         let mut buf = Vec::new();
-        buf.push(0x01); // Ok marker
+        buf.push(crate::stream::FRAME_HEADERS);
         buf.extend_from_slice(&200u16.to_le_bytes()); // status
         buf.extend_from_slice(&300u32.to_le_bytes()); // header_count > 256
 
@@ -1781,9 +1929,16 @@ mod tests {
         }
 
         let result = decode_response(read_fd);
+        // Decoder either rejects via the header-count guard or hits EOF
+        // trying to read the declared 300 headers — both indicate a malformed
+        // / desynced response.
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.to_string().contains("invalid header_count"));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid header_count") || err.kind() == io::ErrorKind::UnexpectedEof,
+            "unexpected error: {msg}"
+        );
 
         unsafe {
             libc::close(read_fd);

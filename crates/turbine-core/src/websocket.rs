@@ -22,7 +22,6 @@ use std::time::Duration;
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
-use http_body_util::Full;
 use hyper::header::{HeaderValue, CONNECTION, SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_KEY, UPGRADE};
 use hyper::upgrade::Upgraded;
 use hyper::{body::Incoming, Request, Response, StatusCode};
@@ -40,14 +39,14 @@ use base64::Engine as _;
 /// frames are considered dead and dropped.
 const DEFAULT_CHANNEL_CAPACITY: usize = 256;
 
-type HyperResponse = Response<Full<Bytes>>;
+type HyperResponse = crate::http_helpers::HyperResponse;
 
 fn build_response(status: u16, content_type: &str, body: Vec<u8>) -> HyperResponse {
     Response::builder()
         .status(StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
         .header("Content-Type", content_type)
         .header("Content-Length", body.len())
-        .body(Full::from(Bytes::from(body)))
+        .body(crate::http_helpers::full_body(Bytes::from(body)))
         .expect("static response")
 }
 
@@ -229,7 +228,7 @@ pub fn handle_ws_upgrade(
         .header(CONNECTION, HeaderValue::from_static("Upgrade"))
         .header(UPGRADE, HeaderValue::from_static("websocket"))
         .header(SEC_WEBSOCKET_ACCEPT, accept)
-        .body(Full::new(Bytes::new()))
+        .body(crate::http_helpers::full_body(Bytes::new()))
         .expect("static 101 response");
 
     // Spawn the actual WS pump in the background.  Hyper drives the

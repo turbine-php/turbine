@@ -6,10 +6,11 @@
 //! plain references to config/metrics; no `ServerState` coupling
 //! beyond the thin `write_access_log` wrapper.
 
+use std::convert::Infallible;
 use std::time::Instant;
 
 use bytes::Bytes;
-use http_body_util::Full;
+use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::{Response, StatusCode};
 use tracing::info;
 use turbine_metrics::MetricsCollector;
@@ -17,7 +18,24 @@ use turbine_metrics::MetricsCollector;
 use crate::config;
 use crate::ServerState;
 
-pub type HyperResponse = Response<Full<Bytes>>;
+/// Boxed response body type used across the handler hot path.
+///
+/// Boxing lets us return either a fully-buffered `Full<Bytes>` body
+/// (the common case — small JSON / HTML / binary responses) or a
+/// `StreamBody<…>` driven by `turbine_worker::stream::consume_streaming`
+/// (SSE, chunked exports, any response that PHP emits via `flush()`),
+/// from the same handler without leaking the body type into every
+/// callsite.
+pub type ResponseBody = BoxBody<Bytes, std::io::Error>;
+pub type HyperResponse = Response<ResponseBody>;
+
+/// Wrap a fully-buffered byte buffer into the boxed response body.
+/// Common helper used by every non-streaming code path.
+pub fn full_body(body: impl Into<Bytes>) -> ResponseBody {
+    Full::new(body.into())
+        .map_err(|never: Infallible| match never {})
+        .boxed()
+}
 
 /// Check if a request origin is allowed by the CORS config.
 pub fn cors_origin_allowed(cors: &config::CorsConfig, origin: &str) -> bool {
@@ -139,10 +157,10 @@ pub fn build_response(
         }
     }
 
-    builder.body(Full::new(body)).unwrap_or_else(|_| {
+    builder.body(full_body(body)).unwrap_or_else(|_| {
         Response::builder()
             .status(StatusCode::INTERNAL_SERVER_ERROR)
-            .body(Full::new(Bytes::from("Internal response build error")))
+            .body(full_body(Bytes::from("Internal response build error")))
             .unwrap()
     })
 }
@@ -269,6 +287,146 @@ pub fn detect_content_type(output: &[u8]) -> &'static str {
     } else {
         "text/plain; charset=utf-8"
     }
+}
+
+/// Decide whether a response produced by the PHP worker should be
+/// streamed to the client (as opposed to buffered, compressed, cached,
+/// and shipped in one go).
+///
+/// A response is streamed when at least one of:
+///
+/// * `Content-Type` starts with `text/event-stream` — Server-Sent Events.
+///   Buffering breaks SSE by definition: clients must see each event as
+///   PHP emits it.
+/// * `X-Accel-Buffering: no` — the explicit nginx/fpm convention for
+///   "please don't buffer me". PHP apps set this when they call
+///   `flush()` in a loop (progress streams, chunked CSV exports,
+///   long-running generation).
+///
+/// Keeping this as a narrow opt-in matters: the regular (fully-buffered)
+/// path preserves compression, caching, response coalescing, and cheap
+/// `Content-Length` — all of which break when the body length is not
+/// known upfront.
+pub fn response_should_stream(headers: &[(String, String)]) -> bool {
+    for (k, v) in headers {
+        if k.eq_ignore_ascii_case("Content-Type") {
+            let ct = v.trim_start().to_ascii_lowercase();
+            if ct.starts_with("text/event-stream") {
+                return true;
+            }
+        } else if k.eq_ignore_ascii_case("X-Accel-Buffering") && v.trim().eq_ignore_ascii_case("no")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Body adapter that streams bytes from an mpsc receiver.
+///
+/// Each `BodyChunk` frame decoded by
+/// `turbine_worker::stream::consume_streaming` arrives on the channel;
+/// hyper polls us for the next frame and we forward it to the socket.
+/// Channel closure means "end of body" (graceful).
+///
+/// Handwritten instead of pulling in `tokio-stream` to keep the
+/// dependency surface small — `hyper::body::Body` has a single required
+/// method and the channel's `poll_recv` already returns a `Poll`.
+pub struct ChannelBody {
+    rx: tokio::sync::mpsc::Receiver<Result<Vec<u8>, std::io::Error>>,
+}
+
+impl ChannelBody {
+    pub fn new(rx: tokio::sync::mpsc::Receiver<Result<Vec<u8>, std::io::Error>>) -> Self {
+        Self { rx }
+    }
+}
+
+impl hyper::body::Body for ChannelBody {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        match self.rx.poll_recv(cx) {
+            std::task::Poll::Pending => std::task::Poll::Pending,
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
+            std::task::Poll::Ready(Some(Err(e))) => std::task::Poll::Ready(Some(Err(e))),
+            std::task::Poll::Ready(Some(Ok(chunk))) => std::task::Poll::Ready(Some(Ok(
+                hyper::body::Frame::data(Bytes::from(chunk)),
+            ))),
+        }
+    }
+}
+
+/// Build a streaming `HyperResponse` from the head and body-chunk receiver
+/// returned by `turbine_worker::stream::consume_streaming`.
+///
+/// Security headers mirror `build_response`. The response body is wired
+/// to the chunk channel via `ChannelBody` — hyper will emit each chunk to
+/// the client as it arrives. `Content-Length` is intentionally omitted:
+/// hyper will use `Transfer-Encoding: chunked` (HTTP/1.1) or `DATA` frames
+/// (HTTP/2).
+pub fn build_streaming_response(
+    status: u16,
+    headers: Vec<(String, String)>,
+    body_rx: tokio::sync::mpsc::Receiver<Result<Vec<u8>, std::io::Error>>,
+) -> HyperResponse {
+    let status_code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let body: ResponseBody = ChannelBody::new(body_rx).boxed();
+
+    let mut builder = Response::builder()
+        .status(status_code)
+        .header("Server", format!("Turbine/{}", env!("CARGO_PKG_VERSION")))
+        .header("X-Content-Type-Options", "nosniff")
+        .header("X-Frame-Options", "SAMEORIGIN")
+        .header("X-XSS-Protection", "0")
+        .header("Referrer-Policy", "strict-origin-when-cross-origin")
+        .header(
+            "Permissions-Policy",
+            "camera=(), microphone=(), geolocation=()",
+        )
+        // SSE / progressive output: disable any upstream buffering by default.
+        .header("Cache-Control", "no-cache")
+        .header("X-Accel-Buffering", "no");
+
+    // Forward all PHP-emitted headers that are valid. Skip `Content-Length`
+    // (we don't know the length) and let PHP override our buffering
+    // defaults if it wants to.
+    let mut seen_ct = false;
+    for (name, value) in &headers {
+        if name.eq_ignore_ascii_case("Content-Length") {
+            continue;
+        }
+        if name.eq_ignore_ascii_case("Cache-Control")
+            || name.eq_ignore_ascii_case("X-Accel-Buffering")
+        {
+            if let Some(h) = builder.headers_mut() {
+                h.remove(name.as_str());
+            }
+        }
+        if name.eq_ignore_ascii_case("Content-Type") {
+            seen_ct = true;
+        }
+        if hyper::header::HeaderName::from_bytes(name.as_bytes()).is_ok()
+            && hyper::header::HeaderValue::from_str(value).is_ok()
+        {
+            builder = builder.header(name.as_str(), value.as_str());
+        }
+    }
+
+    if !seen_ct {
+        builder = builder.header("Content-Type", "application/octet-stream");
+    }
+
+    builder.body(body).unwrap_or_else(|_| {
+        Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(full_body(Bytes::from("Internal streaming response build error")))
+            .unwrap()
+    })
 }
 
 /// Map file extension to MIME type for static file serving.

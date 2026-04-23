@@ -1,13 +1,22 @@
 //! PHP output capture via SAPI ub_write and header_handler interception.
 //!
 //! The embed SAPI writes PHP output (echo, print, etc.) to stdout by default.
-//! We replace the `ub_write` callback with our own that appends to a
-//! process-local buffer, allowing us to capture PHP output from Rust.
+//! We replace the `ub_write` callback with our own that either:
+//!
+//! * **Buffered mode (default):** appends bytes to a thread-local `Vec<u8>`
+//!   that the worker drains at the end of the request — identical to the
+//!   original behaviour.
+//! * **Streaming mode:** writes each `ub_write` chunk directly to a raw fd
+//!   as a `BodyChunk` frame (see `turbine-worker::stream`). The first write
+//!   also emits a `Headers` frame (status + captured headers), so downstream
+//!   readers see a complete framed response. Used by the persistent worker
+//!   to stream `echo`/`flush()` output to the HTTP client as PHP emits it.
 //!
 //! We also replace `header_handler` to capture HTTP headers set via PHP's
 //! `header()`, `setcookie()`, and `http_response_code()`.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::os::unix::io::RawFd;
 
 use libc::{c_char, c_int, c_void, size_t};
 use tracing::trace;
@@ -15,7 +24,7 @@ use tracing::trace;
 use turbine_php_sys::{read_sapi_response_code, sapi_header_struct, sapi_module, SapiUbWrite};
 
 thread_local! {
-    /// Buffer that accumulates PHP output for the current request.
+    /// Buffer that accumulates PHP output for the current request (buffered mode).
     static OUTPUT_BUFFER: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(4096));
 
     /// Buffer that accumulates HTTP headers from PHP header() calls.
@@ -23,19 +32,127 @@ thread_local! {
 
     /// HTTP response status code set by PHP (via http_response_code() or header("HTTP/...")).
     static RESPONSE_CODE: RefCell<u16> = const { RefCell::new(200) };
+
+    /// Raw fd to stream `BodyChunk` frames to. `-1` means buffered mode.
+    ///
+    /// When non-negative, `turbine_ub_write` writes chunks straight to this
+    /// fd instead of appending to `OUTPUT_BUFFER`. The fd is owned by the
+    /// caller (the worker process); this module only writes — it never
+    /// closes.
+    static STREAM_FD: Cell<RawFd> = const { Cell::new(-1) };
+
+    /// Whether the `Headers` frame has already been emitted in the current
+    /// streaming request. Reset by `start_streaming` and checked on the
+    /// first `turbine_ub_write` call.
+    static STREAM_HEADERS_SENT: Cell<bool> = const { Cell::new(false) };
 }
 
 /// The original ub_write callback (saved so we can restore it if needed).
 static mut ORIGINAL_UB_WRITE: Option<SapiUbWrite> = None;
 
-/// Custom ub_write that captures PHP output into our buffer.
+// ── Frame discriminants ─────────────────────────────────────────────────────
+//
+// Kept in sync with `turbine_worker::stream`. Duplicated here instead of
+// depending on `turbine-worker` to avoid a crate-level dependency cycle
+// (turbine-worker already depends on turbine-engine).
+
+const FRAME_HEADERS: u8 = 0x10;
+const FRAME_BODY_CHUNK: u8 = 0x11;
+
+/// Write all bytes to a raw fd, retrying on `EINTR`. Errors are silently
+/// ignored: there is no reasonable recovery from a dead response pipe inside
+/// the PHP `ub_write` callback — the worker will notice on its next frame
+/// write and exit.
+fn write_all_fd(fd: RawFd, mut data: &[u8]) {
+    while !data.is_empty() {
+        let ret =
+            unsafe { libc::write(fd, data.as_ptr() as *const _, data.len()) };
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return;
+        }
+        data = &data[ret as usize..];
+    }
+}
+
+/// Emit a `Headers` frame to the streaming fd. Drains `HEADER_BUFFER` and
+/// `RESPONSE_CODE` (so subsequent calls don't resend them).
+fn emit_headers_frame(fd: RawFd) {
+    let status = RESPONSE_CODE.with(|rc| {
+        let v = *rc.borrow();
+        // Also fold in the PHP-level code if higher priority — mirrors
+        // `take_response_code()` logic so streaming matches buffered mode.
+        if v != 200 {
+            v
+        } else {
+            let sg = unsafe { read_sapi_response_code() };
+            if sg > 0 {
+                sg as u16
+            } else {
+                v
+            }
+        }
+    });
+    let headers: Vec<(String, String)> =
+        HEADER_BUFFER.with(|buf| buf.borrow_mut().split_off(0));
+
+    let mut out = Vec::with_capacity(16 + headers.len() * 32);
+    out.push(FRAME_HEADERS);
+    out.extend_from_slice(&status.to_le_bytes());
+    out.extend_from_slice(&(headers.len() as u32).to_le_bytes());
+    for (name, value) in &headers {
+        let n = name.as_bytes();
+        let v = value.as_bytes();
+        out.extend_from_slice(&(n.len() as u16).to_le_bytes());
+        out.extend_from_slice(n);
+        out.extend_from_slice(&(v.len() as u16).to_le_bytes());
+        out.extend_from_slice(v);
+    }
+    write_all_fd(fd, &out);
+}
+
+/// Emit a single `BodyChunk` frame to the streaming fd.
+fn emit_body_chunk_frame(fd: RawFd, chunk: &[u8]) {
+    // Frame header: [0x11][u32 len]
+    let mut hdr = [0u8; 5];
+    hdr[0] = FRAME_BODY_CHUNK;
+    hdr[1..5].copy_from_slice(&(chunk.len() as u32).to_le_bytes());
+    // Two writes to avoid an extra allocation for large chunks. Pipes are
+    // atomic up to PIPE_BUF (4KB on Linux, 512B on macOS) only; for larger
+    // writes we rely on the fact that the reader is single-consumer and
+    // the writer is single-producer within the worker, so interleaving is
+    // impossible.
+    write_all_fd(fd, &hdr);
+    if !chunk.is_empty() {
+        write_all_fd(fd, chunk);
+    }
+}
+
+/// Custom ub_write that either buffers output or streams it as framed
+/// `BodyChunk` messages, depending on whether streaming mode is active.
 ///
 /// # Safety
 /// Called from PHP engine via C function pointer. `str` must be valid for
 /// `str_length` bytes.
 unsafe extern "C" fn turbine_ub_write(str: *const c_char, str_length: size_t) -> size_t {
-    if !str.is_null() && str_length > 0 {
-        let slice = std::slice::from_raw_parts(str as *const u8, str_length);
+    if str.is_null() || str_length == 0 {
+        return str_length;
+    }
+    let slice = std::slice::from_raw_parts(str as *const u8, str_length);
+
+    let fd = STREAM_FD.with(|f| f.get());
+    if fd >= 0 {
+        // Streaming mode — emit Headers on first write, then BodyChunk.
+        let already_sent = STREAM_HEADERS_SENT.with(|f| f.replace(true));
+        if !already_sent {
+            emit_headers_frame(fd);
+        }
+        emit_body_chunk_frame(fd, slice);
+        trace!(bytes = str_length, "Streamed PHP output chunk");
+    } else {
         OUTPUT_BUFFER.with(|buf| {
             buf.borrow_mut().extend_from_slice(slice);
         });
@@ -145,6 +262,59 @@ pub unsafe fn install_output_capture() {
     ORIGINAL_UB_WRITE = sapi_module.ub_write;
     sapi_module.ub_write = Some(turbine_ub_write);
     sapi_module.header_handler = Some(turbine_header_handler);
+}
+
+// ── Streaming API ───────────────────────────────────────────────────────────
+
+/// Enable streaming mode for the current request. All subsequent
+/// `turbine_ub_write` calls (i.e. every `echo`/`print`/output-buffer flush)
+/// will emit `BodyChunk` frames directly to `fd` instead of accumulating
+/// into `OUTPUT_BUFFER`.
+///
+/// The `Headers` frame is emitted lazily on the first `ub_write` call (or
+/// explicitly via `flush_headers_if_needed`) so PHP has a chance to finish
+/// setting `Content-Type` / `Status` / `Location` / etc.
+///
+/// Must be paired with `finish_streaming`.
+pub fn start_streaming(fd: RawFd) {
+    STREAM_FD.with(|f| f.set(fd));
+    STREAM_HEADERS_SENT.with(|f| f.set(false));
+    // Don't clear HEADER_BUFFER / RESPONSE_CODE here — the worker's normal
+    // per-request reset (`clear_output_buffer`) owns that.
+}
+
+/// Force-emit the `Headers` frame if the script hasn't produced any output
+/// yet. Called by the worker at the end of the request to guarantee that
+/// even empty responses (204 No Content, pure header redirects, etc.)
+/// emit a `Headers` frame before the terminal `End` frame.
+///
+/// Returns `true` if a `Headers` frame was emitted by this call.
+pub fn flush_headers_if_needed() -> bool {
+    let fd = STREAM_FD.with(|f| f.get());
+    if fd < 0 {
+        return false;
+    }
+    let already_sent = STREAM_HEADERS_SENT.with(|f| f.replace(true));
+    if already_sent {
+        return false;
+    }
+    emit_headers_frame(fd);
+    true
+}
+
+/// Disable streaming mode. Returns the fd previously installed (or -1 if
+/// streaming was not active). Does not emit the terminal `End` frame — the
+/// caller owns the response pipe and is responsible for finishing the
+/// response frame sequence.
+pub fn finish_streaming() -> RawFd {
+    let prev = STREAM_FD.with(|f| f.replace(-1));
+    STREAM_HEADERS_SENT.with(|f| f.set(false));
+    prev
+}
+
+/// Check whether streaming mode is currently active.
+pub fn is_streaming() -> bool {
+    STREAM_FD.with(|f| f.get()) >= 0
 }
 
 /// Clear the output buffer and header buffer. Call before executing each request.

@@ -60,6 +60,35 @@ Step by step, what happens when a request arrives:
 
 Async stays on the Rust side. PHP runs synchronously inside its own thread or process. No request blocks another, because accept and I/O never wait on PHP — only the specific worker handling that request is busy until it completes.
 
+## Streaming Responses
+
+Turbine does not buffer the full response body inside the worker. From the very first byte a PHP script writes, bytes flow to the client through a framed pipe protocol:
+
+```
+worker (PHP)                        Rust async dispatch              hyper / client
+────────────────                    ─────────────────────            ──────────────
+echo / print →
+  sapi_module.ub_write  ───────▶    FRAME_HEADERS (once)
+                                    FRAME_BODY_CHUNK  ───────▶      body::Frame(Bytes)
+echo → ub_write         ───────▶    FRAME_BODY_CHUNK  ───────▶      body::Frame(Bytes)
+...
+request shutdown        ───────▶    FRAME_END          ───────▶     end of response
+```
+
+Each worker writes length-prefixed frames to its response pipe (`FRAME_HEADERS=0x10`, `FRAME_BODY_CHUNK=0x11`, `FRAME_END=0x12`, `FRAME_ERROR=0x13`). The Rust dispatch side reads the header frame first (blocking), then decides how to forward the body:
+
+- **Buffered path (default)** — the response is drained into a `Vec<u8>`, passed through the full post-processing pipeline (compression, response cache, coalescing, access log), and written in one shot. This is optimal for short HTML/JSON responses where end-to-end latency matters more than time-to-first-byte.
+- **Streaming path (opt-in)** — a bounded `mpsc` channel feeds a `hyper::body::Body` implementation (`ChannelBody`). Each `FRAME_BODY_CHUNK` the worker writes is forwarded to hyper as soon as it arrives, preserving PHP-controlled flushes. This bypasses the response cache and the compression middleware by design, because the body is not materialized in memory.
+
+The streaming path is triggered automatically when the PHP script sets either:
+
+- `Content-Type: text/event-stream` (Server-Sent Events), or
+- `X-Accel-Buffering: no`
+
+Inside PHP, `flush()` / `ob_flush()` behave as expected — they push the output buffer into `ub_write`, which emits a `FRAME_BODY_CHUNK` immediately. No write is coalesced on the Rust side beyond the OS pipe buffer, so many-write scenarios (progress streams, long downloads, SSE) match FPM and FrankenPHP semantics.
+
+Backpressure is honored: if the client is slow, the bounded channel fills up, `ub_write` blocks on the pipe write, and PHP naturally pauses until the consumer catches up. If the client disconnects mid-stream, Turbine drains and discards remaining frames so the worker can return to the pool cleanly.
+
 ## Shared State
 
 Because workers run in parallel, state shared across requests cannot live in PHP globals (each worker has its own copy). Turbine exposes explicit primitives that live on the Rust side and are accessed from PHP as an extension:
