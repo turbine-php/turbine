@@ -345,123 +345,117 @@ impl std::fmt::Debug for StreamingHead {
 ///   `done` resolves to `Err` carrying the payload as the message.
 /// * Duplicate `Headers` / out-of-order frames → `body` yields
 ///   `Err(InvalidData)` and the task exits.
-pub fn consume_streaming<R>(mut r: R) -> impl std::future::Future<Output = io::Result<StreamingHead>>
+pub async fn consume_streaming<R>(mut r: R) -> io::Result<StreamingHead>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
-    async move {
-        // First frame must be `Headers` (or a terminal `Error`).
-        let first = read_frame_async(&mut r).await?.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "consume_streaming: pipe closed before Headers frame",
-            )
-        })?;
+    // First frame must be `Headers` (or a terminal `Error`).
+    let first = read_frame_async(&mut r).await?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "consume_streaming: pipe closed before Headers frame",
+        )
+    })?;
 
-        let (http_status, headers) = match first {
-            Frame::Headers {
-                http_status,
-                headers,
-            } => (http_status, headers),
-            Frame::Error(msg) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!(
-                        "consume_streaming: worker emitted Error frame: {}",
-                        String::from_utf8_lossy(&msg)
-                    ),
-                ));
-            }
-            Frame::BodyChunk(_) | Frame::End { .. } => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "consume_streaming: first frame must be Headers",
-                ));
-            }
-        };
+    let (http_status, headers) = match first {
+        Frame::Headers {
+            http_status,
+            headers,
+        } => (http_status, headers),
+        Frame::Error(msg) => {
+            return Err(io::Error::other(format!(
+                "consume_streaming: worker emitted Error frame: {}",
+                String::from_utf8_lossy(&msg)
+            )));
+        }
+        Frame::BodyChunk(_) | Frame::End { .. } => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "consume_streaming: first frame must be Headers",
+            ));
+        }
+    };
 
-        let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, io::Error>>(64);
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<io::Result<bool>>();
+    let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, io::Error>>(64);
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<io::Result<bool>>();
 
-        tokio::spawn(async move {
-            loop {
-                let frame = match read_frame_async(&mut r).await {
-                    Ok(Some(f)) => f,
-                    Ok(None) => {
-                        let _ = done_tx.send(Err(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "streaming response pipe closed before End frame",
-                        )));
-                        return;
-                    }
-                    Err(e) => {
-                        let _ = body_tx
-                            .send(Err(io::Error::new(e.kind(), e.to_string())))
-                            .await;
-                        let _ = done_tx.send(Err(e));
-                        return;
-                    }
-                };
+    tokio::spawn(async move {
+        loop {
+            let frame = match read_frame_async(&mut r).await {
+                Ok(Some(f)) => f,
+                Ok(None) => {
+                    let _ = done_tx.send(Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "streaming response pipe closed before End frame",
+                    )));
+                    return;
+                }
+                Err(e) => {
+                    let _ = body_tx
+                        .send(Err(io::Error::new(e.kind(), e.to_string())))
+                        .await;
+                    let _ = done_tx.send(Err(e));
+                    return;
+                }
+            };
 
-                match frame {
-                    Frame::BodyChunk(chunk) => {
-                        if body_tx.send(Ok(chunk)).await.is_err() {
-                            // Receiver dropped — client disconnected. Keep
-                            // draining the pipe so the worker can finish
-                            // and be returned to the pool cleanly.
-                            loop {
-                                match read_frame_async(&mut r).await {
-                                    Ok(Some(Frame::End { ok })) => {
-                                        let _ = done_tx.send(Ok(ok));
-                                        return;
-                                    }
-                                    Ok(Some(_)) => continue,
-                                    Ok(None) | Err(_) => {
-                                        let _ = done_tx.send(Err(io::Error::new(
-                                            io::ErrorKind::BrokenPipe,
-                                            "client disconnected mid-stream",
-                                        )));
-                                        return;
-                                    }
+            match frame {
+                Frame::BodyChunk(chunk) => {
+                    if body_tx.send(Ok(chunk)).await.is_err() {
+                        // Receiver dropped — client disconnected. Keep
+                        // draining the pipe so the worker can finish
+                        // and be returned to the pool cleanly.
+                        loop {
+                            match read_frame_async(&mut r).await {
+                                Ok(Some(Frame::End { ok })) => {
+                                    let _ = done_tx.send(Ok(ok));
+                                    return;
+                                }
+                                Ok(Some(_)) => continue,
+                                Ok(None) | Err(_) => {
+                                    let _ = done_tx.send(Err(io::Error::new(
+                                        io::ErrorKind::BrokenPipe,
+                                        "client disconnected mid-stream",
+                                    )));
+                                    return;
                                 }
                             }
                         }
                     }
-                    Frame::End { ok } => {
-                        let _ = done_tx.send(Ok(ok));
-                        return;
-                    }
-                    Frame::Headers { .. } => {
-                        let _ = body_tx
-                            .send(Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "unexpected Headers frame mid-stream",
-                            )))
-                            .await;
-                        let _ = done_tx.send(Err(io::Error::new(
+                }
+                Frame::End { ok } => {
+                    let _ = done_tx.send(Ok(ok));
+                    return;
+                }
+                Frame::Headers { .. } => {
+                    let _ = body_tx
+                        .send(Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            "duplicate Headers frame",
-                        )));
-                        return;
-                    }
-                    Frame::Error(msg) => {
-                        let _ = done_tx.send(Err(io::Error::new(
-                            io::ErrorKind::Other,
-                            String::from_utf8_lossy(&msg).into_owned(),
-                        )));
-                        return;
-                    }
+                            "unexpected Headers frame mid-stream",
+                        )))
+                        .await;
+                    let _ = done_tx.send(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "duplicate Headers frame",
+                    )));
+                    return;
+                }
+                Frame::Error(msg) => {
+                    let _ = done_tx.send(Err(io::Error::other(
+                        String::from_utf8_lossy(&msg).into_owned(),
+                    )));
+                    return;
                 }
             }
-        });
+        }
+    });
 
-        Ok(StreamingHead {
-            http_status,
-            headers,
-            body: body_rx,
-            done: done_rx,
-        })
-    }
+    Ok(StreamingHead {
+        http_status,
+        headers,
+        body: body_rx,
+        done: done_rx,
+    })
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -530,7 +524,13 @@ mod tests {
 
         let mut cur = Cursor::new(buf);
         let h = read_frame(&mut cur).unwrap().unwrap();
-        assert!(matches!(h, Frame::Headers { http_status: 201, .. }));
+        assert!(matches!(
+            h,
+            Frame::Headers {
+                http_status: 201,
+                ..
+            }
+        ));
         let b = read_frame(&mut cur).unwrap().unwrap();
         assert!(matches!(b, Frame::BodyChunk(ref c) if c == b"body"));
         let e = read_frame(&mut cur).unwrap().unwrap();
@@ -544,7 +544,10 @@ mod tests {
         let mut cur = Cursor::new(buf);
         assert!(matches!(
             read_frame(&mut cur).unwrap().unwrap(),
-            Frame::Headers { http_status: 204, .. }
+            Frame::Headers {
+                http_status: 204,
+                ..
+            }
         ));
         assert!(matches!(
             read_frame(&mut cur).unwrap().unwrap(),
@@ -575,7 +578,13 @@ mod tests {
         drop(server);
 
         let f1 = read_frame_async(&mut client).await.unwrap().unwrap();
-        assert!(matches!(f1, Frame::Headers { http_status: 200, .. }));
+        assert!(matches!(
+            f1,
+            Frame::Headers {
+                http_status: 200,
+                ..
+            }
+        ));
         let f2 = read_frame_async(&mut client).await.unwrap().unwrap();
         assert!(matches!(f2, Frame::BodyChunk(ref c) if c == b"abc"));
         let f3 = read_frame_async(&mut client).await.unwrap().unwrap();

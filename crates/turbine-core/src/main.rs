@@ -4168,7 +4168,10 @@ async fn handle_request_inner(
                             warn!(worker = log_worker, error = %e, "Streaming response ended with error");
                         }
                         Err(_) => {
-                            warn!(worker = log_worker, "Streaming response done channel dropped");
+                            warn!(
+                                worker = log_worker,
+                                "Streaming response done channel dropped"
+                            );
                         }
                     }
                     return_worker_to_pool(&watch_state, pool_index, worker_idx);
@@ -4305,7 +4308,10 @@ async fn handle_request_inner(
                         request_start.elapsed().as_micros() as u64,
                         0,
                     );
-                    error!(worker = worker_idx_log, "Streaming response done channel dropped");
+                    error!(
+                        worker = worker_idx_log,
+                        "Streaming response done channel dropped"
+                    );
                     return Ok(build_response(
                         502,
                         "text/plain",

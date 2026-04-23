@@ -65,8 +65,7 @@ const FRAME_BODY_CHUNK: u8 = 0x11;
 /// write and exit.
 fn write_all_fd(fd: RawFd, mut data: &[u8]) {
     while !data.is_empty() {
-        let ret =
-            unsafe { libc::write(fd, data.as_ptr() as *const _, data.len()) };
+        let ret = unsafe { libc::write(fd, data.as_ptr() as *const _, data.len()) };
         if ret < 0 {
             let err = std::io::Error::last_os_error();
             if err.kind() == std::io::ErrorKind::Interrupted {
@@ -96,8 +95,7 @@ fn emit_headers_frame(fd: RawFd) {
             }
         }
     });
-    let headers: Vec<(String, String)> =
-        HEADER_BUFFER.with(|buf| buf.borrow_mut().split_off(0));
+    let headers: Vec<(String, String)> = HEADER_BUFFER.with(|buf| buf.borrow_mut().split_off(0));
 
     let mut out = Vec::with_capacity(16 + headers.len() * 32);
     out.push(FRAME_HEADERS);

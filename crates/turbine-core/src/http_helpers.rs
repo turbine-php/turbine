@@ -354,9 +354,9 @@ impl hyper::body::Body for ChannelBody {
             std::task::Poll::Pending => std::task::Poll::Pending,
             std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
             std::task::Poll::Ready(Some(Err(e))) => std::task::Poll::Ready(Some(Err(e))),
-            std::task::Poll::Ready(Some(Ok(chunk))) => std::task::Poll::Ready(Some(Ok(
-                hyper::body::Frame::data(Bytes::from(chunk)),
-            ))),
+            std::task::Poll::Ready(Some(Ok(chunk))) => {
+                std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(Bytes::from(chunk)))))
+            }
         }
     }
 }
@@ -424,7 +424,9 @@ pub fn build_streaming_response(
     builder.body(body).unwrap_or_else(|_| {
         Response::builder()
             .status(StatusCode::INTERNAL_SERVER_ERROR)
-            .body(full_body(Bytes::from("Internal streaming response build error")))
+            .body(full_body(Bytes::from(
+                "Internal streaming response build error",
+            )))
             .unwrap()
     })
 }
