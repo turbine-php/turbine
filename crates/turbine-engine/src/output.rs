@@ -91,7 +91,9 @@ fn emit_headers_frame(fd: RawFd) {
         let v = *rc.borrow();
         // Also fold in the PHP-level code if higher priority — mirrors
         // `take_response_code()` logic so streaming matches buffered mode.
-        if v != 200 {
+        // Only read SG() when the engine is initialized; in ZTS builds the
+        // macro dereferences a per-thread TSRM pointer that is NULL pre-init.
+        if v != 200 || !crate::engine::is_initialized() {
             v
         } else {
             let sg = unsafe { read_sapi_response_code() };
@@ -424,7 +426,13 @@ pub fn take_response_code() -> u16 {
         }
 
         // Otherwise read from PHP's sapi_globals (handles http_response_code(),
-        // header("Location: ...", true, 302), etc.)
+        // header("Location: ...", true, 302), etc.) — but only if the engine
+        // is actually initialized. In ZTS builds, SG() dereferences a per-thread
+        // TSRM pointer that is NULL until sapi_startup() runs, so hitting this
+        // path from unit tests (or any non-worker thread) segfaults.
+        if !crate::engine::is_initialized() {
+            return captured;
+        }
         let sg_code = unsafe { read_sapi_response_code() };
         if sg_code > 0 && sg_code != 200 {
             sg_code as u16

@@ -23,6 +23,15 @@ pub struct PhpResponse {
 /// PHP embed SAPI is not re-entrant — only one instance per process.
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
+/// Whether the embedded PHP engine has been initialized in this process.
+///
+/// Used to gate code paths that call into PHP globals (`SG(...)`, `EG(...)`).
+/// In ZTS builds those macros dereference a per-thread TSRM pointer that
+/// is NULL until `sapi_startup()` runs, so calling them pre-init segfaults.
+pub(crate) fn is_initialized() -> bool {
+    INITIALIZED.load(Ordering::Acquire)
+}
+
 /// Path to the generated php.ini file (must live for the process lifetime).
 ///
 /// We use `php_ini_path_override` instead of `ini_entries` because PHP's
