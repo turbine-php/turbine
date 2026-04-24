@@ -33,18 +33,25 @@ thread_local! {
     /// HTTP response status code set by PHP (via http_response_code() or header("HTTP/...")).
     static RESPONSE_CODE: RefCell<u16> = const { RefCell::new(200) };
 
-    /// Raw fd to stream `BodyChunk` frames to. `-1` means buffered mode.
+    /// Raw fd to stream `BodyChunk` frames to. `-1` means no streaming fd
+    /// is armed (pure buffered mode).
     ///
-    /// When non-negative, `turbine_ub_write` writes chunks straight to this
-    /// fd instead of appending to `OUTPUT_BUFFER`. The fd is owned by the
-    /// caller (the worker process); this module only writes — it never
-    /// closes.
+    /// When non-negative the fd is *armed* — streaming may or may not be
+    /// engaged yet. Streaming engages on explicit opt-in:
+    ///   * PHP calls `flush()` (intercepted via `sapi_module.flush`).
+    ///   * First `ub_write` detects an opt-in header
+    ///     (`Content-Type: text/event-stream` or `X-Accel-Buffering: no`).
+    /// Until engaged, output keeps going into `OUTPUT_BUFFER` so the worker
+    /// can coalesce short responses into a single `write(2)` of Headers +
+    /// BodyChunk + End. The fd is owned by the caller (the worker
+    /// process); this module only writes — it never closes.
     static STREAM_FD: Cell<RawFd> = const { Cell::new(-1) };
 
-    /// Whether the `Headers` frame has already been emitted in the current
-    /// streaming request. Reset by `start_streaming` and checked on the
-    /// first `turbine_ub_write` call.
-    static STREAM_HEADERS_SENT: Cell<bool> = const { Cell::new(false) };
+    /// Whether streaming has been *engaged* in the current request. Once
+    /// engaged we've already emitted a `Headers` frame and must keep
+    /// emitting `BodyChunk` frames instead of buffering. Reset by
+    /// `arm_streaming`.
+    static STREAM_ENGAGED: Cell<bool> = const { Cell::new(false) };
 }
 
 /// The original ub_write callback (saved so we can restore it if needed).
@@ -129,6 +136,51 @@ fn emit_body_chunk_frame(fd: RawFd, chunk: &[u8]) {
     }
 }
 
+/// Inspect `HEADER_BUFFER` for headers that request streaming (no buffering)
+/// semantics. Called on the first `ub_write` when a streaming fd is armed
+/// but streaming has not yet engaged.
+///
+/// Opt-in headers:
+///   * `Content-Type: text/event-stream` — Server-Sent Events.
+///   * `X-Accel-Buffering: no` — explicit nginx-style disable-buffering hint.
+fn headers_request_streaming() -> bool {
+    HEADER_BUFFER.with(|buf| {
+        buf.borrow().iter().any(|(k, v)| {
+            if k.eq_ignore_ascii_case("Content-Type")
+                && v.trim_start()
+                    .to_ascii_lowercase()
+                    .starts_with("text/event-stream")
+            {
+                return true;
+            }
+            if k.eq_ignore_ascii_case("X-Accel-Buffering") && v.trim().eq_ignore_ascii_case("no") {
+                return true;
+            }
+            false
+        })
+    })
+}
+
+/// Engage streaming now: emit the `Headers` frame and flush any already-
+/// buffered output as a single `BodyChunk`. Subsequent `ub_write` calls
+/// will stream directly. No-op if already engaged or no fd is armed.
+fn engage_streaming() {
+    let fd = STREAM_FD.with(|f| f.get());
+    if fd < 0 {
+        return;
+    }
+    let already = STREAM_ENGAGED.with(|f| f.replace(true));
+    if already {
+        return;
+    }
+    emit_headers_frame(fd);
+    // Flush any bytes accumulated before the opt-in was detected.
+    let pending: Vec<u8> = OUTPUT_BUFFER.with(|buf| buf.borrow_mut().split_off(0));
+    if !pending.is_empty() {
+        emit_body_chunk_frame(fd, &pending);
+    }
+}
+
 /// Custom ub_write that either buffers output or streams it as framed
 /// `BodyChunk` messages, depending on whether streaming mode is active.
 ///
@@ -142,14 +194,18 @@ unsafe extern "C" fn turbine_ub_write(str: *const c_char, str_length: size_t) ->
     let slice = std::slice::from_raw_parts(str as *const u8, str_length);
 
     let fd = STREAM_FD.with(|f| f.get());
-    if fd >= 0 {
-        // Streaming mode — emit Headers on first write, then BodyChunk.
-        let already_sent = STREAM_HEADERS_SENT.with(|f| f.replace(true));
-        if !already_sent {
-            emit_headers_frame(fd);
-        }
+    let engaged = STREAM_ENGAGED.with(|f| f.get());
+    if engaged {
+        // Already streaming — emit a BodyChunk directly.
         emit_body_chunk_frame(fd, slice);
         trace!(bytes = str_length, "Streamed PHP output chunk");
+    } else if fd >= 0 && headers_request_streaming() {
+        // First write on an armed fd with an opt-in header present →
+        // engage streaming (emits Headers + any already-buffered bytes),
+        // then emit this chunk.
+        engage_streaming();
+        emit_body_chunk_frame(fd, slice);
+        trace!(bytes = str_length, "Streamed PHP output chunk (opt-in)");
     } else {
         OUTPUT_BUFFER.with(|buf| {
             buf.borrow_mut().extend_from_slice(slice);
@@ -157,6 +213,21 @@ unsafe extern "C" fn turbine_ub_write(str: *const c_char, str_length: size_t) ->
         trace!(bytes = str_length, "Captured PHP output");
     }
     str_length
+}
+
+/// Custom `sapi_module.flush` handler. PHP's `flush()` builtin calls this
+/// (via `sapi_flush`) to indicate the script wants bytes shipped to the
+/// client *now*. We treat this as an explicit opt-in to streaming mode
+/// even if no SSE/X-Accel-Buffering header was set.
+///
+/// # Safety
+/// Called from PHP engine via C function pointer.
+unsafe extern "C" fn turbine_sapi_flush(_server_context: *mut c_void) {
+    let fd = STREAM_FD.with(|f| f.get());
+    if fd < 0 {
+        return;
+    }
+    engage_streaming();
 }
 
 /// SAPI header_handler operation constants (from PHP sapi.h).
@@ -254,59 +325,61 @@ pub unsafe fn install_output_capture() {
     ORIGINAL_UB_WRITE = sapi_module.ub_write;
     sapi_module.ub_write = Some(turbine_ub_write);
     sapi_module.header_handler = Some(turbine_header_handler);
+    sapi_module.flush = Some(turbine_sapi_flush);
 }
 
 // ── Streaming API ───────────────────────────────────────────────────────────
+//
+// Opt-in streaming. Usage model:
+//
+//   1. Worker calls `arm_streaming(resp_fd)` before executing PHP. This
+//      installs an fd but does NOT start emitting frames yet — output goes
+//      into `OUTPUT_BUFFER` just like pure buffered mode.
+//   2. If PHP opts in (via `flush()` or an SSE/`X-Accel-Buffering: no`
+//      header), `turbine_ub_write` / `turbine_sapi_flush` engage
+//      streaming: emit a `Headers` frame, flush any already-buffered
+//      bytes as a `BodyChunk`, and send subsequent chunks directly.
+//   3. After PHP finishes, worker calls `finish_streaming()` which returns
+//      `(was_engaged, fd)`. If `was_engaged`, the worker only writes the
+//      terminal `End` frame. Otherwise the worker sends a single
+//      coalesced `write(2)` of Headers + BodyChunk + End (classic
+//      buffered path, ~1 syscall per short response).
 
-/// Enable streaming mode for the current request. All subsequent
-/// `turbine_ub_write` calls (i.e. every `echo`/`print`/output-buffer flush)
-/// will emit `BodyChunk` frames directly to `fd` instead of accumulating
-/// into `OUTPUT_BUFFER`.
+/// Arm the response-pipe fd for potential streaming, without engaging it.
 ///
-/// The `Headers` frame is emitted lazily on the first `ub_write` call (or
-/// explicitly via `flush_headers_if_needed`) so PHP has a chance to finish
-/// setting `Content-Type` / `Status` / `Location` / etc.
+/// Streaming engages later on explicit opt-in (SSE header, `flush()`, or
+/// `X-Accel-Buffering: no`). Until then output is buffered normally so a
+/// typical short response ships in a single `write(2)`.
 ///
 /// Must be paired with `finish_streaming`.
-pub fn start_streaming(fd: RawFd) {
+pub fn arm_streaming(fd: RawFd) {
     STREAM_FD.with(|f| f.set(fd));
-    STREAM_HEADERS_SENT.with(|f| f.set(false));
+    STREAM_ENGAGED.with(|f| f.set(false));
     // Don't clear HEADER_BUFFER / RESPONSE_CODE here — the worker's normal
     // per-request reset (`clear_output_buffer`) owns that.
 }
 
-/// Force-emit the `Headers` frame if the script hasn't produced any output
-/// yet. Called by the worker at the end of the request to guarantee that
-/// even empty responses (204 No Content, pure header redirects, etc.)
-/// emit a `Headers` frame before the terminal `End` frame.
-///
-/// Returns `true` if a `Headers` frame was emitted by this call.
+/// Kept for source compatibility; under the opt-in model
+/// `engage_streaming()` always emits Headers synchronously so there is
+/// nothing to flush later. Always returns `false`.
 pub fn flush_headers_if_needed() -> bool {
-    let fd = STREAM_FD.with(|f| f.get());
-    if fd < 0 {
-        return false;
-    }
-    let already_sent = STREAM_HEADERS_SENT.with(|f| f.replace(true));
-    if already_sent {
-        return false;
-    }
-    emit_headers_frame(fd);
-    true
+    false
 }
 
-/// Disable streaming mode. Returns the fd previously installed (or -1 if
-/// streaming was not active). Does not emit the terminal `End` frame — the
-/// caller owns the response pipe and is responsible for finishing the
-/// response frame sequence.
-pub fn finish_streaming() -> RawFd {
-    let prev = STREAM_FD.with(|f| f.replace(-1));
-    STREAM_HEADERS_SENT.with(|f| f.set(false));
-    prev
+/// Disarm the streaming fd and report whether streaming actually engaged.
+///
+/// Returns `(was_engaged, fd)` where `fd` is the previously-armed fd
+/// (or `-1` if none). Does not emit the terminal `End` frame — the caller
+/// owns the response pipe and is responsible for finishing the response.
+pub fn finish_streaming() -> (bool, RawFd) {
+    let fd = STREAM_FD.with(|f| f.replace(-1));
+    let engaged = STREAM_ENGAGED.with(|f| f.replace(false));
+    (engaged, fd)
 }
 
-/// Check whether streaming mode is currently active.
+/// Check whether streaming has engaged in the current request.
 pub fn is_streaming() -> bool {
-    STREAM_FD.with(|f| f.get()) >= 0
+    STREAM_ENGAGED.with(|f| f.get())
 }
 
 /// Clear the output buffer and header buffer. Call before executing each request.
@@ -528,6 +601,50 @@ mod tests {
         assert_eq!(output.len(), 256);
         assert_eq!(output[0], 0);
         assert_eq!(output[255], 255);
+    }
+
+    // ── Opt-in streaming detection ──────────────────────────────────
+
+    #[test]
+    fn headers_request_streaming_matches_sse() {
+        clear_output_buffer();
+        HEADER_BUFFER.with(|buf| {
+            buf.borrow_mut().push((
+                "Content-Type".to_string(),
+                "text/event-stream; charset=utf-8".to_string(),
+            ));
+        });
+        assert!(headers_request_streaming());
+    }
+
+    #[test]
+    fn headers_request_streaming_matches_x_accel() {
+        clear_output_buffer();
+        HEADER_BUFFER.with(|buf| {
+            buf.borrow_mut()
+                .push(("X-Accel-Buffering".to_string(), "no".to_string()));
+        });
+        assert!(headers_request_streaming());
+    }
+
+    #[test]
+    fn headers_request_streaming_ignores_plain_content_type() {
+        clear_output_buffer();
+        HEADER_BUFFER.with(|buf| {
+            buf.borrow_mut()
+                .push(("Content-Type".to_string(), "application/json".to_string()));
+        });
+        assert!(!headers_request_streaming());
+    }
+
+    #[test]
+    fn arm_streaming_does_not_engage() {
+        clear_output_buffer();
+        arm_streaming(999);
+        assert!(!is_streaming());
+        let (engaged, fd) = finish_streaming();
+        assert!(!engaged);
+        assert_eq!(fd, 999);
     }
 
     // ── turbine_header_handler callback ─────────────────────────────

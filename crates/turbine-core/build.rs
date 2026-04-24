@@ -1,8 +1,32 @@
 use std::env;
 use std::path::Path;
+use std::process::Command;
 
 fn main() {
     let out_dir = env::var("OUT_DIR").unwrap();
+
+    // Bake rpath into the binary so dyld finds libphp.dylib at runtime.
+    // We do this here (in the binary crate's build.rs) rather than in
+    // turbine-php-sys's build.rs because `cargo:rustc-link-arg` from a
+    // build script only affects its own crate. Since turbine-php-sys is
+    // a library, emitting link args there never reaches this binary.
+    //
+    // The rpath is derived from PHP_CONFIG so nts/zts builds bake
+    // different rpaths into their respective binaries. This is what
+    // actually lets ZTS builds find the ZTS libphp at runtime.
+    let php_config = env::var("PHP_CONFIG").unwrap_or_else(|_| "php-config".to_string());
+    println!("cargo:rerun-if-env-changed=PHP_CONFIG");
+    if let Ok(output) = Command::new(&php_config).arg("--prefix").output() {
+        if output.status.success() {
+            if let Ok(prefix) = String::from_utf8(output.stdout) {
+                let prefix = prefix.trim();
+                if !prefix.is_empty() {
+                    let lib_dir = format!("{prefix}/lib");
+                    println!("cargo:rustc-link-arg=-Wl,-rpath,{lib_dir}");
+                }
+            }
+        }
+    }
 
     // Only pack embedded app when the `embed` feature is active
     #[cfg(feature = "embed")]

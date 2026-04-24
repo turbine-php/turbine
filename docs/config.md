@@ -149,8 +149,9 @@ block_url_include = true
 block_url_fopen = true
 
 [cache]
-# Enable in-memory response cache
-enabled = true
+# In-memory response cache. Disabled by default — opt in per app.
+# Only safe for pages that are truly cacheable (GET, no per-user data).
+enabled = false
 # Cache TTL in seconds
 ttl_seconds = 30
 # Maximum cached responses

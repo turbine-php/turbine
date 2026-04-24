@@ -93,7 +93,9 @@ extern "C" {
         post_body_len: usize,
         header_count: c_int,
         header_keys: *const *const c_char,
+        header_key_lens: *const usize,
         header_vals: *const *const c_char,
+        header_val_lens: *const usize,
     );
 
     /// Execute a PHP script using the standard Zend Engine path (OPcache enabled).

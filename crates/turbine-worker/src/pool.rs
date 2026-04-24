@@ -1012,21 +1012,19 @@ pub fn worker_event_loop_native(cmd_fd: RawFd, resp_fd: RawFd) {
                 let c_pathinfo = safe_cstring(req.path_info.as_bytes());
                 let c_scriptname = safe_cstring(req.script_name.as_bytes());
 
-                // Build header key/value CStrings
-                let c_keys: Vec<std::ffi::CString> = req
+                // Headers as raw (ptr, len) — no per-request CString allocation.
+                let key_ptrs: Vec<*const std::ffi::c_char> = req
                     .headers
                     .iter()
-                    .map(|(k, _)| safe_cstring(k.as_bytes()))
+                    .map(|(k, _)| k.as_ptr() as *const std::ffi::c_char)
                     .collect();
-                let c_vals: Vec<std::ffi::CString> = req
+                let key_lens: Vec<usize> = req.headers.iter().map(|(k, _)| k.len()).collect();
+                let val_ptrs: Vec<*const std::ffi::c_char> = req
                     .headers
                     .iter()
-                    .map(|(_, v)| safe_cstring(v.as_bytes()))
+                    .map(|(_, v)| v.as_ptr() as *const std::ffi::c_char)
                     .collect();
-                let key_ptrs: Vec<*const std::ffi::c_char> =
-                    c_keys.iter().map(|k| k.as_ptr()).collect();
-                let val_ptrs: Vec<*const std::ffi::c_char> =
-                    c_vals.iter().map(|v| v.as_ptr()).collect();
+                let val_lens: Vec<usize> = req.headers.iter().map(|(_, v)| v.len()).collect();
 
                 let content_length: libc::c_long = if req.body.is_empty() {
                     -1
@@ -1071,10 +1069,20 @@ pub fn worker_event_loop_native(cmd_fd: RawFd, resp_fd: RawFd) {
                         } else {
                             key_ptrs.as_ptr()
                         },
+                        if key_lens.is_empty() {
+                            std::ptr::null()
+                        } else {
+                            key_lens.as_ptr()
+                        },
                         if val_ptrs.is_empty() {
                             std::ptr::null()
                         } else {
                             val_ptrs.as_ptr()
+                        },
+                        if val_lens.is_empty() {
+                            std::ptr::null()
+                        } else {
+                            val_lens.as_ptr()
                         },
                     );
 
@@ -1218,20 +1226,19 @@ pub fn worker_event_loop_channel(
             let c_pathinfo = safe_cstring(req.path_info.as_bytes());
             let c_scriptname = safe_cstring(req.script_name.as_bytes());
 
-            let c_keys: Vec<std::ffi::CString> = req
+            // Headers as raw (ptr, len) — no per-request CString allocation.
+            let key_ptrs: Vec<*const std::ffi::c_char> = req
                 .headers
                 .iter()
-                .map(|(k, _)| safe_cstring(k.as_bytes()))
+                .map(|(k, _)| k.as_ptr() as *const std::ffi::c_char)
                 .collect();
-            let c_vals: Vec<std::ffi::CString> = req
+            let key_lens: Vec<usize> = req.headers.iter().map(|(k, _)| k.len()).collect();
+            let val_ptrs: Vec<*const std::ffi::c_char> = req
                 .headers
                 .iter()
-                .map(|(_, v)| safe_cstring(v.as_bytes()))
+                .map(|(_, v)| v.as_ptr() as *const std::ffi::c_char)
                 .collect();
-            let key_ptrs: Vec<*const std::ffi::c_char> =
-                c_keys.iter().map(|k| k.as_ptr()).collect();
-            let val_ptrs: Vec<*const std::ffi::c_char> =
-                c_vals.iter().map(|v| v.as_ptr()).collect();
+            let val_lens: Vec<usize> = req.headers.iter().map(|(_, v)| v.len()).collect();
 
             let content_length: libc::c_long = if req.body.is_empty() {
                 -1
@@ -1275,10 +1282,20 @@ pub fn worker_event_loop_channel(
                     } else {
                         key_ptrs.as_ptr()
                     },
+                    if key_lens.is_empty() {
+                        std::ptr::null()
+                    } else {
+                        key_lens.as_ptr()
+                    },
                     if val_ptrs.is_empty() {
                         std::ptr::null()
                     } else {
                         val_ptrs.as_ptr()
+                    },
+                    if val_lens.is_empty() {
+                        std::ptr::null()
+                    } else {
+                        val_lens.as_ptr()
                     },
                 );
 

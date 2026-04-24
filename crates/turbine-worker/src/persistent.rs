@@ -734,18 +734,22 @@ pub fn worker_event_loop_persistent(
         let c_pathinfo = safe_cstring(req.path_info.as_bytes());
         let c_scriptname = safe_cstring(req.script_name.as_bytes());
 
-        let c_keys: Vec<std::ffi::CString> = req
+        // Headers are passed as raw (ptr, len) arrays — no per-request
+        // CString allocation. The underlying String data lives in
+        // `req.headers` for the duration of this scope, which covers the
+        // entire execute + shutdown window.
+        let key_ptrs: Vec<*const std::ffi::c_char> = req
             .headers
             .iter()
-            .map(|(k, _)| safe_cstring(k.as_bytes()))
+            .map(|(k, _)| k.as_ptr() as *const std::ffi::c_char)
             .collect();
-        let c_vals: Vec<std::ffi::CString> = req
+        let key_lens: Vec<usize> = req.headers.iter().map(|(k, _)| k.len()).collect();
+        let val_ptrs: Vec<*const std::ffi::c_char> = req
             .headers
             .iter()
-            .map(|(_, v)| safe_cstring(v.as_bytes()))
+            .map(|(_, v)| v.as_ptr() as *const std::ffi::c_char)
             .collect();
-        let key_ptrs: Vec<*const std::ffi::c_char> = c_keys.iter().map(|k| k.as_ptr()).collect();
-        let val_ptrs: Vec<*const std::ffi::c_char> = c_vals.iter().map(|v| v.as_ptr()).collect();
+        let val_lens: Vec<usize> = req.headers.iter().map(|(_, v)| v.len()).collect();
 
         let content_length: libc::c_long = if req.body.is_empty() {
             -1
@@ -790,24 +794,38 @@ pub fn worker_event_loop_persistent(
                 } else {
                     key_ptrs.as_ptr()
                 },
+                if key_lens.is_empty() {
+                    std::ptr::null()
+                } else {
+                    key_lens.as_ptr()
+                },
                 if val_ptrs.is_empty() {
                     std::ptr::null()
                 } else {
                     val_ptrs.as_ptr()
                 },
+                if val_lens.is_empty() {
+                    std::ptr::null()
+                } else {
+                    val_lens.as_ptr()
+                },
             );
 
-            let (result, body, headers, status) = if lightweight {
+            let (result, body, headers, status, streamed) = if lightweight {
                 // ── Lightweight path: execute worker_handler directly via OPcache ──
                 turbine_php_sys::turbine_worker_request_startup();
 
                 output::install_output_capture();
                 output::clear_output_buffer();
-                // Stream PHP output (echo / flush) directly to the response
-                // pipe as BodyChunk frames instead of buffering until end
-                // of request. Headers are emitted lazily on the first
-                // `ub_write` call (or by `flush_headers_if_needed` at end).
-                output::start_streaming(resp_fd);
+                // Arm streaming: the response pipe fd is stashed but no
+                // frames are emitted yet. Output keeps going into the
+                // buffer so typical short responses can be coalesced
+                // into a single write(2) of Headers+BodyChunk+End at
+                // request end. Streaming only engages on explicit
+                // opt-in: PHP calls `flush()`, or sets an
+                // `X-Accel-Buffering: no` / `Content-Type:
+                // text/event-stream` header.
+                output::arm_streaming(resp_fd);
 
                 // Use turbine_execute_script (php_execute_script) so the handler
                 // goes straight through OPcache without being re-parsed every
@@ -849,30 +867,26 @@ pub fn worker_event_loop_persistent(
                 // bodies for large payloads under ZTS persistent mode).
                 turbine_php_sys::turbine_worker_request_shutdown();
 
-                // Make sure a `Headers` frame has been emitted (covers empty
-                // bodies / early returns), then leave streaming mode.
-                output::flush_headers_if_needed();
-                output::finish_streaming();
+                // Disarm streaming and note whether it engaged.
+                let (streamed, _fd) = output::finish_streaming();
 
-                // Any bytes that landed in the buffered OUTPUT_BUFFER would
-                // indicate a logic bug — streaming mode bypasses it — but
-                // we still drain it for safety so the next request starts
-                // clean. `headers` / `status` are unused for the streaming
-                // path (emitted directly in the `Headers` frame) but we
-                // return them for compatibility with the non-streaming
-                // signature of this match arm.
+                // If streaming engaged, OUTPUT_BUFFER is already empty
+                // (flushed at engagement) and HEADER_BUFFER was drained
+                // by the `Headers` frame — so `b`/`h`/`s` will be empty.
+                // Otherwise these carry the full response, to be
+                // coalesced into one write below.
                 let b = output::take_output();
                 let h = output::take_headers();
                 let s = output::take_response_code();
 
-                (r, b, h, s)
+                (r, b, h, s, streamed)
             } else {
                 // ── Full lifecycle path (original behaviour) ────────
                 turbine_php_sys::php_request_startup();
 
                 output::install_output_capture();
                 output::clear_output_buffer();
-                output::start_streaming(resp_fd);
+                output::arm_streaming(resp_fd);
 
                 let r = turbine_php_sys::turbine_execute_script(c_script.as_ptr());
 
@@ -904,35 +918,52 @@ pub fn worker_event_loop_persistent(
                 // CRITICAL: shutdown before take_output — see lightweight path.
                 turbine_php_sys::php_request_shutdown(std::ptr::null_mut());
 
-                output::flush_headers_if_needed();
-                output::finish_streaming();
+                let (streamed, _fd) = output::finish_streaming();
 
                 let b = output::take_output();
                 let h = output::take_headers();
                 let s = output::take_response_code();
 
-                (r, b, h, s)
+                (r, b, h, s, streamed)
             };
 
             let ok = result == turbine_php_sys::SUCCESS;
 
-            // Streaming path: `Headers` + `BodyChunk`s have already been
-            // emitted to `resp_fd` by `turbine_ub_write`. All that remains
-            // is the terminal `End` frame. If any stray bytes landed in
-            // the buffered `OUTPUT_BUFFER` (should not happen in normal
-            // flow but we defend against unseen edge cases), ship them as
-            // one last chunk before closing the frame sequence.
-            let write_result = if body.is_empty() {
-                let _ = (headers, status); // intentionally unused on streaming path
-                write_stream_end(resp_fd, ok)
+            // Two paths based on whether PHP opted in to streaming:
+            //
+            // * `streamed == true`  → `Headers` + `BodyChunk` frames have
+            //   already hit the wire during script execution. All that
+            //   remains is the terminal `End` frame. Any stray bytes in
+            //   `body` would indicate a logic bug (we flushed at
+            //   engagement time) but we defensively ship them as one
+            //   last chunk.
+            //
+            // * `streamed == false` → classic buffered path. Coalesce
+            //   Headers + BodyChunk + End into a single `write(2)` so
+            //   short responses cost one syscall (plus the PHP-side
+            //   `ub_write` append into OUTPUT_BUFFER, which is a memcpy).
+            let write_result = if streamed {
+                if body.is_empty() {
+                    let _ = (&headers, status);
+                    write_stream_end(resp_fd, ok)
+                } else {
+                    warn!(
+                        pid = std::process::id(),
+                        bytes = body.len(),
+                        "Non-empty buffered output on streaming path — flushing as final chunk"
+                    );
+                    let mut buf = Vec::with_capacity(8 + body.len());
+                    crate::stream::encode_body_chunk(&mut buf, &body);
+                    crate::stream::encode_end(&mut buf, ok);
+                    write_all_fd(resp_fd, &buf)
+                }
             } else {
-                warn!(
-                    pid = std::process::id(),
-                    bytes = body.len(),
-                    "Non-empty buffered output on streaming path — flushing as final chunk"
-                );
-                let mut buf = Vec::with_capacity(8 + body.len());
-                crate::stream::encode_body_chunk(&mut buf, &body);
+                // Buffered fast path: one write for the whole response.
+                let mut buf = Vec::with_capacity(32 + headers.len() * 32 + body.len() + 8);
+                crate::stream::encode_headers(&mut buf, status, &headers);
+                if !body.is_empty() {
+                    crate::stream::encode_body_chunk(&mut buf, &body);
+                }
                 crate::stream::encode_end(&mut buf, ok);
                 write_all_fd(resp_fd, &buf)
             };

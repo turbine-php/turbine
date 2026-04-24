@@ -64,3 +64,12 @@ mimalloc = { version = "0.1", default-features = false }
 instant-acme = "0.7"
 rcgen = "0.13"
 pem = "3"
+
+# Profiling build: release optimizations + debug symbols so samply/perf
+# can resolve function names and line numbers. Use with:
+#   cargo build --profile profiling
+#   samply record ./target/profiling/turbine ...
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"
+strip = false

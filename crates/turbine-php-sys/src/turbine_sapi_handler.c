@@ -46,7 +46,9 @@ static _Thread_local const char *turbine_cookie_data = NULL;
 #define TURBINE_MAX_HEADERS 128
 
 static _Thread_local const char *turbine_header_keys[TURBINE_MAX_HEADERS];
+static _Thread_local size_t      turbine_header_key_lens[TURBINE_MAX_HEADERS];
 static _Thread_local const char *turbine_header_vals[TURBINE_MAX_HEADERS];
+static _Thread_local size_t      turbine_header_val_lens[TURBINE_MAX_HEADERS];
 static _Thread_local int         turbine_header_count = 0;
 
 /* Extra server variables */
@@ -89,11 +91,11 @@ static char *turbine_sapi_read_cookies(void) {
 /**
  * Convert a header name to HTTP_UPPER_CASE format.
  * "Content-Type" → "HTTP_CONTENT_TYPE"
- * Buffer must be at least 5 + strlen(name) + 1 bytes.
+ * Buffer must be at least 5 + name_len + 1 bytes. `name` does not need
+ * to be null-terminated; `name_len` is used directly.
  */
-static void header_to_server_key(const char *name, char *buf, size_t buf_size) {
+static void header_to_server_key(const char *name, size_t name_len, char *buf, size_t buf_size) {
     size_t prefix_len = 5; /* "HTTP_" */
-    size_t name_len = strlen(name);
     if (prefix_len + name_len >= buf_size) {
         name_len = buf_size - prefix_len - 1;
     }
@@ -199,16 +201,18 @@ static void turbine_sapi_register_variables(zval *track_vars_array) {
     /* HTTP headers → HTTP_UPPER_CASE */
     char key_buf[256];
     for (int i = 0; i < turbine_header_count; i++) {
-        if (!turbine_header_keys[i] || !turbine_header_vals[i]) continue;
+        const char *name_ptr = turbine_header_keys[i];
+        const char *val_ptr  = turbine_header_vals[i];
+        size_t name_len      = turbine_header_key_lens[i];
+        size_t val_len       = turbine_header_val_lens[i];
+        if (!name_ptr || !val_ptr || name_len == 0) continue;
 
         /* Content-Type and Content-Length are already set above (without HTTP_ prefix) */
-        if (strcasecmp(turbine_header_keys[i], "Content-Type") == 0) continue;
-        if (strcasecmp(turbine_header_keys[i], "Content-Length") == 0) continue;
+        if (name_len == 12 && strncasecmp(name_ptr, "Content-Type", 12) == 0) continue;
+        if (name_len == 14 && strncasecmp(name_ptr, "Content-Length", 14) == 0) continue;
 
-        header_to_server_key(turbine_header_keys[i], key_buf, sizeof(key_buf));
-        php_register_variable_safe(key_buf,
-            (char *)turbine_header_vals[i],
-            strlen(turbine_header_vals[i]), track_vars_array);
+        header_to_server_key(name_ptr, name_len, key_buf, sizeof(key_buf));
+        php_register_variable_safe(key_buf, (char *)val_ptr, val_len, track_vars_array);
     }
 }
 
@@ -252,10 +256,13 @@ void turbine_sapi_set_request(
     /* POST body */
     const char *post_body,
     size_t      post_body_len,
-    /* Headers */
+    /* Headers — values carry explicit lengths so Rust does not need to
+       allocate null-terminated CStrings per header. */
     int         header_count,
     const char **header_keys,
-    const char **header_vals
+    const size_t *header_key_lens,
+    const char **header_vals,
+    const size_t *header_val_lens
 ) {
     /* Populate SG(request_info) — PHP reads this during request_startup */
     SG(request_info).request_method  = method;
@@ -287,8 +294,10 @@ void turbine_sapi_set_request(
     turbine_header_count = (header_count > TURBINE_MAX_HEADERS)
                            ? TURBINE_MAX_HEADERS : header_count;
     for (int i = 0; i < turbine_header_count; i++) {
-        turbine_header_keys[i] = header_keys[i];
-        turbine_header_vals[i] = header_vals[i];
+        turbine_header_keys[i]     = header_keys[i];
+        turbine_header_key_lens[i] = header_key_lens ? header_key_lens[i] : 0;
+        turbine_header_vals[i]     = header_vals[i];
+        turbine_header_val_lens[i] = header_val_lens ? header_val_lens[i] : 0;
     }
 
     /* Reset SAPI state for new request */

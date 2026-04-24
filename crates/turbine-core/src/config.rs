@@ -313,7 +313,7 @@ pub struct LoggingConfig {
 
 #[derive(Debug, Deserialize)]
 pub struct CacheTomlConfig {
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub enabled: bool,
     #[serde(default = "default_cache_ttl")]
     pub ttl_seconds: u64,
@@ -1017,7 +1017,7 @@ impl Default for LoggingConfig {
 impl Default for CacheTomlConfig {
     fn default() -> Self {
         CacheTomlConfig {
-            enabled: true,
+            enabled: false,
             ttl_seconds: default_cache_ttl(),
             max_entries: default_cache_max_entries(),
         }
@@ -1800,7 +1800,7 @@ max_entries = 2048
     #[test]
     fn parse_cache_defaults() {
         let config: RuntimeConfig = toml::from_str("").unwrap();
-        assert!(config.cache.enabled);
+        assert!(!config.cache.enabled);
         assert_eq!(config.cache.ttl_seconds, 30);
         assert_eq!(config.cache.max_entries, 1024);
     }
@@ -2055,7 +2055,7 @@ enabled = false
         assert_eq!(config.server.worker_mode, "process");
         assert!(config.server.persistent_workers.is_none());
         assert!(config.security.enabled);
-        assert!(config.cache.enabled);
+        assert!(!config.cache.enabled);
         assert!(config.compression.enabled);
         assert!(!config.cors.enabled);
         assert!(!config.watcher.enabled);
