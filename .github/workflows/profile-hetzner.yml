@@ -146,7 +146,7 @@ jobs:
           # samply (prebuilt static musl binary — no Rust toolchain needed)
           SAMPLY_VERSION="0.13.1"
           curl -fsSL -o /tmp/samply.tar.xz \
-            "https://github.com/mstange/samply/releases/download/samply-v${SAMPLY_VERSION}/samply-v${SAMPLY_VERSION}-x86_64-unknown-linux-musl.tar.xz"
+            "https://github.com/mstange/samply/releases/download/samply-v${SAMPLY_VERSION}/samply-x86_64-unknown-linux-musl.tar.xz"
           tar -C /tmp -xf /tmp/samply.tar.xz
           install -m 0755 "$(find /tmp -name samply -type f | head -1)" /usr/local/bin/samply
           samply --version
