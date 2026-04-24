@@ -1218,7 +1218,21 @@ fn cmd_serve(
     // PHP handles database connections natively via PDO.
 
     let listen = config.server.listen.clone();
-    let worker_count = config.server.workers;
+    // `workers = 0` in TOML means "auto-detect" per our documented
+    // convention (and what most server tooling does, e.g. nginx
+    // `worker_processes auto`). Resolve it to CPU count here so the
+    // rest of the code can treat it as a concrete worker count and
+    // never falls into the fragile single-process fallback for users
+    // who copy-pasted an example config.
+    let worker_count = if config.server.workers == 0 {
+        let n = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        info!(cpus = n, "workers = 0 → auto-detected worker count");
+        n
+    } else {
+        config.server.workers
+    };
 
     // --- Upload Security (Camada 4: Fortress) ---
     let upload_security = compat::UploadSecurityConfig {

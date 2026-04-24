@@ -53,6 +53,10 @@ pub struct RuntimeConfig {
 
 #[derive(Debug, Deserialize)]
 pub struct ServerConfig {
+    /// Number of PHP workers.
+    ///
+    /// Set to `0` to auto-detect (uses the number of logical CPUs).
+    /// Any positive value uses that exact worker count.
     #[serde(default = "default_workers")]
     pub workers: usize,
     #[serde(default = "default_listen")]
@@ -1175,10 +1179,6 @@ impl RuntimeConfig {
         }
 
         // ── Warnings ────────────────────────────────────────────────
-
-        if self.server.workers == 0 && self.server.request_timeout == 0 {
-            warnings.push("[server] workers = 0 + request_timeout = 0 — a slow request will block ALL subsequent requests".to_string());
-        }
 
         if self.security.enabled
             && !self.security.sql_guard
