@@ -223,8 +223,12 @@ jobs:
           WM="process"
           [[ "$MODE" == "zts" ]] && WM="thread"
 
+          # Write directly into the app dir — the image entrypoint looks for
+          # \${APP_ROOT}/turbine.toml first. We can't bind-mount the config onto
+          # a :ro volume (runc cannot create the mountpoint file), so placing
+          # the config inside the app dir before mounting is the simplest path.
           ssh -o StrictHostKeyChecking=no -i /tmp/bench_key "root@${IP}" \
-            "cat > /root/prof/etc/turbine.toml" << TOML
+            "cat > /root/prof/app/turbine.toml" << TOML
           [server]
           listen = "0.0.0.0:80"
           workers = ${WORKERS}
@@ -259,16 +263,14 @@ jobs:
           set -euo pipefail
           docker rm -f turbine-prof >/dev/null 2>&1 || true
           # --pid=host so the binary PID is visible on the host for samply.
-          # --cap-add=SYS_ADMIN is not required; samply runs on the host.
-          # The image's entrypoint already runs `turbine serve -c <cfg> -r <root>`
-          # and picks up \${APP_ROOT}/turbine.toml when present, so we just mount
-          # the config there and pass no CMD (passing `serve …` would cause
-          # "unexpected argument 'serve' found" because entrypoint appends "$@").
+          # samply runs on the host, so no container caps are required.
+          # The image entrypoint already invokes turbine serve with the right
+          # flags and picks up APP_ROOT/turbine.toml when present, so we just
+          # place the config inside the app dir and pass no CMD override.
           docker run -d --name turbine-prof \
               --pid=host \
               -p 8080:80 \
               -v /root/prof/app:/var/www/html:ro \
-              -v /root/prof/etc/turbine.toml:/var/www/html/turbine.toml:ro \
               "${IMG}"
 
           # Wait for HTTP 200
