@@ -64,9 +64,11 @@ fn main() {
     for flag in &include_flags {
         c_build.flag(flag);
     }
-    // Suppress PHP internal header warnings that are not our concern
+    // Suppress PHP internal header warnings that are not our concern.
+    // These originate from <php/Zend/*> and we can't fix them upstream from here.
     c_build
         .flag("-Wno-unused-function")
+        .flag("-Wno-unused-parameter")
         .flag("-Wno-deprecated-declarations");
     c_build.compile("turbine_worker_lifecycle");
     println!("cargo:rerun-if-changed=src/turbine_worker_lifecycle.c");
