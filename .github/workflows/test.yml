@@ -12,8 +12,12 @@ env:
 
 jobs:
   test:
-    name: cargo test (PHP 8.4 NTS)
+    name: cargo test (PHP 8.4 ${{ matrix.mode == 'zts' && 'ZTS' || 'NTS' }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [nts, zts]
 
     steps:
       - uses: actions/checkout@v4
@@ -35,17 +39,25 @@ jobs:
         id: cache-php
         uses: actions/cache@v4
         with:
-          path: /opt/php-embed
-          key: php-embed-${{ env.PHP_VERSION }}-nts-${{ runner.os }}-${{ hashFiles('crates/turbine-php-sys/build.rs') }}
+          path: /opt/php-embed-${{ matrix.mode }}
+          key: php-embed-${{ env.PHP_VERSION }}-${{ matrix.mode }}-${{ runner.os }}-${{ hashFiles('crates/turbine-php-sys/build.rs') }}
 
-      - name: Build PHP embed SAPI
+      - name: Build PHP embed SAPI (${{ matrix.mode }})
         if: steps.cache-php.outputs.cache-hit != 'true'
+        env:
+          MODE: ${{ matrix.mode }}
         run: |
           curl -fSL "https://www.php.net/distributions/php-${PHP_VERSION}.tar.xz" -o php.tar.xz
           tar xf php.tar.xz
           cd php-${PHP_VERSION}
+
+          ZTS_FLAG=""
+          if [[ "$MODE" == "zts" ]]; then
+            ZTS_FLAG="--enable-zts"
+          fi
+
           ./configure \
-            --prefix=/opt/php-embed \
+            --prefix=/opt/php-embed-${MODE} \
             --enable-embed=shared \
             --enable-opcache \
             --enable-mbstring \
@@ -53,6 +65,7 @@ jobs:
             --enable-bcmath \
             --enable-sockets \
             --enable-pcntl \
+            ${ZTS_FLAG} \
             --with-openssl \
             --with-zlib \
             --with-curl \
@@ -65,7 +78,7 @@ jobs:
             --with-sodium \
             --with-gmp \
             --with-ffi \
-            --with-config-file-path=/opt/php-embed/etc \
+            --with-config-file-path=/opt/php-embed-${MODE}/etc \
             --disable-cgi \
             --disable-phpdbg
           make -j"$(nproc)"
@@ -78,20 +91,22 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target/
-          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-
+          key: cargo-${{ runner.os }}-${{ matrix.mode }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-${{ matrix.mode }}-
 
       - name: Run tests
         env:
-          PHP_CONFIG: /opt/php-embed/bin/php-config
-          LD_LIBRARY_PATH: /opt/php-embed/lib
+          PHP_CONFIG: /opt/php-embed-${{ matrix.mode }}/bin/php-config
+          LD_LIBRARY_PATH: /opt/php-embed-${{ matrix.mode }}/lib
         run: cargo test --workspace --verbose
 
+      # Formatting doesn't depend on PHP build — run once on NTS.
       - name: Check formatting
+        if: matrix.mode == 'nts'
         run: cargo fmt --all -- --check
 
       - name: Clippy
         env:
-          PHP_CONFIG: /opt/php-embed/bin/php-config
-          LD_LIBRARY_PATH: /opt/php-embed/lib
+          PHP_CONFIG: /opt/php-embed-${{ matrix.mode }}/bin/php-config
+          LD_LIBRARY_PATH: /opt/php-embed-${{ matrix.mode }}/lib
         run: cargo clippy --workspace -- -D warnings
