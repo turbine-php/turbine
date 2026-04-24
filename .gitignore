@@ -14,3 +14,4 @@ Cargo.lock
 /examples/wordpress/public
 # Benchmark scripts' python cache
 benchmarks/scripts/__pycache__/
+profile-out/
