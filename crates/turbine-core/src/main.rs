@@ -3297,7 +3297,17 @@ async fn handle_request_inner(
             // AsyncFd-based read: no spawn_blocking thread consumed.
             let bin_result: std::io::Result<_> =
                 match turbine_worker::async_io::AsyncPipe::new(resp_fd) {
-                    Ok(mut pipe) => turbine_worker::decode_response_async(&mut pipe).await,
+                    Ok(mut pipe) => {
+                        let res = turbine_worker::decode_response_async(&mut pipe).await;
+                        // Explicit drop BEFORE releasing the worker slot:
+                        // deregister the fd from the tokio reactor
+                        // (epoll_ctl EPOLL_CTL_DEL) so a follow-up request
+                        // that claims the same worker_idx and calls
+                        // `AsyncPipe::new(same_fd)` won't hit `EEXIST` from
+                        // the stale registration.
+                        drop(pipe);
+                        res
+                    }
                     Err(e) => Err(e),
                 };
             // If decode failed, tag the worker unhealthy before releasing
@@ -4144,9 +4154,16 @@ async fn handle_request_inner(
                 }
             };
 
-            let head_result = turbine_worker::stream::consume_streaming(pipe).await;
-            let mut head = match head_result {
-                Ok(h) => h,
+            // Peek only the leading `Headers` frame so we can decide
+            // between true streaming (spawn forwarder + mpsc) and the
+            // buffered fast path (drain inline, no spawn). Going through
+            // `consume_streaming` unconditionally used to add a
+            // `tokio::spawn + mpsc::channel(64) + extend_from_slice`
+            // round-trip for every response — dominant overhead for
+            // large buffered bodies (50 KB binary), which is issue #19.
+            let head_result = turbine_worker::stream::read_response_head(pipe).await;
+            let (status, headers, mut pipe) = match head_result {
+                Ok(t) => t,
                 Err(e) => {
                     error!(worker = worker_idx_log, error = %e, "Failed to read response head");
                     return_worker_to_pool(&return_state, pool_index, worker_idx);
@@ -4160,16 +4177,11 @@ async fn handle_request_inner(
                 }
             };
 
-            if http_helpers::response_should_stream(&head.headers) {
+            if http_helpers::response_should_stream(&headers) {
                 // ── True streaming response ─────────────────────────
-                // Hand the body channel to hyper; spawn a task that waits
-                // for the `End` frame, then returns the worker to the
-                // pool. The permit is moved into the watcher so back-
-                // pressure on concurrent requests is preserved.
-                let headers = head.headers;
-                let status = head.http_status;
-                let body_rx = head.body;
-                let done_rx = head.done;
+                // Now (and only now) spawn the body forwarder + mpsc
+                // channel that hyper's `ChannelBody` will pull from.
+                let (body_rx, done_rx) = turbine_worker::stream::start_streaming_forwarder(pipe);
                 let log_worker = worker_idx_log;
                 let watch_state = return_state.clone();
 
@@ -4214,125 +4226,110 @@ async fn handle_request_inner(
                 ));
             }
 
-            // ── Buffered fallback: drain remaining BodyChunks ──────
-            let mut body_buf: Vec<u8> = Vec::new();
-            while let Some(chunk_result) = head.body.recv().await {
-                match chunk_result {
-                    Ok(chunk) => body_buf.extend_from_slice(&chunk),
-                    Err(e) => {
-                        error!(worker = worker_idx_log, error = %e, "Error draining stream body");
-                        return_worker_to_pool(&return_state, pool_index, worker_idx);
-                        drop(permit);
-                        return Ok(build_response(
-                            500,
-                            "text/plain",
-                            b"Worker body error".to_vec(),
-                            &[],
-                        ));
-                    }
+            // ── Buffered fast path: drain body inline (no spawn, no
+            // mpsc, no extra memcpy). Issue #19 hot path.
+            let drain_result = turbine_worker::stream::drain_body_buffered(&mut pipe).await;
+            // Drop `pipe` now so `AsyncFd` deregisters the resp_fd from
+            // the reactor BEFORE we return the worker to the idle pool.
+            // A follow-up request that claims the same worker_idx will
+            // re-register the fd via `AsyncPipe::new` — if the previous
+            // registration is still alive, `epoll_ctl(EPOLL_CTL_ADD)`
+            // returns `EEXIST` (this is also the #18 root cause).
+            drop(pipe);
+
+            let (body_buf, ok_flag) = match drain_result {
+                Ok(pair) => pair,
+                Err(e) => {
+                    error!(worker = worker_idx_log, error = %e, "Error draining stream body");
+                    return_worker_to_pool(&return_state, pool_index, worker_idx);
+                    drop(permit);
+                    return Ok(build_response(
+                        500,
+                        "text/plain",
+                        b"Worker body error".to_vec(),
+                        &[],
+                    ));
                 }
-            }
-            let done_result = head.done.await;
+            };
+            let _ = ok_flag;
             return_worker_to_pool(&return_state, pool_index, worker_idx);
             drop(permit);
 
             // Reconstruct the aggregated response and run it through the
             // same post-processing pipeline the old non-streaming path
             // used (postprocess → cache → coalesce → access log).
-            match done_result {
-                Ok(Ok(_)) | Ok(Err(_)) => {
-                    let mut body = body_buf;
-                    let mut status_code = head.http_status;
-                    let elapsed_us = request_start.elapsed().as_micros() as u64;
-                    let php_content_type = head
-                        .headers
-                        .iter()
-                        .find(|(k, _)| k.eq_ignore_ascii_case("Content-Type"))
-                        .map(|(_, v)| v.as_str());
-                    let mut content_type = php_content_type
-                        .unwrap_or_else(|| detect_content_type(&body))
-                        .to_string();
-                    let mut resp_headers = head.headers;
+            {
+                let mut body = body_buf;
+                let mut status_code = status;
+                let elapsed_us = request_start.elapsed().as_micros() as u64;
+                let php_content_type = headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("Content-Type"))
+                    .map(|(_, v)| v.as_str());
+                let mut content_type = php_content_type
+                    .unwrap_or_else(|| detect_content_type(&body))
+                    .to_string();
+                let mut resp_headers = headers;
 
-                    postprocess_php_response(
-                        &state,
-                        &mut body,
-                        &mut status_code,
-                        &mut content_type,
-                        &mut resp_headers,
-                    );
+                postprocess_php_response(
+                    &state,
+                    &mut body,
+                    &mut status_code,
+                    &mut content_type,
+                    &mut resp_headers,
+                );
 
-                    state.security.record_request(client_ip, false);
-                    state.metrics.record_request(
-                        &php_path,
-                        status_code,
-                        elapsed_us,
-                        body.len() as u64,
-                    );
-                    if !response_prevents_caching(&resp_headers) {
-                        state.cache.put(
-                            &request.method,
-                            &request.path,
-                            source_hash,
-                            status_code,
-                            &content_type,
-                            &body,
-                        );
-                    }
-                    if let Some(ref mut g) = coalesce_guard {
-                        g.publish(CoalescedResponse {
-                            status: status_code,
-                            content_type: content_type.clone(),
-                            body: Bytes::copy_from_slice(&body),
-                            headers: resp_headers.clone(),
-                        });
-                    }
-
-                    info!(method = %request.method, path = %request.path, worker = worker_idx_log, status = status_code, elapsed_us = elapsed_us, bytes = body.len(), "Request completed");
-                    write_access_log(
-                        &state,
+                state.security.record_request(client_ip, false);
+                state.metrics.record_request(
+                    &php_path,
+                    status_code,
+                    elapsed_us,
+                    body.len() as u64,
+                );
+                if !response_prevents_caching(&resp_headers) {
+                    state.cache.put(
                         &request.method,
                         &request.path,
-                        status_code,
-                        request_start,
-                        &client_ip_str,
-                    );
-
-                    let extra_headers: Vec<(&str, &str)> = resp_headers
-                        .iter()
-                        .filter(|(k, _)| {
-                            !k.eq_ignore_ascii_case("Content-Type")
-                                && !k.eq_ignore_ascii_case("Content-Length")
-                        })
-                        .map(|(k, v)| (k.as_str(), v.as_str()))
-                        .collect();
-
-                    return Ok(build_response(
+                        source_hash,
                         status_code,
                         &content_type,
-                        body,
-                        &extra_headers,
-                    ));
-                }
-                Err(_) => {
-                    state.security.record_request(client_ip, true);
-                    state.metrics.record_request(
-                        &php_path,
-                        502,
-                        request_start.elapsed().as_micros() as u64,
-                        0,
+                        &body,
                     );
-                    error!(
-                        worker = worker_idx_log,
-                        "Streaming response done channel dropped"
-                    );
-                    return Ok(build_response(
-                        502,
-                        "text/plain",
-                        b"Worker response error".to_vec(),
-                        &[],
-                    ));
                 }
+                if let Some(ref mut g) = coalesce_guard {
+                    g.publish(CoalescedResponse {
+                        status: status_code,
+                        content_type: content_type.clone(),
+                        body: Bytes::copy_from_slice(&body),
+                        headers: resp_headers.clone(),
+                    });
+                }
+
+                info!(method = %request.method, path = %request.path, worker = worker_idx_log, status = status_code, elapsed_us = elapsed_us, bytes = body.len(), "Request completed");
+                write_access_log(
+                    &state,
+                    &request.method,
+                    &request.path,
+                    status_code,
+                    request_start,
+                    &client_ip_str,
+                );
+
+                let extra_headers: Vec<(&str, &str)> = resp_headers
+                    .iter()
+                    .filter(|(k, _)| {
+                        !k.eq_ignore_ascii_case("Content-Type")
+                            && !k.eq_ignore_ascii_case("Content-Length")
+                    })
+                    .map(|(k, v)| (k.as_str(), v.as_str()))
+                    .collect();
+
+                return Ok(build_response(
+                    status_code,
+                    &content_type,
+                    body,
+                    &extra_headers,
+                ));
             }
         }
 
@@ -4348,7 +4345,7 @@ async fn handle_request_inner(
             // AsyncFd-based read: no blocking pool thread consumed per request.
             let result = match turbine_worker::async_io::AsyncPipe::new(resp_fd) {
                 Ok(mut pipe) => {
-                    if is_persistent {
+                    let res = if is_persistent {
                         WorkerResult::Persistent(
                             turbine_worker::decode_response_async(&mut pipe).await,
                         )
@@ -4356,7 +4353,14 @@ async fn handle_request_inner(
                         WorkerResult::Native(
                             turbine_worker::read_native_response_async(&mut pipe).await,
                         )
-                    }
+                    };
+                    // Explicit drop BEFORE `return_worker_to_pool`:
+                    // deregister the fd from the tokio reactor so a
+                    // follow-up request that claims the same worker_idx
+                    // and calls `AsyncPipe::new(same_fd)` won't hit
+                    // `EEXIST` from the stale registration.
+                    drop(pipe);
+                    res
                 }
                 Err(e) => {
                     if is_persistent {

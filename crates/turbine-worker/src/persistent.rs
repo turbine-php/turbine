@@ -551,6 +551,65 @@ fn write_all_fd(fd: RawFd, data: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// Write multiple buffers to `fd` in order using `writev(2)`, handling
+/// short writes and EINTR.
+///
+/// Used by the persistent buffered response path to coalesce
+/// `[headers_frame, body_chunk_hdr, body_bytes, end_frame]` into a
+/// single syscall WITHOUT first memcpy-ing the body into a scratch
+/// `Vec`. For large responses (e.g. the 50 KB binary in issue #19) this
+/// eliminates a full body-sized memcpy on the worker side.
+fn writev_all_fd(fd: RawFd, mut slices: &mut [&[u8]]) -> io::Result<()> {
+    // Clone slice refs into a mutable stack-friendly Vec we can advance.
+    // Keeping this on the heap is fine — the caller already owns the
+    // body Vec and header frames.
+    loop {
+        // Skip leading empty slices.
+        while let Some(first) = slices.first() {
+            if first.is_empty() {
+                slices = &mut slices[1..];
+            } else {
+                break;
+            }
+        }
+        if slices.is_empty() {
+            return Ok(());
+        }
+
+        // Build iovec array (cap at IOV_MAX to be safe — typically 1024).
+        const IOV_MAX: usize = 1024;
+        let n = slices.len().min(IOV_MAX);
+        let mut iov: [libc::iovec; IOV_MAX] = unsafe { std::mem::zeroed() };
+        for i in 0..n {
+            iov[i] = libc::iovec {
+                iov_base: slices[i].as_ptr() as *mut _,
+                iov_len: slices[i].len(),
+            };
+        }
+
+        let ret = unsafe { libc::writev(fd, iov.as_ptr(), n as libc::c_int) };
+        if ret < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        let mut written = ret as usize;
+        // Advance slices by `written` bytes.
+        while written > 0 {
+            let first_len = slices[0].len();
+            if written >= first_len {
+                written -= first_len;
+                slices = &mut slices[1..];
+            } else {
+                slices[0] = &slices[0][written..];
+                written = 0;
+            }
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Persistent worker event loop (runs in the child process after fork)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -958,14 +1017,29 @@ pub fn worker_event_loop_persistent(
                     write_all_fd(resp_fd, &buf)
                 }
             } else {
-                // Buffered fast path: one write for the whole response.
-                let mut buf = Vec::with_capacity(32 + headers.len() * 32 + body.len() + 8);
-                crate::stream::encode_headers(&mut buf, status, &headers);
-                if !body.is_empty() {
-                    crate::stream::encode_body_chunk(&mut buf, &body);
+                // Buffered fast path: one `writev(2)` for the whole
+                // response. Coalesces headers + body-chunk header +
+                // body bytes + end frame WITHOUT copying the body into
+                // an intermediate Vec. For large bodies (e.g. the 50 KB
+                // binary in issue #19) this removes a body-sized memcpy
+                // that otherwise ran on every request.
+                let mut hdr_buf =
+                    Vec::with_capacity(32 + headers.len() * 32);
+                crate::stream::encode_headers(&mut hdr_buf, status, &headers);
+
+                let mut end_buf = [0u8; 2];
+                end_buf[0] = crate::stream::FRAME_END;
+                end_buf[1] = if ok { 1 } else { 0 };
+
+                if body.is_empty() {
+                    let mut parts: [&[u8]; 2] = [&hdr_buf, &end_buf];
+                    writev_all_fd(resp_fd, &mut parts)
+                } else {
+                    let chunk_hdr = crate::stream::encode_body_chunk_header(body.len());
+                    let mut parts: [&[u8]; 4] =
+                        [&hdr_buf, &chunk_hdr, &body, &end_buf];
+                    writev_all_fd(resp_fd, &mut parts)
                 }
-                crate::stream::encode_end(&mut buf, ok);
-                write_all_fd(resp_fd, &buf)
             };
 
             if let Err(e) = write_result {

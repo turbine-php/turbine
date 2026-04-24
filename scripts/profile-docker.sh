@@ -142,16 +142,28 @@ docker run --rm --privileged --pid=host alpine:3 sh -c '
   echo "perf_event_paranoid = $(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo ?)"
 ' || echo "::warning:: could not relax perf_event_paranoid — samply may fail"
 
-# Bind /tmp from a host dir instead of --tmpfs: `docker cp` on Docker
-# Desktop for Mac cannot read tmpfs mounts (shows "Could not find the
-# file" even though `docker exec ls` sees it). A host bind gives us
-# direct access — we just cp from the host dir at the end. Bonus: perf
-# maps + jit dumps land directly on the host, no cp needed.
-TMP_SHARED="$WORK_DIR/tmp"
-mkdir -p "$TMP_SHARED"
-chmod 1777 "$TMP_SHARED"
+# IMPORTANT: do NOT bind-mount /tmp from the macOS host. On Docker
+# Desktop, virtiofs causes the LinuxKit kernel to report the backing
+# host path (e.g. /run/host_virtiofs/private/var/folders/.../jit-8.dump)
+# in the perf_event MMAP2 record, rather than the in-container path
+# /tmp/jit-8.dump. samply then tries to open that non-existent path and
+# silently fails to parse the jitdump, so no JIT$ symbols ever land in
+# the profile. Using container-local /tmp makes the kernel report the
+# plain /tmp/jit-<pid>.dump path, which samply can read.
+#
+# Output goes to a separate bind mount (/out) — unrelated to the JIT
+# file paths, so the virtiofs path shows up for that mmap (harmless).
+OUT_SHARED="$WORK_DIR/out"
+mkdir -p "$OUT_SHARED"
+chmod 1777 "$OUT_SHARED"
 
-echo "==> Starting $CONTAINER"
+echo "==> Starting $CONTAINER (samply wraps turbine from PID 1 for jitdump)"
+OUT_IN_CONTAINER="/out/profile-${TAG}.json.gz"
+# Wrap turbine inside samply so samply sees every MMAP event (including
+# the JIT buffer mmap and the /tmp/jit-%d.dump mmap) from the start.
+# samply cannot reconstruct these when attached via -p after the fact
+# (samply issue #127 — attach mode misses mmap events), which is why
+# every JIT sample ended up as "0x8000xxx zero (deleted)" unresolved.
 docker run -d --name "$CONTAINER" \
     --cap-add SYS_PTRACE \
     --cap-add PERFMON \
@@ -159,8 +171,14 @@ docker run -d --name "$CONTAINER" \
     --security-opt seccomp=unconfined \
     -p "${PORT}:80" \
     -v "$APP_DIR/turbine.toml:/var/www/html/turbine.toml:ro" \
-    -v "$TMP_SHARED:/tmp" \
-    "$IMG" >/dev/null
+    -v "$OUT_SHARED:/out" \
+    --entrypoint sh \
+    "$IMG" \
+    -c "exec samply record --save-only --jit-markers \
+            --output '${OUT_IN_CONTAINER}' --rate ${RATE} \
+            -- turbine serve -c /var/www/html/turbine.toml -r /var/www/html \
+            > /out/samply.log 2>&1" \
+    >/dev/null
 
 # /proc/sys/kernel/perf_event_paranoid is read-only in Docker Desktop — skip.
 # CAP_PERFMON + seccomp=unconfined is usually enough for samply's perf events.
@@ -187,21 +205,7 @@ echo "==> Warmup (5s)"
 wrk -t2 -c8 -d5s "http://127.0.0.1:${PORT}/${SCENARIO}.php" >/dev/null
 
 # ── Record profile ─────────────────────────────────────────────────────────
-TURB_PID=$(docker exec "$CONTAINER" sh -c "pgrep -f 'turbine .*serve' | head -1")
-if [[ -z "$TURB_PID" ]]; then
-    echo "::error:: Could not locate turbine PID inside container" >&2
-    docker logs --tail 80 "$CONTAINER" || true
-    exit 1
-fi
-echo "==> samply attach to container PID $TURB_PID"
-
-OUT_IN_CONTAINER="/tmp/profile-${TAG}.json.gz"
-docker exec -d "$CONTAINER" sh -c \
-    "samply record -v --jit-markers --save-only --output '${OUT_IN_CONTAINER}' \
-        --rate ${RATE} --duration $((DURATION + 5)) \
-        -p ${TURB_PID} > /tmp/samply.log 2>&1"
-
-sleep 1
+echo "==> samply is already recording (PID 1 inside container)"
 
 # From here on: never abort on a non-zero exit. We want to harvest every
 # file we can and print diagnostics if anything is missing. Previously an
@@ -217,40 +221,48 @@ cat "$OUT_DIR/wrk-${TAG}.txt"
 # samply 0.13.1 ignores --duration when attached to an external PID —
 # it literally logs "until Ctrl+C" and waits for a signal. SIGINT is
 # the normal stop-and-save path (NOT cancel); SIGTERM/SIGKILL truncates.
-echo "==> Sending SIGINT to samply to stop+flush"
-docker exec "$CONTAINER" sh -c 'pkill -INT -f "samply record" || true'
+# Since samply is PID 1 (exec) and turbine is its child, we send
+# SIGTERM to turbine. samply sees the child exit, finalises the
+# profile, and then exits itself (which also exits the container).
+echo "==> Sending SIGTERM to turbine (samply's child) to trigger flush"
+docker exec "$CONTAINER" sh -c 'pkill -TERM -f "turbine serve" || true'
 
-# Wait up to 90s for samply to finish writing the gz.
 for i in $(seq 1 90); do
-    if ! docker exec "$CONTAINER" sh -c 'pgrep -f "samply record" >/dev/null 2>&1'; then
-        echo "    samply exited after ${i}s"
+    if ! docker ps --format '{{.Names}}' | grep -qx "$CONTAINER"; then
+        echo "    container stopped after ${i}s"
         break
     fi
     sleep 1
 done
 
-if docker exec "$CONTAINER" sh -c 'pgrep -f "samply record" >/dev/null 2>&1'; then
-    echo "::warning:: samply still alive after 90s — forcing SIGTERM then SIGKILL"
-    docker exec "$CONTAINER" sh -c 'pkill -TERM -f "samply record" || true'
-    sleep 3
-    docker exec "$CONTAINER" sh -c 'pkill -KILL -f "samply record" || true'
-    sleep 1
+if docker ps --format '{{.Names}}' | grep -qx "$CONTAINER"; then
+    echo "::warning:: container still running after 90s — sending SIGINT to PID 1 (samply)"
+    docker kill --signal=INT "$CONTAINER" >/dev/null 2>&1 || true
+    sleep 10
+    if docker ps --format '{{.Names}}' | grep -qx "$CONTAINER"; then
+        docker kill "$CONTAINER" >/dev/null 2>&1 || true
+        sleep 2
+    fi
 fi
 
-# Prove the file exists (and its size) inside the container before cp.
-echo "==> Profile file inside container:"
-docker exec "$CONTAINER" ls -lh "$OUT_IN_CONTAINER" || true
+# Prove the file exists (and its size) on the host side of the bind.
+echo "==> Profile file on host bind:"
+ls -lh "$OUT_SHARED/profile-${TAG}.json.gz" 2>/dev/null || echo "    (not found)"
 
-# /tmp is now a host bind ($TMP_SHARED) — read the files directly, no
-# `docker cp` (which is broken for tmpfs and flaky in general on
-# Docker Desktop Mac).
-cp -f "$TMP_SHARED/samply.log" "$OUT_DIR/samply-${TAG}.log" 2>/dev/null || true
-cp -f "$TMP_SHARED/profile-${TAG}.json.gz" "$OUT_DIR/profile-${TAG}.json.gz"
+# /out is a host bind ($OUT_SHARED) — read the files directly.
+cp -f "$OUT_SHARED/samply.log" "$OUT_DIR/samply-${TAG}.log" 2>/dev/null || true
+cp -f "$OUT_SHARED/profile-${TAG}.json.gz" "$OUT_DIR/profile-${TAG}.json.gz"
 CP_RC=$?
 
-if [[ "$JIT_PERF_MAP" == "true" ]]; then
+# /tmp lives inside the container's own fs (not a bind), so use
+# `docker cp`. Works on stopped containers too. We copy the whole /tmp
+# into a staging dir and then pick out the JIT artefacts.
+if [[ "$JIT_PERF_MAP" == "true" ]] && docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER"; then
     mkdir -p "$OUT_DIR/perf-maps-${TAG}"
-    for f in "$TMP_SHARED"/perf-*.map "$TMP_SHARED"/jit-*.dump; do
+    STAGE="$WORK_DIR/tmp-stage"
+    rm -rf "$STAGE" && mkdir -p "$STAGE"
+    docker cp "$CONTAINER:/tmp/." "$STAGE/" 2>/dev/null || true
+    for f in "$STAGE"/perf-*.map "$STAGE"/jit-*.dump; do
         [[ -e "$f" ]] && cp -f "$f" "$OUT_DIR/perf-maps-${TAG}/"
     done
 fi

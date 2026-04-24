@@ -97,6 +97,17 @@ pub fn encode_body_chunk(buf: &mut Vec<u8>, chunk: &[u8]) {
     buf.extend_from_slice(chunk);
 }
 
+/// Encode only the 5-byte prefix of a `BodyChunk` frame (discriminant +
+/// `u32` length). Returned as a fixed-size array so the caller can place
+/// the body bytes in a separate iovec and issue a single `writev(2)` —
+/// avoiding a scratch memcpy of the body into a combined buffer.
+#[inline]
+pub fn encode_body_chunk_header(chunk_len: usize) -> [u8; 5] {
+    let len = chunk_len as u32;
+    let lb = len.to_le_bytes();
+    [FRAME_BODY_CHUNK, lb[0], lb[1], lb[2], lb[3]]
+}
+
 /// Encode an `End` frame into `buf`.
 pub fn encode_end(buf: &mut Vec<u8>, ok: bool) {
     buf.push(FRAME_END);
@@ -379,23 +390,37 @@ where
     let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, io::Error>>(64);
     let (done_tx, done_rx) = tokio::sync::oneshot::channel::<io::Result<bool>>();
 
-    tokio::spawn(async move {
+    // Helper that owns `r` and returns the completion result. We run this
+    // in an inner scope so `r` (the `AsyncPipe` / `AsyncFd` registration)
+    // is dropped BEFORE we notify `done_tx`. This is critical for
+    // persistent workers: the caller awaits `done_rx`, returns the worker
+    // fd to the pool, and a follow-up request may call
+    // `AsyncPipe::new(resp_fd)` on the SAME fd. If the previous
+    // registration is still alive at that moment, `AsyncFd::new` hits
+    // `epoll_ctl(EPOLL_CTL_ADD)` → `EEXIST` and the new request 502s.
+    // Dropping `r` first guarantees the deregister (EPOLL_CTL_DEL) happens
+    // before the caller is woken.
+    async fn drive<R>(
+        mut r: R,
+        body_tx: tokio::sync::mpsc::Sender<Result<Vec<u8>, io::Error>>,
+    ) -> io::Result<bool>
+    where
+        R: tokio::io::AsyncRead + Unpin + Send,
+    {
         loop {
             let frame = match read_frame_async(&mut r).await {
                 Ok(Some(f)) => f,
                 Ok(None) => {
-                    let _ = done_tx.send(Err(io::Error::new(
+                    return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         "streaming response pipe closed before End frame",
-                    )));
-                    return;
+                    ));
                 }
                 Err(e) => {
                     let _ = body_tx
                         .send(Err(io::Error::new(e.kind(), e.to_string())))
                         .await;
-                    let _ = done_tx.send(Err(e));
-                    return;
+                    return Err(e);
                 }
             };
 
@@ -407,26 +432,19 @@ where
                         // and be returned to the pool cleanly.
                         loop {
                             match read_frame_async(&mut r).await {
-                                Ok(Some(Frame::End { ok })) => {
-                                    let _ = done_tx.send(Ok(ok));
-                                    return;
-                                }
+                                Ok(Some(Frame::End { ok })) => return Ok(ok),
                                 Ok(Some(_)) => continue,
                                 Ok(None) | Err(_) => {
-                                    let _ = done_tx.send(Err(io::Error::new(
+                                    return Err(io::Error::new(
                                         io::ErrorKind::BrokenPipe,
                                         "client disconnected mid-stream",
-                                    )));
-                                    return;
+                                    ));
                                 }
                             }
                         }
                     }
                 }
-                Frame::End { ok } => {
-                    let _ = done_tx.send(Ok(ok));
-                    return;
-                }
+                Frame::End { ok } => return Ok(ok),
                 Frame::Headers { .. } => {
                     let _ = body_tx
                         .send(Err(io::Error::new(
@@ -434,20 +452,27 @@ where
                             "unexpected Headers frame mid-stream",
                         )))
                         .await;
-                    let _ = done_tx.send(Err(io::Error::new(
+                    return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "duplicate Headers frame",
-                    )));
-                    return;
+                    ));
                 }
                 Frame::Error(msg) => {
-                    let _ = done_tx.send(Err(io::Error::other(
+                    return Err(io::Error::other(
                         String::from_utf8_lossy(&msg).into_owned(),
-                    )));
-                    return;
+                    ));
                 }
             }
         }
+    }
+
+    tokio::spawn(async move {
+        let result = drive(r, body_tx).await;
+        // `r` has been moved into `drive` and dropped as `drive`
+        // returned — AsyncFd is deregistered from the reactor NOW, before
+        // we wake the caller via `done_tx`. Any follow-up
+        // `AsyncPipe::new(same_fd)` is safe.
+        let _ = done_tx.send(result);
     });
 
     Ok(StreamingHead {
@@ -456,6 +481,215 @@ where
         body: body_rx,
         done: done_rx,
     })
+}
+
+/// Read only the leading `Headers` frame from `r` and return
+/// `(http_status, headers, reader)`. The caller keeps `reader` and can
+/// either drive true streaming (spawn a forwarder via
+/// `start_streaming_forwarder`) or drain the body inline via
+/// `drain_body_buffered`.
+///
+/// Splitting the dispatch this way avoids the unconditional
+/// `tokio::spawn + mpsc::channel(64) + extend_from_slice` overhead of
+/// `consume_streaming` when the response is actually buffered (no SSE /
+/// `X-Accel-Buffering: no` opt-in). For large buffered bodies (e.g.
+/// 50 KB binary responses) that overhead dominates — the mpsc hop plus
+/// the body_buf extension adds a second ~body_len memcpy on top of the
+/// one already done by `read_exact` inside `read_frame_async`.
+pub async fn read_response_head<R>(
+    mut r: R,
+) -> io::Result<(u16, Vec<(String, String)>, R)>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let first = read_frame_async(&mut r).await?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "read_response_head: pipe closed before Headers frame",
+        )
+    })?;
+    match first {
+        Frame::Headers {
+            http_status,
+            headers,
+        } => Ok((http_status, headers, r)),
+        Frame::Error(msg) => Err(io::Error::other(format!(
+            "read_response_head: worker emitted Error frame: {}",
+            String::from_utf8_lossy(&msg)
+        ))),
+        Frame::BodyChunk(_) | Frame::End { .. } => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "read_response_head: first frame must be Headers",
+        )),
+    }
+}
+
+/// Drain `BodyChunk` frames inline into a single `Vec<u8>` until the
+/// terminal `End` (or `Error`) frame, returning `(body, ok)`.
+///
+/// Inline variant of the buffered-fallback path: no `tokio::spawn`, no
+/// bounded mpsc channel, and `BodyChunk` bytes are read straight into the
+/// accumulator via `read_exact` so we pay exactly one alloc + one memcpy
+/// per chunk (vs the `consume_streaming` path which allocates a per-chunk
+/// `Vec<u8>`, sends it over mpsc, then re-copies it via
+/// `extend_from_slice` on the consumer side).
+pub async fn drain_body_buffered<R>(r: &mut R) -> io::Result<(Vec<u8>, bool)>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let mut body: Vec<u8> = Vec::new();
+    loop {
+        let mut discr = [0u8; 1];
+        match r.read(&mut discr).await? {
+            0 => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "drain_body_buffered: pipe closed before End frame",
+                ));
+            }
+            1 => {}
+            _ => unreachable!(),
+        }
+        match discr[0] {
+            FRAME_BODY_CHUNK => {
+                let mut cl = [0u8; 4];
+                r.read_exact(&mut cl).await?;
+                let chunk_len = u32::from_le_bytes(cl) as usize;
+                // Extend body in-place and read chunk bytes DIRECTLY into
+                // the accumulator — no per-chunk Vec allocation and no
+                // second memcpy.
+                let old_len = body.len();
+                body.resize(old_len + chunk_len, 0);
+                r.read_exact(&mut body[old_len..old_len + chunk_len]).await?;
+            }
+            FRAME_END => {
+                let mut ok = [0u8; 1];
+                r.read_exact(&mut ok).await?;
+                return Ok((body, ok[0] != 0));
+            }
+            FRAME_ERROR => {
+                let mut ml = [0u8; 4];
+                r.read_exact(&mut ml).await?;
+                let mut msg = vec![0u8; u32::from_le_bytes(ml) as usize];
+                r.read_exact(&mut msg).await?;
+                return Err(io::Error::other(
+                    String::from_utf8_lossy(&msg).into_owned(),
+                ));
+            }
+            FRAME_HEADERS => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "drain_body_buffered: unexpected Headers frame mid-body",
+                ));
+            }
+            other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("drain_body_buffered: unknown frame discriminant: 0x{other:02x}"),
+                ));
+            }
+        }
+    }
+}
+
+/// Spawn the streaming forwarder task on an already-head-consumed reader.
+///
+/// Use-case: caller has already parsed the `Headers` frame via
+/// `read_response_head` and decided (based on the headers) that the
+/// response is a true stream (SSE / `X-Accel-Buffering: no`). This starts
+/// the same body-forwarding machinery that `consume_streaming` uses: a
+/// spawned task reads each subsequent `BodyChunk` frame and feeds the
+/// returned channel; on `End` or pipe error the `done` oneshot resolves.
+///
+/// The reader is dropped inside the spawned task **before** `done_tx`
+/// fires, so the `AsyncFd` epoll registration is torn down before the
+/// caller is woken (avoids `EEXIST` on fd reuse — see `consume_streaming`
+/// for the full explanation).
+pub fn start_streaming_forwarder<R>(
+    r: R,
+) -> (
+    tokio::sync::mpsc::Receiver<Result<Vec<u8>, io::Error>>,
+    tokio::sync::oneshot::Receiver<io::Result<bool>>,
+)
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, io::Error>>(64);
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<io::Result<bool>>();
+
+    async fn drive<R>(
+        mut r: R,
+        body_tx: tokio::sync::mpsc::Sender<Result<Vec<u8>, io::Error>>,
+    ) -> io::Result<bool>
+    where
+        R: tokio::io::AsyncRead + Unpin + Send,
+    {
+        loop {
+            let frame = match read_frame_async(&mut r).await {
+                Ok(Some(f)) => f,
+                Ok(None) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "streaming response pipe closed before End frame",
+                    ));
+                }
+                Err(e) => {
+                    let _ = body_tx
+                        .send(Err(io::Error::new(e.kind(), e.to_string())))
+                        .await;
+                    return Err(e);
+                }
+            };
+
+            match frame {
+                Frame::BodyChunk(chunk) => {
+                    if body_tx.send(Ok(chunk)).await.is_err() {
+                        // Client disconnected — drain the pipe so the worker
+                        // can finish cleanly.
+                        loop {
+                            match read_frame_async(&mut r).await {
+                                Ok(Some(Frame::End { ok })) => return Ok(ok),
+                                Ok(Some(_)) => continue,
+                                Ok(None) | Err(_) => {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::BrokenPipe,
+                                        "client disconnected mid-stream",
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+                Frame::End { ok } => return Ok(ok),
+                Frame::Headers { .. } => {
+                    let _ = body_tx
+                        .send(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "unexpected Headers frame mid-stream",
+                        )))
+                        .await;
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "duplicate Headers frame",
+                    ));
+                }
+                Frame::Error(msg) => {
+                    return Err(io::Error::other(
+                        String::from_utf8_lossy(&msg).into_owned(),
+                    ));
+                }
+            }
+        }
+    }
+
+    tokio::spawn(async move {
+        let result = drive(r, body_tx).await;
+        let _ = done_tx.send(result);
+    });
+
+    (body_rx, done_rx)
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
