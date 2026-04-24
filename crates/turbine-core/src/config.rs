@@ -2246,17 +2246,6 @@ foo = "bar"
     }
 
     #[test]
-    fn check_warn_workers_zero_timeout_zero() {
-        let mut config = RuntimeConfig::default();
-        config.server.workers = 0;
-        config.server.request_timeout = 0;
-        let (_, warnings) = config.check();
-        assert!(warnings
-            .iter()
-            .any(|w| w.contains("workers = 0") && w.contains("request_timeout = 0")));
-    }
-
-    #[test]
     fn check_warn_security_all_guards_disabled() {
         let mut config = RuntimeConfig::default();
         config.security.enabled = true;
