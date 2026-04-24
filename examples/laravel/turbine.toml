@@ -33,7 +33,9 @@ upload_tmp_dir = "/tmp/turbine-uploads"
 
 [php.ini]
 error_reporting = "E_ALL"
-date.timezone = "UTC"
+# Dotted INI keys must be quoted so TOML doesn't parse them as nested
+# tables (e.g. unquoted `date.timezone = "UTC"` creates a `date` table).
+"date.timezone" = "UTC"
 # Laravel needs these
 "session.auto_start" = "0"
 "short_open_tag" = "0"

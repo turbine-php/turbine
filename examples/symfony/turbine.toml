@@ -26,7 +26,7 @@ upload_tmp_dir = "/tmp/turbine-uploads"
 
 [php.ini]
 error_reporting = "E_ALL"
-date.timezone = "UTC"
+"date.timezone" = "UTC"
 "realpath_cache_size" = "4096k"
 "realpath_cache_ttl" = "600"
 

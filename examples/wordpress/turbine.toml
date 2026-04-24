@@ -26,7 +26,7 @@ upload_tmp_dir = "/tmp/turbine-uploads"
 [php.ini]
 error_reporting = "E_ALL & ~E_DEPRECATED & ~E_STRICT"
 display_errors = "0"
-date.timezone = "UTC"
+"date.timezone" = "UTC"
 # WordPress needs these
 "short_open_tag" = "1"
 "max_input_vars" = "5000"

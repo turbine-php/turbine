@@ -324,7 +324,7 @@ Arbitrary php.ini directives as key-value pairs:
 ```toml
 [php.ini]
 error_reporting = "E_ALL"
-date.timezone = "America/Sao_Paulo"
+"date.timezone" = "America/Sao_Paulo"
 "session.gc_probability" = "1"
 ```
 
