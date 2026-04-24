@@ -46,6 +46,23 @@ on:
         description: "Hetzner server type."
         required: false
         default: "ccx33"
+      scenario:
+        description: "Workload to profile."
+        required: false
+        default: "mandelbrot"
+        type: choice
+        options:
+          - mandelbrot
+          - pdf50k
+          - helloworld
+      persistent:
+        description: "persistent_workers (true = worker mode, false = per-request)."
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
 
 permissions:
   contents: read
@@ -71,6 +88,8 @@ jobs:
             echo "workers=${{ inputs.workers || '4' }}"
             echo "sample_rate=${{ inputs.sample_rate || '1999' }}"
             echo "server_type=${{ inputs.server_type || 'ccx33' }}"
+            echo "scenario=${{ inputs.scenario || 'mandelbrot' }}"
+            echo "persistent=${{ inputs.persistent || 'true' }}"
           } >> "$GITHUB_OUTPUT"
 
       - name: Generate SSH keypair
@@ -197,6 +216,20 @@ jobs:
           echo mandelbrot();
           PHP
 
+          cat > /root/prof/app/pdf50k.php << 'PHP'
+          <?php
+          // ~50 KB "binary" response — simulates large body write path.
+          header('Content-Type: application/pdf');
+          $chunk = str_repeat('x', 1023) . "\n";
+          for ($i = 0; $i < 50; $i++) { echo $chunk; }
+          PHP
+
+          cat > /root/prof/app/helloworld.php << 'PHP'
+          <?php
+          header('Content-Type: text/plain');
+          echo 'Hello, World!';
+          PHP
+
           cat > /root/prof/app/jitstatus.php << 'PHP'
           <?php
           header('Content-Type: application/json');
@@ -220,6 +253,7 @@ jobs:
           # Write turbine.toml with the selected worker_mode
           MODE="${{ steps.meta.outputs.mode }}"
           WORKERS="${{ steps.meta.outputs.workers }}"
+          PERSIST="${{ steps.meta.outputs.persistent }}"
           WM="process"
           [[ "$MODE" == "zts" ]] && WM="thread"
 
@@ -233,7 +267,7 @@ jobs:
           listen = "0.0.0.0:80"
           workers = ${WORKERS}
           worker_mode = "${WM}"
-          persistent_workers = true
+          persistent_workers = ${PERSIST}
           worker_max_requests = 0
 
           [php]
@@ -258,6 +292,7 @@ jobs:
           IP="${{ steps.server.outputs.ip }}"
           PHP="${{ steps.meta.outputs.php_version }}"
           MODE="${{ steps.meta.outputs.mode }}"
+          SCENARIO="${{ steps.meta.outputs.scenario }}"
           IMG="katisuhara/turbine-php:latest-php${PHP}-${MODE}"
           ssh -o StrictHostKeyChecking=no -i /tmp/bench_key "root@${IP}" bash -s << SERVE
           set -euo pipefail
@@ -275,12 +310,12 @@ jobs:
 
           # Wait for HTTP 200
           for i in \$(seq 1 40); do
-            code=\$(curl -s -o /dev/null -w "%{http_code}" -m 2 http://127.0.0.1:8080/mandelbrot.php || echo 000)
+            code=\$(curl -s -o /dev/null -w "%{http_code}" -m 2 http://127.0.0.1:8080/${SCENARIO}.php || echo 000)
             [[ "\$code" == "200" ]] && break
             sleep 0.5
           done
           if [[ "\$code" != "200" ]]; then
-            echo "::error::Turbine did not return 200 (last: \$code)"
+            echo "::error::Turbine did not return 200 (last: \$code) on /${SCENARIO}.php"
             docker logs --tail 80 turbine-prof || true
             exit 1
           fi
@@ -289,11 +324,47 @@ jobs:
           echo ""
           SERVE
 
+      - name: Mirror container PHP install and turbine binary onto host (for samply symbols)
+        run: |
+          IP="${{ steps.server.outputs.ip }}"
+          ssh -o StrictHostKeyChecking=no -i /tmp/bench_key "root@${IP}" bash -s << 'MIRROR'
+          set -euo pipefail
+          # /proc/<pid>/maps lists paths from the container's point of view
+          # (e.g. /opt/php-embed-zts/lib/libphp.so, /usr/local/bin/turbine).
+          # samply on the host cannot resolve those paths, so every frame in
+          # libphp + the turbine binary shows up as "(deleted)" in Firefox
+          # Profiler. Copying the files from the container to the same
+          # absolute paths on the host makes symbol resolution work without
+          # needing nsenter or running samply inside the container.
+          for d in /opt/php-embed-nts /opt/php-embed-zts /opt/php-embed-84 /opt/turbine; do
+            if docker exec turbine-prof test -d "$d" 2>/dev/null; then
+              mkdir -p "$d"
+              echo "mirroring $d"
+              docker cp "turbine-prof:$d/." "$d/" 2>/dev/null || true
+            fi
+          done
+          # Turbine binary — wherever PATH resolves it inside the container.
+          TURB=$(docker exec turbine-prof sh -c 'command -v turbine' 2>/dev/null || echo /usr/local/bin/turbine)
+          if [[ -n "$TURB" ]]; then
+            mkdir -p "$(dirname "$TURB")"
+            docker cp "turbine-prof:$TURB" "$TURB" 2>/dev/null || true
+            echo "mirrored turbine binary to $TURB"
+          fi
+          # Also mirror the JIT-friendly standard libs (libc, libstdc++ etc)
+          # that the image ships — helpful when image base differs from host.
+          for lib in /lib/x86_64-linux-gnu/libc.so.6 /lib/x86_64-linux-gnu/libstdc++.so.6; do
+            if docker exec turbine-prof test -e "$lib" 2>/dev/null && [[ ! -e "$lib.container" ]]; then
+              docker cp "turbine-prof:$lib" "$lib.container" 2>/dev/null || true
+            fi
+          done
+          MIRROR
+
       - name: Warmup
         run: |
           IP="${{ steps.server.outputs.ip }}"
+          SCENARIO="${{ steps.meta.outputs.scenario }}"
           ssh -o StrictHostKeyChecking=no -i /tmp/bench_key "root@${IP}" \
-            "wrk -t2 -c8 -d5s http://127.0.0.1:8080/mandelbrot.php >/dev/null"
+            "wrk -t2 -c8 -d5s http://127.0.0.1:8080/${SCENARIO}.php >/dev/null"
 
       - name: Record samply profile under wrk load
         id: record
@@ -304,6 +375,8 @@ jobs:
           THREADS="${{ steps.meta.outputs.threads }}"
           RATE="${{ steps.meta.outputs.sample_rate }}"
           MODE="${{ steps.meta.outputs.mode }}"
+          SCENARIO="${{ steps.meta.outputs.scenario }}"
+          PERSIST="${{ steps.meta.outputs.persistent }}"
 
           ssh -o StrictHostKeyChecking=no -i /tmp/bench_key "root@${IP}" bash -s << REC
           set -euo pipefail
@@ -318,7 +391,7 @@ jobs:
           fi
           echo "Attaching samply to PID \$PID"
 
-          OUT=/root/prof/profile-mandelbrot-${MODE}.json.gz
+          OUT=/root/prof/profile-${MODE}-${SCENARIO}-p${PERSIST}.json.gz
           rm -f "\$OUT"
 
           # Record for the whole workload duration + 5s startup slack.
@@ -334,9 +407,9 @@ jobs:
           SAMPLY_PID=\$!
           sleep 1
 
-          echo "wrk: -t${THREADS} -c${CONN} -d${DUR}s"
+          echo "wrk: -t${THREADS} -c${CONN} -d${DUR}s  url=/${SCENARIO}.php"
           wrk -t${THREADS} -c${CONN} -d${DUR}s --latency \
-              http://127.0.0.1:8080/mandelbrot.php | tee /root/prof/wrk.txt
+              http://127.0.0.1:8080/${SCENARIO}.php | tee /root/prof/wrk.txt
 
           # Tell samply to stop recording and flush the profile.
           # SIGINT is how it finalises output in "until Ctrl+C" mode.
@@ -370,21 +443,27 @@ jobs:
         run: |
           IP="${{ steps.server.outputs.ip }}"
           MODE="${{ steps.meta.outputs.mode }}"
+          SCENARIO="${{ steps.meta.outputs.scenario }}"
+          PERSIST="${{ steps.meta.outputs.persistent }}"
+          TAG="${MODE}-${SCENARIO}-p${PERSIST}"
           mkdir -p /tmp/profile-out
           # Don't fail the step if a single file is missing — we still want
           # to upload whatever we did manage to capture.
           scp -o StrictHostKeyChecking=no -i /tmp/bench_key \
-              "root@${IP}:/root/prof/profile-mandelbrot-${MODE}.json.gz" \
+              "root@${IP}:/root/prof/profile-${TAG}.json.gz" \
               /tmp/profile-out/ || echo "::warning::profile scp failed"
           scp -o StrictHostKeyChecking=no -i /tmp/bench_key \
               "root@${IP}:/root/prof/wrk.txt" \
-              /tmp/profile-out/wrk-${MODE}.txt || echo "::warning::wrk.txt scp failed"
+              /tmp/profile-out/wrk-${TAG}.txt || echo "::warning::wrk.txt scp failed"
           ls -lh /tmp/profile-out || true
 
       - name: Summary
         if: always()
         run: |
           MODE="${{ steps.meta.outputs.mode }}"
+          SCENARIO="${{ steps.meta.outputs.scenario }}"
+          PERSIST="${{ steps.meta.outputs.persistent }}"
+          TAG="${MODE}-${SCENARIO}-p${PERSIST}"
           {
             echo "## Turbine CPU Profile"
             echo ""
@@ -392,6 +471,8 @@ jobs:
             echo "|---|---|"
             echo "| **PHP** | ${{ steps.meta.outputs.php_version }} |"
             echo "| **Mode** | ${MODE} |"
+            echo "| **Scenario** | ${SCENARIO} |"
+            echo "| **persistent_workers** | ${PERSIST} |"
             echo "| **Server** | Hetzner ${{ steps.meta.outputs.server_type }} |"
             echo "| **Workers** | ${{ steps.meta.outputs.workers }} |"
             echo "| **wrk** | ${{ steps.meta.outputs.threads }} threads × ${{ steps.meta.outputs.connections }} conns × ${{ steps.meta.outputs.duration }}s |"
@@ -399,17 +480,17 @@ jobs:
             echo ""
             echo "### wrk"
             echo '```'
-            cat /tmp/profile-out/wrk-${MODE}.txt || true
+            cat /tmp/profile-out/wrk-${TAG}.txt || true
             echo '```'
             echo ""
-            echo "Open the artifact \`turbine-profile-${MODE}\` in https://profiler.firefox.com."
+            echo "Open the artifact \`turbine-profile-${TAG}\` in https://profiler.firefox.com."
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload profile artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: turbine-profile-${{ steps.meta.outputs.mode }}-php${{ steps.meta.outputs.php_version }}
+          name: turbine-profile-${{ steps.meta.outputs.mode }}-${{ steps.meta.outputs.scenario }}-p${{ steps.meta.outputs.persistent }}-php${{ steps.meta.outputs.php_version }}
           path: /tmp/profile-out/
           if-no-files-found: warn
           retention-days: 30
