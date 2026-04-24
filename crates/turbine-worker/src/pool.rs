@@ -1096,14 +1096,22 @@ pub fn worker_event_loop_native(cmd_fd: RawFd, resp_fd: RawFd) {
                     // 4. php_execute_script — uses OPcache, standard Zend VM path
                     let result = turbine_php_sys::turbine_execute_script(c_script.as_ptr());
 
-                    // 5. Capture output, headers, status code BEFORE shutdown.
-                    //    php_request_shutdown may reset SAPI state or free globals.
+                    // 5. Full request shutdown — resets all PHP state for next request.
+                    //
+                    // CRITICAL: shutdown must run BEFORE take_output(). PHP's
+                    // internal output_buffering (default 4096 bytes in php.ini)
+                    // only flushes chunks to our ub_write callback during
+                    // php_output_end_all() inside php_request_shutdown.
+                    // Collecting before shutdown truncates any response larger
+                    // than output_buffering — manifests as partial/empty bodies
+                    // for large payloads (mirrors the persistent-worker path
+                    // that already documents this invariant).
+                    turbine_php_sys::php_request_shutdown(std::ptr::null_mut());
+
+                    // 6. Now collect the full output.
                     let body = output::take_output();
                     let headers = output::take_headers();
                     let status = output::take_response_code();
-
-                    // 6. Full request shutdown — resets all PHP state for next request.
-                    turbine_php_sys::php_request_shutdown(std::ptr::null_mut());
 
                     if result == turbine_php_sys::SUCCESS {
                         let _ = write_native_response(
@@ -1305,13 +1313,18 @@ pub fn worker_event_loop_channel(
 
                 let result = turbine_php_sys::turbine_execute_script(c_script.as_ptr());
 
-                // Capture output, headers, status code BEFORE shutdown.
+                // Full request shutdown FIRST — flushes PHP's internal output
+                // buffer (output_buffering, default 4096) into our ub_write
+                // callback via php_output_end_all(). Collecting before shutdown
+                // truncates any response larger than output_buffering (empty /
+                // partial bodies under load). Mirrors the invariant documented
+                // in the persistent-worker path.
+                turbine_php_sys::php_request_shutdown(std::ptr::null_mut());
+
+                // Now collect the full output.
                 let body = output::take_output();
                 let headers = output::take_headers();
                 let status = output::take_response_code();
-
-                // Full request shutdown — resets all PHP state for next request.
-                turbine_php_sys::php_request_shutdown(std::ptr::null_mut());
 
                 response_fn(NativeResponse {
                     success: result == turbine_php_sys::SUCCESS,
