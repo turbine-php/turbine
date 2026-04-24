@@ -260,12 +260,16 @@ jobs:
           docker rm -f turbine-prof >/dev/null 2>&1 || true
           # --pid=host so the binary PID is visible on the host for samply.
           # --cap-add=SYS_ADMIN is not required; samply runs on the host.
+          # The image's entrypoint already runs `turbine serve -c <cfg> -r <root>`
+          # and picks up \${APP_ROOT}/turbine.toml when present, so we just mount
+          # the config there and pass no CMD (passing `serve …` would cause
+          # "unexpected argument 'serve' found" because entrypoint appends "$@").
           docker run -d --name turbine-prof \
               --pid=host \
               -p 8080:80 \
               -v /root/prof/app:/var/www/html:ro \
-              -v /root/prof/etc/turbine.toml:/etc/turbine/turbine.toml:ro \
-              "${IMG}" serve --config /etc/turbine/turbine.toml --root /var/www/html
+              -v /root/prof/etc/turbine.toml:/var/www/html/turbine.toml:ro \
+              "${IMG}"
 
           # Wait for HTTP 200
           for i in \$(seq 1 40); do
