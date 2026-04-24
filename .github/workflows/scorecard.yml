@@ -3,6 +3,8 @@ name: OSSF Scorecard
 on:
   push:
     branches: ["main", "master"]
+  pull_request:
+    branches: ["main", "master"]
   schedule:
     # Weekly scan — every Monday at 06:15 UTC
     - cron: "15 6 * * 1"
@@ -16,6 +18,9 @@ jobs:
     runs-on: ubuntu-latest
 
     permissions:
+      # security-events: write and id-token: write are only granted on
+      # same-repo events. On PRs from forks GitHub scopes tokens down to
+      # read-only, so we gate the steps that need those permissions.
       security-events: write  # upload SARIF results to Security tab
       id-token: write         # publish results to OSSF REST API
       contents: read
@@ -30,10 +35,15 @@ jobs:
         with:
           results_file: scorecard.sarif
           results_format: sarif
-          # Publish to https://securityscorecards.dev (public repos only)
-          publish_results: true
+          # Only publish to https://securityscorecards.dev on push to the
+          # default branch. PRs run the analysis as a required check but
+          # don't publish partial results for an unmerged tree.
+          publish_results: ${{ github.event_name == 'push' || github.event_name == 'schedule' }}
 
       - name: Upload SARIF to GitHub Security tab
+        # Skip on pull_request from forks — security-events: write is not
+        # granted and the step would fail the required check.
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: scorecard.sarif
