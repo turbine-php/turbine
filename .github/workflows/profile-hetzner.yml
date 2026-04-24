@@ -63,6 +63,14 @@ on:
         options:
           - "true"
           - "false"
+      jit_perf_map:
+        description: "Emit OPcache JIT perf map (/tmp/perf-<pid>.map) so samply symbolicates JIT frames."
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
 
 permissions:
   contents: read
@@ -90,6 +98,7 @@ jobs:
             echo "server_type=${{ inputs.server_type || 'ccx33' }}"
             echo "scenario=${{ inputs.scenario || 'mandelbrot' }}"
             echo "persistent=${{ inputs.persistent || 'true' }}"
+            echo "jit_perf_map=${{ inputs.jit_perf_map || 'true' }}"
           } >> "$GITHUB_OUTPUT"
 
       - name: Generate SSH keypair
@@ -254,8 +263,18 @@ jobs:
           MODE="${{ steps.meta.outputs.mode }}"
           WORKERS="${{ steps.meta.outputs.workers }}"
           PERSIST="${{ steps.meta.outputs.persistent }}"
+          JIT_PERF_MAP="${{ steps.meta.outputs.jit_perf_map }}"
           WM="process"
           [[ "$MODE" == "zts" ]] && WM="thread"
+
+          # opcache.jit_debug bit 0x20 (ZEND_JIT_DEBUG_PERF_DUMP) makes PHP
+          # write /tmp/perf-<PID>.map with symbol names for every JIT'd
+          # function. samply reads that file at symbolication time and turns
+          # the 0x8000XXXX frames into PHP function names.
+          JIT_INI=""
+          if [[ "$JIT_PERF_MAP" == "true" ]]; then
+            JIT_INI=$'\n[php.ini]\n"opcache.jit_debug" = "0x20"\n'
+          fi
 
           # Write directly into the app dir — the image entrypoint looks for
           # \${APP_ROOT}/turbine.toml first. We can't bind-mount the config onto
@@ -285,6 +304,7 @@ jobs:
 
           [compression]
           enabled = false
+          ${JIT_INI}
           TOML
 
       - name: Start Turbine container
@@ -293,7 +313,17 @@ jobs:
           PHP="${{ steps.meta.outputs.php_version }}"
           MODE="${{ steps.meta.outputs.mode }}"
           SCENARIO="${{ steps.meta.outputs.scenario }}"
+          JIT_PERF_MAP="${{ steps.meta.outputs.jit_perf_map }}"
           IMG="katisuhara/turbine-php:latest-php${PHP}-${MODE}"
+          # When jit_perf_map is on, PHP writes /tmp/perf-<PID>.map inside the
+          # container. Because we're using --pid=host, the PID in the path is
+          # already the host PID — so bind-mounting host /tmp onto container
+          # /tmp makes the map show up at /tmp/perf-<PID>.map on the host,
+          # which is exactly where samply looks for it.
+          TMP_MOUNT=""
+          if [[ "$JIT_PERF_MAP" == "true" ]]; then
+            TMP_MOUNT="-v /tmp:/tmp"
+          fi
           ssh -o StrictHostKeyChecking=no -i /tmp/bench_key "root@${IP}" bash -s << SERVE
           set -euo pipefail
           docker rm -f turbine-prof >/dev/null 2>&1 || true
@@ -306,6 +336,7 @@ jobs:
               --pid=host \
               -p 8080:80 \
               -v /root/prof/app:/var/www/html:ro \
+              ${TMP_MOUNT} \
               "${IMG}"
 
           # Wait for HTTP 200
@@ -436,6 +467,14 @@ jobs:
             exit 1
           fi
           ls -lh "\$OUT"
+
+          # Collect JIT perf maps (if opcache.jit_debug wrote any) so we can
+          # ship them alongside the profile. Firefox Profiler doesn't consume
+          # them directly, but the samply run above already resolved JIT
+          # symbols — we upload them for reproducibility / re-symbolication.
+          mkdir -p /root/prof/perf-maps
+          cp /tmp/perf-*.map /root/prof/perf-maps/ 2>/dev/null || true
+          ls -lh /root/prof/perf-maps/ || true
           REC
 
       - name: Fetch profile and wrk output
@@ -455,6 +494,12 @@ jobs:
           scp -o StrictHostKeyChecking=no -i /tmp/bench_key \
               "root@${IP}:/root/prof/wrk.txt" \
               /tmp/profile-out/wrk-${TAG}.txt || echo "::warning::wrk.txt scp failed"
+          # Optional: JIT perf maps (only present when jit_perf_map=true).
+          ssh -o StrictHostKeyChecking=no -i /tmp/bench_key "root@${IP}" \
+              'tar -C /root/prof -czf /root/prof/perf-maps.tar.gz perf-maps/ 2>/dev/null' || true
+          scp -o StrictHostKeyChecking=no -i /tmp/bench_key \
+              "root@${IP}:/root/prof/perf-maps.tar.gz" \
+              /tmp/profile-out/perf-maps-${TAG}.tar.gz 2>/dev/null || true
           ls -lh /tmp/profile-out || true
 
       - name: Summary
