@@ -1,0 +1,403 @@
+name: Profile on Hetzner
+
+# Records a samply CPU profile of Turbine serving a CPU-bound Mandelbrot
+# script on a Hetzner CCX33 (8 vCPU / 32 GB, AMD) and publishes the capture
+# as a workflow artifact. Open the .json.gz in https://profiler.firefox.com.
+#
+# Required secrets:
+#   HETZNER_API_TOKEN — Hetzner Cloud API token (Read+Write)
+
+on:
+  workflow_dispatch:
+    inputs:
+      php_version:
+        description: "PHP major version (e.g. 8.4)."
+        required: false
+        default: "8.4"
+      mode:
+        description: "Turbine build: nts (process workers) or zts (thread workers)."
+        required: false
+        default: "nts"
+        type: choice
+        options:
+          - nts
+          - zts
+      duration:
+        description: "Recording duration in seconds."
+        required: false
+        default: "30"
+      connections:
+        description: "wrk concurrent connections."
+        required: false
+        default: "64"
+      threads:
+        description: "wrk client threads."
+        required: false
+        default: "4"
+      workers:
+        description: "Turbine workers (process or thread count)."
+        required: false
+        default: "4"
+      sample_rate:
+        description: "samply sampling rate in Hz."
+        required: false
+        default: "1999"
+      server_type:
+        description: "Hetzner server type."
+        required: false
+        default: "ccx33"
+
+permissions:
+  contents: read
+
+jobs:
+  profile:
+    name: Profile Turbine on Hetzner
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse inputs
+        id: meta
+        run: |
+          {
+            echo "php_version=${{ inputs.php_version || '8.4' }}"
+            echo "mode=${{ inputs.mode || 'nts' }}"
+            echo "duration=${{ inputs.duration || '30' }}"
+            echo "connections=${{ inputs.connections || '64' }}"
+            echo "threads=${{ inputs.threads || '4' }}"
+            echo "workers=${{ inputs.workers || '4' }}"
+            echo "sample_rate=${{ inputs.sample_rate || '1999' }}"
+            echo "server_type=${{ inputs.server_type || 'ccx33' }}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Generate SSH keypair
+        run: ssh-keygen -t ed25519 -f /tmp/bench_key -N ""
+
+      - name: Create Hetzner SSH key
+        id: hkey
+        env:
+          HCLOUD_TOKEN: ${{ secrets.HETZNER_API_TOKEN }}
+        run: |
+          KEY_NAME="profile-${{ github.run_id }}-${{ github.run_attempt }}"
+          RESP=$(curl -sSL -X POST \
+            -H "Authorization: Bearer $HCLOUD_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"name\":\"${KEY_NAME}\",\"public_key\":\"$(cat /tmp/bench_key.pub)\"}" \
+            https://api.hetzner.cloud/v1/ssh_keys)
+          ERR=$(echo "$RESP" | jq -r '.error.message // empty')
+          if [[ -n "$ERR" ]]; then
+            echo "::error::Hetzner SSH key error: $ERR"
+            exit 1
+          fi
+          KEY_ID=$(echo "$RESP" | jq -r '.ssh_key.id')
+          echo "id=${KEY_ID}" >> "$GITHUB_OUTPUT"
+          echo "KEY_ID=${KEY_ID}" >> "$GITHUB_ENV"
+
+      - name: Create Hetzner server
+        id: server
+        env:
+          HCLOUD_TOKEN: ${{ secrets.HETZNER_API_TOKEN }}
+        run: |
+          RESP=$(curl -sSL -X POST \
+            -H "Authorization: Bearer $HCLOUD_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"name\":\"profile-${{ github.run_id }}-${{ github.run_attempt }}\",\"server_type\":\"${{ steps.meta.outputs.server_type }}\",\"image\":\"ubuntu-24.04\",\"ssh_keys\":[${{ steps.hkey.outputs.id }}],\"location\":\"nbg1\"}" \
+            https://api.hetzner.cloud/v1/servers)
+          ERR=$(echo "$RESP" | jq -r '.error.message // empty')
+          if [[ -n "$ERR" ]]; then
+            echo "::error::Hetzner API error: $ERR"
+            exit 1
+          fi
+          echo "id=$(echo "$RESP" | jq -r '.server.id')"                 >> "$GITHUB_OUTPUT"
+          echo "ip=$(echo "$RESP" | jq -r '.server.public_net.ipv4.ip')" >> "$GITHUB_OUTPUT"
+          echo "SERVER_ID=$(echo "$RESP" | jq -r '.server.id')" >> "$GITHUB_ENV"
+
+      - name: Wait for SSH
+        run: |
+          IP="${{ steps.server.outputs.ip }}"
+          for i in $(seq 1 40); do
+            ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+                -i /tmp/bench_key "root@${IP}" "echo ready" 2>/dev/null && break
+            echo "  Attempt ${i}/40 — retrying in 10s..."
+            sleep 10
+          done
+
+      - name: Install Docker, wrk and samply
+        run: |
+          IP="${{ steps.server.outputs.ip }}"
+          ssh -o StrictHostKeyChecking=no -i /tmp/bench_key "root@${IP}" bash -s << 'SETUP'
+          set -euo pipefail
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+              ca-certificates curl gnupg jq xz-utils linux-tools-common linux-tools-generic \
+              build-essential git libssl-dev
+          curl -fsSL https://get.docker.com | sh
+
+          # wrk
+          if ! command -v wrk >/dev/null; then
+            git clone --depth 1 https://github.com/wg/wrk.git /tmp/wrk-src
+            make -C /tmp/wrk-src -j"$(nproc)"
+            install -m 0755 /tmp/wrk-src/wrk /usr/local/bin/wrk
+          fi
+
+          # samply (prebuilt static musl binary — no Rust toolchain needed)
+          SAMPLY_VERSION="0.13.1"
+          curl -fsSL -o /tmp/samply.tar.xz \
+            "https://github.com/mstange/samply/releases/download/samply-v${SAMPLY_VERSION}/samply-v${SAMPLY_VERSION}-x86_64-unknown-linux-musl.tar.xz"
+          tar -C /tmp -xf /tmp/samply.tar.xz
+          install -m 0755 "$(find /tmp -name samply -type f | head -1)" /usr/local/bin/samply
+          samply --version
+
+          # Relax perf_event_paranoid so samply can record kernel/user samples
+          # without requiring CAP_PERFMON for every invocation.
+          echo -1 > /proc/sys/kernel/perf_event_paranoid || true
+          echo 0  > /proc/sys/kernel/kptr_restrict       || true
+          SETUP
+
+      - name: Pull Turbine image
+        run: |
+          IP="${{ steps.server.outputs.ip }}"
+          PHP="${{ steps.meta.outputs.php_version }}"
+          MODE="${{ steps.meta.outputs.mode }}"
+          IMG="katisuhara/turbine-php:latest-php${PHP}-${MODE}"
+          ssh -o StrictHostKeyChecking=no -i /tmp/bench_key "root@${IP}" \
+            "docker pull ${IMG} && echo 'Pulled ${IMG}'"
+
+      - name: Prepare Mandelbrot workload and turbine.toml
+        run: |
+          IP="${{ steps.server.outputs.ip }}"
+          ssh -o StrictHostKeyChecking=no -i /tmp/bench_key "root@${IP}" bash -s << 'PREP'
+          set -euo pipefail
+          mkdir -p /root/prof/app /root/prof/etc
+
+          cat > /root/prof/app/mandelbrot.php << 'PHP'
+          <?php
+          function mandelbrot(int $iters = 300): int {
+              $sum = 0;
+              for ($y = -1.0; $y < 1.0; $y += 0.1) {
+                  for ($x = -2.0; $x < 1.0; $x += 0.08) {
+                      $cr = $x; $ci = $y;
+                      $zr = 0.0; $zi = 0.0;
+                      $i = 0;
+                      while ($i < $iters && ($zr * $zr + $zi * $zi) < 4.0) {
+                          $tmp = $zr * $zr - $zi * $zi + $cr;
+                          $zi = 2 * $zr * $zi + $ci;
+                          $zr = $tmp;
+                          $i++;
+                      }
+                      $sum += $i;
+                  }
+              }
+              return $sum;
+          }
+          header('Content-Type: text/plain');
+          echo mandelbrot();
+          PHP
+
+          cat > /root/prof/app/jitstatus.php << 'PHP'
+          <?php
+          header('Content-Type: application/json');
+          $out = [
+              'sapi'        => PHP_SAPI,
+              'zts'         => (bool) PHP_ZTS,
+              'opcache_ext' => extension_loaded('Zend OPcache'),
+          ];
+          if (function_exists('opcache_get_status')) {
+              $s = opcache_get_status(false);
+              $out['opcache_enabled'] = $s['opcache_enabled'] ?? false;
+              $out['jit_enabled']     = $s['jit']['enabled']   ?? false;
+              $out['jit_on']          = $s['jit']['on']        ?? false;
+              $out['jit_buffer_size'] = $s['jit']['buffer_size'] ?? 0;
+              $out['jit_buffer_free'] = $s['jit']['buffer_free'] ?? 0;
+          }
+          echo json_encode($out, JSON_PRETTY_PRINT);
+          PHP
+          PREP
+
+          # Write turbine.toml with the selected worker_mode
+          MODE="${{ steps.meta.outputs.mode }}"
+          WORKERS="${{ steps.meta.outputs.workers }}"
+          WM="process"
+          [[ "$MODE" == "zts" ]] && WM="thread"
+
+          ssh -o StrictHostKeyChecking=no -i /tmp/bench_key "root@${IP}" \
+            "cat > /root/prof/etc/turbine.toml" << TOML
+          [server]
+          listen = "0.0.0.0:80"
+          workers = ${WORKERS}
+          worker_mode = "${WM}"
+          persistent_workers = true
+          worker_max_requests = 0
+
+          [php]
+          memory_limit = "128M"
+          opcache_memory = 128
+
+          [logging]
+          level = "warn"
+
+          [security]
+          enabled = false
+
+          [cache]
+          enabled = false
+
+          [compression]
+          enabled = false
+          TOML
+
+      - name: Start Turbine container
+        run: |
+          IP="${{ steps.server.outputs.ip }}"
+          PHP="${{ steps.meta.outputs.php_version }}"
+          MODE="${{ steps.meta.outputs.mode }}"
+          IMG="katisuhara/turbine-php:latest-php${PHP}-${MODE}"
+          ssh -o StrictHostKeyChecking=no -i /tmp/bench_key "root@${IP}" bash -s << SERVE
+          set -euo pipefail
+          docker rm -f turbine-prof >/dev/null 2>&1 || true
+          # --pid=host so the binary PID is visible on the host for samply.
+          # --cap-add=SYS_ADMIN is not required; samply runs on the host.
+          docker run -d --name turbine-prof \
+              --pid=host \
+              -p 8080:80 \
+              -v /root/prof/app:/var/www/html:ro \
+              -v /root/prof/etc/turbine.toml:/etc/turbine/turbine.toml:ro \
+              "${IMG}" serve --config /etc/turbine/turbine.toml --root /var/www/html
+
+          # Wait for HTTP 200
+          for i in \$(seq 1 40); do
+            code=\$(curl -s -o /dev/null -w "%{http_code}" -m 2 http://127.0.0.1:8080/mandelbrot.php || echo 000)
+            [[ "\$code" == "200" ]] && break
+            sleep 0.5
+          done
+          if [[ "\$code" != "200" ]]; then
+            echo "::error::Turbine did not return 200 (last: \$code)"
+            docker logs --tail 80 turbine-prof || true
+            exit 1
+          fi
+          echo "--- jitstatus ---"
+          curl -s http://127.0.0.1:8080/jitstatus.php
+          echo ""
+          SERVE
+
+      - name: Warmup
+        run: |
+          IP="${{ steps.server.outputs.ip }}"
+          ssh -o StrictHostKeyChecking=no -i /tmp/bench_key "root@${IP}" \
+            "wrk -t2 -c8 -d5s http://127.0.0.1:8080/mandelbrot.php >/dev/null"
+
+      - name: Record samply profile under wrk load
+        id: record
+        run: |
+          IP="${{ steps.server.outputs.ip }}"
+          DUR="${{ steps.meta.outputs.duration }}"
+          CONN="${{ steps.meta.outputs.connections }}"
+          THREADS="${{ steps.meta.outputs.threads }}"
+          RATE="${{ steps.meta.outputs.sample_rate }}"
+          MODE="${{ steps.meta.outputs.mode }}"
+
+          ssh -o StrictHostKeyChecking=no -i /tmp/bench_key "root@${IP}" bash -s << REC
+          set -euo pipefail
+
+          # Find the turbine binary PID inside the container (visible on host
+          # thanks to --pid=host).
+          PID=\$(pgrep -f 'turbine .*serve' | head -1 || true)
+          if [[ -z "\$PID" ]]; then
+            echo "::error::Could not locate turbine PID on host"
+            ps -ef | grep turbine || true
+            exit 1
+          fi
+          echo "Attaching samply to PID \$PID"
+
+          OUT=/root/prof/profile-mandelbrot-${MODE}.json.gz
+          rm -f "\$OUT"
+
+          # Record for the whole workload duration + 5s startup slack.
+          samply record \
+              --save-only \
+              --output "\$OUT" \
+              --rate ${RATE} \
+              --duration \$((${DUR} + 2)) \
+              -p "\$PID" &
+          SAMPLY_PID=\$!
+          sleep 1
+
+          echo "wrk: -t${THREADS} -c${CONN} -d${DUR}s"
+          wrk -t${THREADS} -c${CONN} -d${DUR}s --latency \
+              http://127.0.0.1:8080/mandelbrot.php | tee /root/prof/wrk.txt
+
+          # Wait for samply to finalise the capture.
+          wait "\$SAMPLY_PID" || true
+
+          if [[ ! -s "\$OUT" ]]; then
+            echo "::error::Profile was not produced: \$OUT"
+            docker logs --tail 80 turbine-prof || true
+            exit 1
+          fi
+          ls -lh "\$OUT"
+          REC
+
+      - name: Fetch profile and wrk output
+        run: |
+          IP="${{ steps.server.outputs.ip }}"
+          MODE="${{ steps.meta.outputs.mode }}"
+          mkdir -p /tmp/profile-out
+          scp -o StrictHostKeyChecking=no -i /tmp/bench_key \
+              "root@${IP}:/root/prof/profile-mandelbrot-${MODE}.json.gz" \
+              /tmp/profile-out/
+          scp -o StrictHostKeyChecking=no -i /tmp/bench_key \
+              "root@${IP}:/root/prof/wrk.txt" \
+              /tmp/profile-out/wrk-${MODE}.txt
+          ls -lh /tmp/profile-out
+
+      - name: Summary
+        if: always()
+        run: |
+          MODE="${{ steps.meta.outputs.mode }}"
+          {
+            echo "## Turbine CPU Profile"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| **PHP** | ${{ steps.meta.outputs.php_version }} |"
+            echo "| **Mode** | ${MODE} |"
+            echo "| **Server** | Hetzner ${{ steps.meta.outputs.server_type }} |"
+            echo "| **Workers** | ${{ steps.meta.outputs.workers }} |"
+            echo "| **wrk** | ${{ steps.meta.outputs.threads }} threads × ${{ steps.meta.outputs.connections }} conns × ${{ steps.meta.outputs.duration }}s |"
+            echo "| **Rate** | ${{ steps.meta.outputs.sample_rate }} Hz |"
+            echo ""
+            echo "### wrk"
+            echo '```'
+            cat /tmp/profile-out/wrk-${MODE}.txt || true
+            echo '```'
+            echo ""
+            echo "Open the artifact \`turbine-profile-${MODE}\` in https://profiler.firefox.com."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload profile artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: turbine-profile-${{ steps.meta.outputs.mode }}-php${{ steps.meta.outputs.php_version }}
+          path: /tmp/profile-out/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Delete Hetzner server and SSH key
+        if: always()
+        env:
+          HCLOUD_TOKEN: ${{ secrets.HETZNER_API_TOKEN }}
+        run: |
+          if [[ -n "${SERVER_ID:-}" ]]; then
+            curl -fsSL -X DELETE \
+              -H "Authorization: Bearer $HCLOUD_TOKEN" \
+              "https://api.hetzner.cloud/v1/servers/${SERVER_ID}" || true
+          fi
+          if [[ -n "${KEY_ID:-}" ]]; then
+            curl -fsSL -X DELETE \
+              -H "Authorization: Bearer $HCLOUD_TOKEN" \
+              "https://api.hetzner.cloud/v1/ssh_keys/${KEY_ID}" || true
+          fi
