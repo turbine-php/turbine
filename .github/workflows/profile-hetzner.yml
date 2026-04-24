@@ -366,17 +366,20 @@ jobs:
           REC
 
       - name: Fetch profile and wrk output
+        if: always()
         run: |
           IP="${{ steps.server.outputs.ip }}"
           MODE="${{ steps.meta.outputs.mode }}"
           mkdir -p /tmp/profile-out
+          # Don't fail the step if a single file is missing — we still want
+          # to upload whatever we did manage to capture.
           scp -o StrictHostKeyChecking=no -i /tmp/bench_key \
               "root@${IP}:/root/prof/profile-mandelbrot-${MODE}.json.gz" \
-              /tmp/profile-out/
+              /tmp/profile-out/ || echo "::warning::profile scp failed"
           scp -o StrictHostKeyChecking=no -i /tmp/bench_key \
               "root@${IP}:/root/prof/wrk.txt" \
-              /tmp/profile-out/wrk-${MODE}.txt
-          ls -lh /tmp/profile-out
+              /tmp/profile-out/wrk-${MODE}.txt || echo "::warning::wrk.txt scp failed"
+          ls -lh /tmp/profile-out || true
 
       - name: Summary
         if: always()
@@ -408,7 +411,7 @@ jobs:
         with:
           name: turbine-profile-${{ steps.meta.outputs.mode }}-php${{ steps.meta.outputs.php_version }}
           path: /tmp/profile-out/
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 30
 
       - name: Delete Hetzner server and SSH key
