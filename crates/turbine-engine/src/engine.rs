@@ -32,9 +32,13 @@ static INI_PATH: std::sync::OnceLock<CString> = std::sync::OnceLock::new();
 
 /// SAPI name override — must live for the process lifetime.
 ///
-/// OPcache checks `sapi_module.name` against a whitelist of supported SAPIs.
-/// The "embed" SAPI is not in the list. We override it to "cli" so that
-/// OPcache enables when `opcache.enable_cli=1` is set.
+/// PHP < 8.5: OPcache's `accel_find_sapi()` only enables when `sapi_module.name`
+/// is on a hard-coded whitelist. The "embed" SAPI isn't on it, so we register
+/// as "cli-server" (which is on the whitelist) to get OPcache support.
+///
+/// PHP >= 8.5: the whitelist was removed (php-src#19351), so we register
+/// our real name "turbine" — distinguishing Turbine from PHP's built-in
+/// dev server for user code, profilers, and framework SAPI sniffing.
 static SAPI_NAME: std::sync::OnceLock<CString> = std::sync::OnceLock::new();
 
 /// Configuration for PHP ini generation, passed from the runtime config.
@@ -369,12 +373,23 @@ impl PhpEngine {
             // Tell PHP to ignore default php.ini search paths
             php_embed_module.php_ini_ignore = 1;
 
-            // Override SAPI name to "cli-server" BEFORE php_embed_init so that
-            // OPcache's accel_find_sapi() whitelist check passes during module
-            // startup. "cli-server" is directly in the whitelist and is a
-            // long-running server SAPI (PHP's built-in dev server), making it
-            // the most compatible choice for our embedded server runtime.
-            let name = CString::new("cli-server").unwrap();
+            // Override SAPI name BEFORE php_embed_init.
+            //
+            // OPcache's accel_find_sapi() in PHP < 8.5 keeps a hard-coded
+            // whitelist of supported SAPIs; if our name isn't on it,
+            // OPcache silently disables itself. "cli-server" is on the
+            // whitelist and is a long-running server SAPI, so it was the
+            // compatible choice for PHP 8.4 and earlier.
+            //
+            // PHP >= 8.5.0 removed the whitelist (php-src#19351), so we
+            // can (and should) expose our real identity. Using our own
+            // name lets user code and extensions distinguish Turbine from
+            // PHP's built-in dev server via `PHP_SAPI === 'turbine'`.
+            let name = if turbine_php_sys::PHP_VERSION_ID >= 80500 {
+                CString::new("turbine").unwrap()
+            } else {
+                CString::new("cli-server").unwrap()
+            };
             let name_ptr = name.as_ptr();
             SAPI_NAME.get_or_init(|| name);
             php_embed_module.name = name_ptr as *mut c_char;
