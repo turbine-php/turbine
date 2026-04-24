@@ -1,0 +1,28 @@
+# Default config for the profiling image. profile-docker.sh overwrites
+# this file via a bind-mount before running, so changes here are just
+# fallback defaults for ad-hoc `docker run`.
+[server]
+listen = "0.0.0.0:80"
+workers = 4
+worker_mode = "process"
+persistent_workers = true
+worker_max_requests = 0
+
+[php]
+memory_limit = "128M"
+opcache_memory = 128
+
+[logging]
+level = "warn"
+
+[security]
+enabled = false
+
+[cache]
+enabled = false
+
+[compression]
+enabled = false
+
+[php.ini]
+"opcache.jit_debug" = "0x20"
