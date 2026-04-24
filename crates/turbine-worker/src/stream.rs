@@ -335,6 +335,14 @@ impl std::fmt::Debug for StreamingHead {
     }
 }
 
+/// Return type of [`start_streaming_forwarder`]: the body-chunk channel
+/// and the completion signal. Factored into a named struct to avoid the
+/// `clippy::type_complexity` lint on the tuple return.
+pub struct StreamingForwarder {
+    pub body: tokio::sync::mpsc::Receiver<Result<Vec<u8>, io::Error>>,
+    pub done: tokio::sync::oneshot::Receiver<io::Result<bool>>,
+}
+
 /// Consume the leading `Headers` frame from `r`, then spawn a task that
 /// forwards every subsequent `BodyChunk` into the returned channel.
 ///
@@ -458,9 +466,7 @@ where
                     ));
                 }
                 Frame::Error(msg) => {
-                    return Err(io::Error::other(
-                        String::from_utf8_lossy(&msg).into_owned(),
-                    ));
+                    return Err(io::Error::other(String::from_utf8_lossy(&msg).into_owned()));
                 }
             }
         }
@@ -496,9 +502,7 @@ where
 /// 50 KB binary responses) that overhead dominates — the mpsc hop plus
 /// the body_buf extension adds a second ~body_len memcpy on top of the
 /// one already done by `read_exact` inside `read_frame_async`.
-pub async fn read_response_head<R>(
-    mut r: R,
-) -> io::Result<(u16, Vec<(String, String)>, R)>
+pub async fn read_response_head<R>(mut r: R) -> io::Result<(u16, Vec<(String, String)>, R)>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -562,7 +566,8 @@ where
                 // second memcpy.
                 let old_len = body.len();
                 body.resize(old_len + chunk_len, 0);
-                r.read_exact(&mut body[old_len..old_len + chunk_len]).await?;
+                r.read_exact(&mut body[old_len..old_len + chunk_len])
+                    .await?;
             }
             FRAME_END => {
                 let mut ok = [0u8; 1];
@@ -574,9 +579,7 @@ where
                 r.read_exact(&mut ml).await?;
                 let mut msg = vec![0u8; u32::from_le_bytes(ml) as usize];
                 r.read_exact(&mut msg).await?;
-                return Err(io::Error::other(
-                    String::from_utf8_lossy(&msg).into_owned(),
-                ));
+                return Err(io::Error::other(String::from_utf8_lossy(&msg).into_owned()));
             }
             FRAME_HEADERS => {
                 return Err(io::Error::new(
@@ -607,12 +610,7 @@ where
 /// fires, so the `AsyncFd` epoll registration is torn down before the
 /// caller is woken (avoids `EEXIST` on fd reuse — see `consume_streaming`
 /// for the full explanation).
-pub fn start_streaming_forwarder<R>(
-    r: R,
-) -> (
-    tokio::sync::mpsc::Receiver<Result<Vec<u8>, io::Error>>,
-    tokio::sync::oneshot::Receiver<io::Result<bool>>,
-)
+pub fn start_streaming_forwarder<R>(r: R) -> StreamingForwarder
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
@@ -676,9 +674,7 @@ where
                     ));
                 }
                 Frame::Error(msg) => {
-                    return Err(io::Error::other(
-                        String::from_utf8_lossy(&msg).into_owned(),
-                    ));
+                    return Err(io::Error::other(String::from_utf8_lossy(&msg).into_owned()));
                 }
             }
         }
@@ -689,7 +685,10 @@ where
         let _ = done_tx.send(result);
     });
 
-    (body_rx, done_rx)
+    StreamingForwarder {
+        body: body_rx,
+        done: done_rx,
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────

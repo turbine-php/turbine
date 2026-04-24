@@ -4181,7 +4181,10 @@ async fn handle_request_inner(
                 // ── True streaming response ─────────────────────────
                 // Now (and only now) spawn the body forwarder + mpsc
                 // channel that hyper's `ChannelBody` will pull from.
-                let (body_rx, done_rx) = turbine_worker::stream::start_streaming_forwarder(pipe);
+                let turbine_worker::stream::StreamingForwarder {
+                    body: body_rx,
+                    done: done_rx,
+                } = turbine_worker::stream::start_streaming_forwarder(pipe);
                 let log_worker = worker_idx_log;
                 let watch_state = return_state.clone();
 
@@ -4280,12 +4283,9 @@ async fn handle_request_inner(
                 );
 
                 state.security.record_request(client_ip, false);
-                state.metrics.record_request(
-                    &php_path,
-                    status_code,
-                    elapsed_us,
-                    body.len() as u64,
-                );
+                state
+                    .metrics
+                    .record_request(&php_path, status_code, elapsed_us, body.len() as u64);
                 if !response_prevents_caching(&resp_headers) {
                     state.cache.put(
                         &request.method,

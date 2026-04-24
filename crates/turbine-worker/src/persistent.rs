@@ -1023,8 +1023,7 @@ pub fn worker_event_loop_persistent(
                 // an intermediate Vec. For large bodies (e.g. the 50 KB
                 // binary in issue #19) this removes a body-sized memcpy
                 // that otherwise ran on every request.
-                let mut hdr_buf =
-                    Vec::with_capacity(32 + headers.len() * 32);
+                let mut hdr_buf = Vec::with_capacity(32 + headers.len() * 32);
                 crate::stream::encode_headers(&mut hdr_buf, status, &headers);
 
                 let mut end_buf = [0u8; 2];
@@ -1036,8 +1035,7 @@ pub fn worker_event_loop_persistent(
                     writev_all_fd(resp_fd, &mut parts)
                 } else {
                     let chunk_hdr = crate::stream::encode_body_chunk_header(body.len());
-                    let mut parts: [&[u8]; 4] =
-                        [&hdr_buf, &chunk_hdr, &body, &end_buf];
+                    let mut parts: [&[u8]; 4] = [&hdr_buf, &chunk_hdr, &body, &end_buf];
                     writev_all_fd(resp_fd, &mut parts)
                 }
             };
