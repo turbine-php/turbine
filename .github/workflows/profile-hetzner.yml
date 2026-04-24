@@ -322,6 +322,9 @@ jobs:
           rm -f "\$OUT"
 
           # Record for the whole workload duration + 5s startup slack.
+          # NOTE: when attached to an external PID samply prints
+          # "until Ctrl+C" and may ignore --duration, so we also send
+          # SIGINT after wrk finishes to make it flush and exit cleanly.
           samply record \
               --save-only \
               --output "\$OUT" \
@@ -335,8 +338,24 @@ jobs:
           wrk -t${THREADS} -c${CONN} -d${DUR}s --latency \
               http://127.0.0.1:8080/mandelbrot.php | tee /root/prof/wrk.txt
 
-          # Wait for samply to finalise the capture.
-          wait "\$SAMPLY_PID" || true
+          # Tell samply to stop recording and flush the profile.
+          # SIGINT is how it finalises output in "until Ctrl+C" mode.
+          if kill -0 "\$SAMPLY_PID" 2>/dev/null; then
+            kill -INT "\$SAMPLY_PID" 2>/dev/null || true
+          fi
+
+          # Bounded wait — if samply hasn't exited in 30s, force it.
+          for i in \$(seq 1 30); do
+            kill -0 "\$SAMPLY_PID" 2>/dev/null || break
+            sleep 1
+          done
+          if kill -0 "\$SAMPLY_PID" 2>/dev/null; then
+            echo "::warning::samply still running after 30s — sending SIGTERM"
+            kill -TERM "\$SAMPLY_PID" 2>/dev/null || true
+            sleep 2
+            kill -KILL "\$SAMPLY_PID" 2>/dev/null || true
+          fi
+          wait "\$SAMPLY_PID" 2>/dev/null || true
 
           if [[ ! -s "\$OUT" ]]; then
             echo "::error::Profile was not produced: \$OUT"
@@ -347,17 +366,20 @@ jobs:
           REC
 
       - name: Fetch profile and wrk output
+        if: always()
         run: |
           IP="${{ steps.server.outputs.ip }}"
           MODE="${{ steps.meta.outputs.mode }}"
           mkdir -p /tmp/profile-out
+          # Don't fail the step if a single file is missing — we still want
+          # to upload whatever we did manage to capture.
           scp -o StrictHostKeyChecking=no -i /tmp/bench_key \
               "root@${IP}:/root/prof/profile-mandelbrot-${MODE}.json.gz" \
-              /tmp/profile-out/
+              /tmp/profile-out/ || echo "::warning::profile scp failed"
           scp -o StrictHostKeyChecking=no -i /tmp/bench_key \
               "root@${IP}:/root/prof/wrk.txt" \
-              /tmp/profile-out/wrk-${MODE}.txt
-          ls -lh /tmp/profile-out
+              /tmp/profile-out/wrk-${MODE}.txt || echo "::warning::wrk.txt scp failed"
+          ls -lh /tmp/profile-out || true
 
       - name: Summary
         if: always()
@@ -389,7 +411,7 @@ jobs:
         with:
           name: turbine-profile-${{ steps.meta.outputs.mode }}-php${{ steps.meta.outputs.php_version }}
           path: /tmp/profile-out/
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 30
 
       - name: Delete Hetzner server and SSH key
