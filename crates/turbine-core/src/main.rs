@@ -668,18 +668,53 @@ impl ThreadDispatch {
 }
 
 /// RAII guard that returns a worker index to the idle pool on drop.
-/// Prevents worker leaks when an async task is cancelled (e.g. client disconnect).
+///
+/// Two modes:
+///   * Default: drop simply calls `return_idle(idx)`.  Used by the
+///     channel-based dispatch where the IPC is message-oriented and a
+///     cancelled future cannot leave bytes "in flight".
+///   * **Pipe-poison mode** (after `arm_poison(cmd_fd)`): drop *kills* the
+///     worker by sending a 0xFF shutdown byte on `cmd_fd` AND marking the
+///     slot unhealthy — UNLESS `mark_completed()` was called first.  This
+///     protects pipe-based persistent dispatch from contamination when the
+///     request future is cancelled mid-read (e.g. client TCP close, hyper
+///     timeout): otherwise leftover response bytes sitting in the resp
+///     pipe would be misread as the next request's frame discriminant
+///     ("unknown stream frame discriminant: 0x78").
 struct IdleGuard {
     td: Arc<ThreadDispatch>,
     idx: Option<usize>,
+    /// `Some(cmd_fd)` enables kill-on-drop semantics for pipe paths.
+    poison_on_drop: Option<std::os::unix::io::RawFd>,
+    /// Set by `mark_completed()` when the response was decoded successfully.
+    completed: bool,
 }
 
 impl IdleGuard {
     fn new(td: Arc<ThreadDispatch>, idx: usize) -> Self {
-        IdleGuard { td, idx: Some(idx) }
+        IdleGuard {
+            td,
+            idx: Some(idx),
+            poison_on_drop: None,
+            completed: false,
+        }
+    }
+    /// Enable kill-on-drop semantics for pipe-based dispatch.  Without
+    /// this, a cancelled future would silently return a worker whose
+    /// resp pipe still holds an unread response — corrupting the next
+    /// request that picks the same slot.
+    fn arm_poison(&mut self, cmd_fd: std::os::unix::io::RawFd) {
+        self.poison_on_drop = Some(cmd_fd);
+    }
+    /// Signal that the request finished cleanly (response fully decoded).
+    /// Cancels the kill-on-drop behaviour for armed guards.
+    fn mark_completed(&mut self) {
+        self.completed = true;
     }
     /// Consume the guard without returning the worker (e.g. on send error
-    /// where we manually call return_idle).
+    /// where we already manually marked the slot unhealthy and want to
+    /// avoid putting it back in the idle queue).
+    #[allow(dead_code)]
     fn defuse(&mut self) {
         self.idx = None;
     }
@@ -688,7 +723,32 @@ impl IdleGuard {
 impl Drop for IdleGuard {
     fn drop(&mut self) {
         if let Some(idx) = self.idx.take() {
-            self.td.return_idle(idx);
+            match (self.poison_on_drop, self.completed) {
+                (Some(cmd_fd), false) => {
+                    // Pipe path, request did NOT complete cleanly (decode
+                    // error OR future cancelled mid-await).  The worker's
+                    // resp pipe may contain leftover bytes that would
+                    // corrupt the next request.  Force the worker to exit;
+                    // the reaper will respawn it with fresh pipes and
+                    // refresh_fds will revive the slot.
+                    self.td.mark_unhealthy(idx);
+                    let shutdown_byte: [u8; 1] = [0xFF];
+                    let _ = unsafe {
+                        libc::write(
+                            cmd_fd,
+                            shutdown_byte.as_ptr() as *const libc::c_void,
+                            1,
+                        )
+                    };
+                    // Intentionally do NOT call `return_idle`: the slot
+                    // is unhealthy and refresh_fds will restore the
+                    // semaphore permit + idle-queue entry once the
+                    // worker has been respawned.
+                }
+                _ => {
+                    self.td.return_idle(idx);
+                }
+            }
         }
     }
 }
@@ -3390,17 +3450,21 @@ async fn handle_request_inner(
             };
             let mut guard = IdleGuard::new(td.clone(), worker_idx);
             let (cmd_fd, resp_fd) = td.fds(worker_idx);
+            // Arm pipe-poison: if the request future is cancelled mid-await
+            // (e.g. client TCP close, hyper timeout) OR decode fails, the
+            // guard's Drop will force the worker to exit so its (possibly
+            // partially-drained) resp pipe is replaced with a fresh one.
+            // Without this, leftover response bytes get misread as the
+            // next request's frame discriminant ("0x78" / "0x70" / etc.).
+            guard.arm_poison(cmd_fd);
             let write_result = turbine_worker::with_encode_scratch(|buf| {
                 turbine_worker::encode_request_into(buf, &per);
                 write_to_fd(cmd_fd, buf)
             });
             if let Err(e) = write_result {
                 error!(worker = worker_idx, error = %e, "Failed to send to persistent worker (thread dispatch)");
-                // Mark pipe as unhealthy so subsequent get_idle skips this
-                // worker until the reaper respawns it.  guard returns the
-                // idx on drop so the semaphore permit is restored, but
-                // the flag ensures the next dispatch bypasses this slot.
-                td.mark_unhealthy(worker_idx);
+                // guard's Drop (poison armed, !completed) will mark
+                // unhealthy + send 0xFF + skip idle requeue.
                 return Ok(build_response(
                     502,
                     "text/plain",
@@ -3426,23 +3490,13 @@ async fn handle_request_inner(
                     }
                     Err(e) => Err(e),
                 };
-            // If decode failed, tag the worker unhealthy AND send a
-            // shutdown byte so the worker exits — its pipe state may
-            // contain trailing bytes from a partial/oversized frame
-            // that would corrupt the very next request if the same
-            // pipe is reused.  Defuse the guard so the slot is NOT
-            // returned to the idle queue: the reaper will reap+respawn
-            // the now-exiting child and `refresh_fds` will revive the
-            // slot with fresh pipe fds.
-            if bin_result.is_err() {
-                td.mark_unhealthy(worker_idx);
-                let shutdown_byte: [u8; 1] = [0xFF];
-                let _ = unsafe {
-                    libc::write(cmd_fd, shutdown_byte.as_ptr() as *const libc::c_void, 1)
-                };
-                guard.defuse();
-            } else {
+            // If decode failed, leave the guard armed (no mark_completed):
+            // its Drop will mark the slot unhealthy, send 0xFF, and skip
+            // the idle requeue so the now-corrupted-pipe worker can't be
+            // reused before the reaper respawns it.
+            if bin_result.is_ok() {
                 td.record_served(worker_idx);
+                guard.mark_completed();
             }
             drop(guard);
 
@@ -3876,8 +3930,11 @@ async fn handle_request_inner(
 
         // ── Send request and receive response ─────────────────────
         // IdleGuard ensures the worker index returns to idle even if
-        // the task is cancelled (e.g. client disconnect).
-        let guard = IdleGuard::new(td.clone(), worker_idx);
+        // the task is cancelled (e.g. client disconnect).  When the
+        // pipe path is used (below), we additionally arm pipe-poison
+        // semantics so a cancelled mid-read doesn't leak unread bytes
+        // into the next request.
+        let mut guard = IdleGuard::new(td.clone(), worker_idx);
 
         let native_result: Result<NativeResponse, String> = if td.has_channels() {
             // In-memory channel IPC (zero syscalls); must own Vec<u8>.
@@ -3920,6 +3977,8 @@ async fn handle_request_inner(
         } else {
             // Pipe-based IPC (legacy / persistent fallback)
             let (cmd_fd, resp_fd) = td.fds(worker_idx);
+            // Arm pipe-poison so a cancelled mid-read forces worker recycle.
+            guard.arm_poison(cmd_fd);
             let write_result = turbine_worker::with_encode_scratch(|buf| {
                 turbine_worker::encode_native_request_into(
                     buf,
@@ -3942,9 +4001,9 @@ async fn handle_request_inner(
                 );
                 write_to_fd(cmd_fd, buf)
             });
-            if let Err(e) = write_result {
-                error!(worker = worker_idx, error = %e, "Failed to send to worker (thread dispatch)");
-                td.mark_unhealthy(worker_idx);
+            if write_result.is_err() {
+                error!(worker = worker_idx, "Failed to send to worker (thread dispatch)");
+                // guard's Drop (poison armed, !completed) handles cleanup.
                 return Ok(build_response(
                     502,
                     "text/plain",
@@ -3959,18 +4018,22 @@ async fn handle_request_inner(
                     Ok(mut pipe) => turbine_worker::read_native_response_async(&mut pipe).await,
                     Err(e) => Err(e),
                 };
-            if result.is_err() {
-                td.mark_unhealthy(worker_idx);
-            }
+            // On success the guard is marked completed below (after the
+            // map_err); on failure the armed guard's Drop will recycle
+            // the worker and skip the idle requeue.
             result.map_err(|e| e.to_string())
         };
 
-        // Explicitly drop the guard now to return worker to idle pool.
-        drop(guard);
-
+        // Mark completed so the guard's Drop returns the slot to idle
+        // instead of poisoning it.  Only valid for successful responses.
         if native_result.is_ok() {
+            guard.mark_completed();
             td.record_served(worker_idx);
         }
+
+        // Explicitly drop the guard now to either return to idle (success)
+        // or recycle the worker (failure / cancellation).
+        drop(guard);
 
         match native_result {
             Ok(resp) => {
