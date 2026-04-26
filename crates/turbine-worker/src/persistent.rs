@@ -10,21 +10,22 @@
 /// Rust -> Worker (per request):
 /// ```text
 /// [u8  cmd:  0x01 = HandleRequest | 0xFF = Shutdown]
-/// [u32 method_len LE] [method bytes]
-/// [u32 uri_len LE]    [uri bytes]        // full URI including ?query
+/// [u32 payload_len LE]
+/// [u32 method_len LE] [method bytes] \0
+/// [u32 uri_len LE]    [uri bytes] \0     // full URI including ?query
 /// [u32 body_len LE]   [body bytes]
-/// [u32 ip_len LE]     [client_ip bytes]
+/// [u32 ip_len LE]     [client_ip bytes] \0
 /// [u32 port LE]
 /// [u8  is_https]                        // 0 or 1
 /// [u32 header_count LE]
-///   per header: [u32 name_len][name] [u32 value_len][value]
-/// [u32 script_filename_len][script_filename]
-/// [u32 query_string_len][query_string]
-/// [u32 document_root_len][document_root]
-/// [u32 content_type_len][content_type]
-/// [u32 cookie_len][cookie]
-/// [u32 path_info_len][path_info]
-/// [u32 script_name_len][script_name]
+///   per header: [u32 name_len][name] \0 [u32 value_len][value] \0
+/// [u32 script_filename_len][script_filename] \0
+/// [u32 query_string_len][query_string] \0
+/// [u32 document_root_len][document_root] \0
+/// [u32 content_type_len][content_type] \0
+/// [u32 cookie_len][cookie] \0
+/// [u32 path_info_len][path_info] \0
+/// [u32 script_name_len][script_name] \0
 /// ```
 ///
 /// Worker -> Rust:
@@ -103,7 +104,10 @@ fn write_bytes(buf: &mut Vec<u8>, data: &[u8]) {
 
 #[inline]
 fn write_str(buf: &mut Vec<u8>, s: &str) {
-    write_bytes(buf, s.as_bytes());
+    let bytes = s.as_bytes();
+    write_u32_le(buf, bytes.len() as u32);
+    buf.extend_from_slice(bytes);
+    buf.push(0);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -164,6 +168,10 @@ pub fn encode_request_into(buf: &mut Vec<u8>, req: &PersistentRequest<'_>) {
     buf.reserve(256 + req.body.len());
 
     write_u8(buf, 0x01); // HandleRequest command
+    
+    let payload_start = buf.len();
+    write_u32_le(buf, 0); // Placeholder for payload_len
+
     write_str(buf, req.method);
     write_str(buf, req.uri);
     write_bytes(buf, req.body);
@@ -183,6 +191,11 @@ pub fn encode_request_into(buf: &mut Vec<u8>, req: &PersistentRequest<'_>) {
     write_str(buf, req.cookie);
     write_str(buf, req.path_info);
     write_str(buf, req.script_name);
+
+    // Patch total payload length
+    let payload_len = (buf.len() - payload_start - 4) as u32;
+    let len_bytes = payload_len.to_le_bytes();
+    buf[payload_start..payload_start + 4].copy_from_slice(&len_bytes);
 }
 
 /// Encode a `PersistentRequest` into the binary wire format (allocating).
@@ -401,7 +414,88 @@ pub fn read_ready_signal(resp_fd: RawFd) -> io::Result<bool> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Decoded request read from the cmd pipe inside the worker process.
-struct DecodedRequest {
+struct DecodedRequest<'a> {
+    method: &'a std::ffi::CStr,
+    uri: &'a std::ffi::CStr,
+    body: &'a [u8],
+    client_ip: &'a std::ffi::CStr,
+    port: u16,
+    is_https: bool,
+    headers: Vec<(&'a std::ffi::CStr, &'a std::ffi::CStr)>,
+    script_filename: &'a std::ffi::CStr,
+    query_string: &'a std::ffi::CStr,
+    document_root: &'a std::ffi::CStr,
+    content_type: &'a std::ffi::CStr,
+    cookie: &'a std::ffi::CStr,
+    path_info: &'a std::ffi::CStr,
+    script_name: &'a std::ffi::CStr,
+}
+
+impl<'a> DecodedRequest<'a> {
+    fn decode(data: &'a [u8]) -> Option<Self> {
+        let mut pos = 0;
+
+        let mut read_cstr = |data: &'a [u8], pos: &mut usize| -> Option<&'a std::ffi::CStr> {
+            if *pos + 4 > data.len() { return None; }
+            let len = u32::from_le_bytes([data[*pos], data[*pos+1], data[*pos+2], data[*pos+3]]) as usize;
+            *pos += 4;
+            if *pos + len + 1 > data.len() { return None; }
+            let slice = &data[*pos..*pos + len + 1];
+            *pos += len + 1;
+            std::ffi::CStr::from_bytes_with_nul(slice).ok()
+        };
+
+        let mut read_bytes = |data: &'a [u8], pos: &mut usize| -> Option<&'a [u8]> {
+            if *pos + 4 > data.len() { return None; }
+            let len = u32::from_le_bytes([data[*pos], data[*pos+1], data[*pos+2], data[*pos+3]]) as usize;
+            *pos += 4;
+            if *pos + len > data.len() { return None; }
+            let slice = &data[*pos..*pos + len];
+            *pos += len;
+            Some(slice)
+        };
+
+        let method = read_cstr(data, &mut pos)?;
+        let uri = read_cstr(data, &mut pos)?;
+        let body = read_bytes(data, &mut pos)?;
+        let client_ip = read_cstr(data, &mut pos)?;
+
+        if pos + 4 > data.len() { return None; }
+        let port = u32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]) as u16;
+        pos += 4;
+
+        if pos + 1 > data.len() { return None; }
+        let is_https = data[pos] != 0;
+        pos += 1;
+
+        if pos + 4 > data.len() { return None; }
+        let hdr_count = u32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]) as usize;
+        pos += 4;
+
+        let mut headers = Vec::with_capacity(hdr_count);
+        for _ in 0..hdr_count {
+            let name = read_cstr(data, &mut pos)?;
+            let value = read_cstr(data, &mut pos)?;
+            headers.push((name, value));
+        }
+
+        let script_filename = read_cstr(data, &mut pos)?;
+        let query_string = read_cstr(data, &mut pos)?;
+        let document_root = read_cstr(data, &mut pos)?;
+        let content_type = read_cstr(data, &mut pos)?;
+        let cookie = read_cstr(data, &mut pos)?;
+        let path_info = read_cstr(data, &mut pos)?;
+        let script_name = read_cstr(data, &mut pos)?;
+
+        Some(DecodedRequest {
+            method, uri, body, client_ip, port, is_https, headers,
+            script_filename, query_string, document_root, content_type, cookie, path_info, script_name
+        })
+    }
+}
+
+#[cfg(test)]
+struct DecodedRequestOwned {
     method: String,
     uri: String,
     body: Vec<u8>,
@@ -418,77 +512,43 @@ struct DecodedRequest {
     script_name: String,
 }
 
-/// Decode a full request from a `Read` source (pipe fd, in-memory buffer, etc).
-/// Mirror of the `encode_request_into` wire format.  Used by both the pipe
-/// and channel worker event loops — channel mode wraps a `&[u8]` in a
-/// `std::io::Cursor` and reuses the same decoder.
-fn decode_request_from_reader<R: Read>(r: &mut R) -> io::Result<DecodedRequest> {
-    // All read_* helpers here mirror the fd variants but work on any Read.
-    fn read_exact_n<R: Read>(r: &mut R, n: usize) -> io::Result<Vec<u8>> {
-        let mut buf = vec![0u8; n];
-        r.read_exact(&mut buf)?;
-        Ok(buf)
-    }
-    fn read_u8_r<R: Read>(r: &mut R) -> io::Result<u8> {
-        Ok(read_exact_n(r, 1)?[0])
-    }
-    fn read_u32_le_r<R: Read>(r: &mut R) -> io::Result<u32> {
-        let b = read_exact_n(r, 4)?;
-        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-    }
-    fn read_string_r<R: Read>(r: &mut R) -> io::Result<String> {
-        let len = read_u32_le_r(r)? as usize;
-        let bytes = read_exact_n(r, len)?;
-        String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-    }
-    fn read_bytes_r<R: Read>(r: &mut R) -> io::Result<Vec<u8>> {
-        let len = read_u32_le_r(r)? as usize;
-        read_exact_n(r, len)
-    }
-
-    let method = read_string_r(r)?;
-    let uri = read_string_r(r)?;
-    let body = read_bytes_r(r)?;
-    let client_ip = read_string_r(r)?;
-    let port = read_u32_le_r(r)? as u16;
-    let is_https = read_u8_r(r)? != 0;
-    let hdr_count = read_u32_le_r(r)? as usize;
-    let mut headers = Vec::with_capacity(hdr_count);
-    for _ in 0..hdr_count {
-        let name = read_string_r(r)?;
-        let value = read_string_r(r)?;
-        headers.push((name, value));
-    }
-    let script_filename = read_string_r(r)?;
-    let query_string = read_string_r(r)?;
-    let document_root = read_string_r(r)?;
-    let content_type = read_string_r(r)?;
-    let cookie = read_string_r(r)?;
-    let path_info = read_string_r(r)?;
-    let script_name = read_string_r(r)?;
-
-    Ok(DecodedRequest {
-        method,
-        uri,
-        body,
-        client_ip,
-        port,
-        is_https,
-        headers,
-        script_filename,
-        query_string,
-        document_root,
-        content_type,
-        cookie,
-        path_info,
-        script_name,
-    })
-}
-
 #[cfg(test)]
-fn decode_request_from_fd(cmd_fd: RawFd) -> io::Result<DecodedRequest> {
+fn decode_request_from_fd(cmd_fd: RawFd) -> io::Result<DecodedRequestOwned> {
     let mut reader = std::io::BufReader::with_capacity(8192, FdReader(cmd_fd));
-    decode_request_from_reader(&mut reader)
+    let mut cmd = [0u8; 1];
+    reader.read_exact(&mut cmd)?;
+    if cmd[0] != 0x01 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "Unknown command byte"));
+    }
+
+    let mut len_buf = [0u8; 4];
+    reader.read_exact(&mut len_buf)?;
+    let payload_len = u32::from_le_bytes(len_buf) as usize;
+    let mut payload = vec![0u8; payload_len];
+    if payload_len > 0 {
+        reader.read_exact(&mut payload)?;
+    }
+    
+    let req = DecodedRequest::decode(&payload).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "Failed to decode payload")
+    })?;
+    
+    Ok(DecodedRequestOwned {
+        method: req.method.to_string_lossy().into_owned(),
+        uri: req.uri.to_string_lossy().into_owned(),
+        body: req.body.to_vec(),
+        client_ip: req.client_ip.to_string_lossy().into_owned(),
+        port: req.port,
+        is_https: req.is_https,
+        headers: req.headers.iter().map(|(k, v)| (k.to_string_lossy().into_owned(), v.to_string_lossy().into_owned())).collect(),
+        script_filename: req.script_filename.to_string_lossy().into_owned(),
+        query_string: req.query_string.to_string_lossy().into_owned(),
+        document_root: req.document_root.to_string_lossy().into_owned(),
+        content_type: req.content_type.to_string_lossy().into_owned(),
+        cookie: req.cookie.to_string_lossy().into_owned(),
+        path_info: req.path_info.to_string_lossy().into_owned(),
+        script_name: req.script_name.to_string_lossy().into_owned(),
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -727,11 +787,7 @@ pub fn worker_event_loop_persistent(
             "No worker_cleanup configured — cleanup will NOT run"
         );
     }
-    let cleanup_code = cleanup_abs.as_ref().map(|p| {
-        let code = format!("include '{}';", p);
-        safe_cstring(code.as_bytes())
-    });
-    let cleanup_eval_name = safe_cstring(b"turbine_worker_cleanup");
+    let c_cleanup_path = cleanup_abs.as_ref().map(|p| safe_cstring(p.as_bytes()));
 
     // Install initial output capture (for both modes).
     unsafe {
@@ -769,11 +825,23 @@ pub fn worker_event_loop_persistent(
             continue;
         }
 
-        // Decode request payload.
-        let req = match decode_request_from_reader(&mut cmd_reader) {
-            Ok(r) => r,
-            Err(e) => {
-                error!(pid = std::process::id(), error = %e, "Failed to decode request");
+        // Read request payload length
+        let mut len_buf = [0u8; 4];
+        if cmd_reader.read_exact(&mut len_buf).is_err() {
+            break;
+        }
+        let payload_len = u32::from_le_bytes(len_buf) as usize;
+        
+        let mut payload = vec![0u8; payload_len];
+        if cmd_reader.read_exact(&mut payload).is_err() {
+            break;
+        }
+
+        // Decode binary payload
+        let req = match DecodedRequest::decode(&payload) {
+            Some(r) => r,
+            None => {
+                error!(pid = std::process::id(), "Failed to decode request");
                 let _ = write_response(resp_fd, false, 500, &[], b"Failed to decode request");
                 continue;
             }
@@ -787,34 +855,30 @@ pub fn worker_event_loop_persistent(
             "Executing via native SAPI (persistent)"
         );
 
-        // Build CStrings for the C API.
-        let c_method = safe_cstring(req.method.as_bytes());
-        let c_uri = safe_cstring(req.uri.as_bytes());
-        let c_qs = safe_cstring(req.query_string.as_bytes());
-        let c_ct = safe_cstring(req.content_type.as_bytes());
-        let c_cookie = safe_cstring(req.cookie.as_bytes());
-        let c_script = safe_cstring(req.script_filename.as_bytes());
-        let c_docroot = safe_cstring(req.document_root.as_bytes());
-        let c_addr = safe_cstring(req.client_ip.as_bytes());
-        let c_pathinfo = safe_cstring(req.path_info.as_bytes());
-        let c_scriptname = safe_cstring(req.script_name.as_bytes());
+        // CStrings without allocations (zero-copy references from binary protocol)
+        let c_method = req.method;
+        let c_uri = req.uri;
+        let c_qs = req.query_string;
+        let c_ct = req.content_type;
+        let c_cookie = req.cookie;
+        let c_script = req.script_filename;
+        let c_docroot = req.document_root;
+        let c_addr = req.client_ip;
+        let c_pathinfo = req.path_info;
+        let c_scriptname = req.script_name;
 
-        // Headers are passed as raw (ptr, len) arrays — no per-request
-        // CString allocation. The underlying String data lives in
-        // `req.headers` for the duration of this scope, which covers the
-        // entire execute + shutdown window.
         let key_ptrs: Vec<*const std::ffi::c_char> = req
             .headers
             .iter()
-            .map(|(k, _)| k.as_ptr() as *const std::ffi::c_char)
+            .map(|(k, _)| k.as_ptr())
             .collect();
-        let key_lens: Vec<usize> = req.headers.iter().map(|(k, _)| k.len()).collect();
+        let key_lens: Vec<usize> = req.headers.iter().map(|(k, _)| k.to_bytes().len()).collect();
         let val_ptrs: Vec<*const std::ffi::c_char> = req
             .headers
             .iter()
-            .map(|(_, v)| v.as_ptr() as *const std::ffi::c_char)
+            .map(|(_, v)| v.as_ptr())
             .collect();
-        let val_lens: Vec<usize> = req.headers.iter().map(|(_, v)| v.len()).collect();
+        let val_lens: Vec<usize> = req.headers.iter().map(|(_, v)| v.to_bytes().len()).collect();
 
         let content_length: libc::c_long = if req.body.is_empty() {
             -1
@@ -828,13 +892,13 @@ pub fn worker_event_loop_persistent(
                 c_method.as_ptr(),
                 c_uri.as_ptr(),
                 c_qs.as_ptr(),
-                if req.content_type.is_empty() {
+                if req.content_type.to_bytes().is_empty() {
                     std::ptr::null()
                 } else {
                     c_ct.as_ptr()
                 },
                 content_length,
-                if req.cookie.is_empty() {
+                if req.cookie.to_bytes().is_empty() {
                     std::ptr::null()
                 } else {
                     c_cookie.as_ptr()
@@ -900,27 +964,23 @@ pub fn worker_event_loop_persistent(
 
                 // Run cleanup script (if configured) BEFORE collecting output.
                 // Cleanup output is intentionally discarded below (after shutdown).
-                if let Some(ref c_cleanup) = cleanup_code {
+                if let Some(ref c_cleanup) = c_cleanup_path {
                     debug!(
                         pid = std::process::id(),
                         "Running worker cleanup (lightweight path)"
                     );
-                    let cleanup_result = turbine_php_sys::zend_eval_string(
-                        c_cleanup.as_ptr(),
-                        std::ptr::null_mut(),
-                        cleanup_eval_name.as_ptr(),
-                    );
+                    let cleanup_result = turbine_php_sys::turbine_execute_script(c_cleanup.as_ptr());
                     if cleanup_result != turbine_php_sys::SUCCESS {
                         warn!(
                             pid = std::process::id(),
                             result = cleanup_result,
-                            "Cleanup script eval FAILED"
+                            "Cleanup script execution FAILED"
                         );
                     }
                 } else {
                     debug!(
                         pid = std::process::id(),
-                        "No cleanup_code — skipping cleanup"
+                        "No cleanup script — skipping cleanup"
                     );
                 }
 
@@ -956,27 +1016,23 @@ pub fn worker_event_loop_persistent(
                 let r = turbine_php_sys::turbine_execute_script(c_script.as_ptr());
 
                 // Run cleanup script (if configured) BEFORE collecting output.
-                if let Some(ref c_cleanup) = cleanup_code {
+                if let Some(ref c_cleanup) = c_cleanup_path {
                     debug!(
                         pid = std::process::id(),
                         "Running worker cleanup (full lifecycle path)"
                     );
-                    let cleanup_result = turbine_php_sys::zend_eval_string(
-                        c_cleanup.as_ptr(),
-                        std::ptr::null_mut(),
-                        cleanup_eval_name.as_ptr(),
-                    );
+                    let cleanup_result = turbine_php_sys::turbine_execute_script(c_cleanup.as_ptr());
                     if cleanup_result != turbine_php_sys::SUCCESS {
                         warn!(
                             pid = std::process::id(),
                             result = cleanup_result,
-                            "Cleanup script eval FAILED (full lifecycle)"
+                            "Cleanup script execution FAILED (full lifecycle)"
                         );
                     }
                 } else {
                     debug!(
                         pid = std::process::id(),
-                        "No cleanup_code — skipping cleanup (full lifecycle)"
+                        "No cleanup script — skipping cleanup (full lifecycle)"
                     );
                 }
 
@@ -1634,9 +1690,10 @@ mod tests {
     fn write_str_utf8() {
         let mut buf = Vec::new();
         write_str(&mut buf, "café");
-        let expected_len = "café".len() as u32; // 5 bytes in UTF-8
+        let expected_len = "café".len() as u32;
         assert_eq!(&buf[0..4], &expected_len.to_le_bytes());
-        assert_eq!(&buf[4..], "café".as_bytes());
+        assert_eq!(&buf[4..buf.len() - 1], "café".as_bytes());
+        assert_eq!(buf.last(), Some(&0));
     }
 
     // ── Request Encoding ────────────────────────────────────────────
@@ -1756,11 +1813,11 @@ mod tests {
         let written = unsafe {
             libc::write(
                 write_fd,
-                encoded[1..].as_ptr() as *const _,
-                encoded.len() - 1,
+                encoded.as_ptr() as *const _,
+                encoded.len(),
             )
         };
-        assert_eq!(written as usize, encoded.len() - 1);
+        assert_eq!(written as usize, encoded.len());
 
         // Decode from the read end
         let decoded = decode_request_from_fd(read_fd).expect("decode failed");
@@ -1819,11 +1876,11 @@ mod tests {
         let written = unsafe {
             libc::write(
                 write_fd,
-                encoded[1..].as_ptr() as *const _,
-                encoded.len() - 1,
+                encoded.as_ptr() as *const _,
+                encoded.len(),
             )
         };
-        assert_eq!(written as usize, encoded.len() - 1);
+        assert_eq!(written as usize, encoded.len());
 
         let decoded = decode_request_from_fd(read_fd).expect("decode failed");
         assert_eq!(decoded.method, "GET");
@@ -1973,7 +2030,7 @@ mod tests {
         let encoded = encode_request(&req);
 
         let writer = std::thread::spawn(move || {
-            write_all_fd(write_fd, &encoded[1..]).expect("write failed");
+            write_all_fd(write_fd, &encoded).expect("write failed");
             unsafe {
                 libc::close(write_fd);
             }
@@ -2079,7 +2136,7 @@ mod tests {
 
         let encoded = encode_request(&req);
         let writer = std::thread::spawn(move || {
-            write_all_fd(write_fd, &encoded[1..]).expect("write failed");
+            write_all_fd(write_fd, &encoded).expect("write failed");
             unsafe {
                 libc::close(write_fd);
             }
