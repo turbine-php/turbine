@@ -223,10 +223,7 @@ struct ThreadDispatch {
 
 impl ThreadDispatch {
     /// Create a pipe-based ThreadDispatch (legacy / persistent workers).
-    fn new(
-        fds: Vec<(std::os::unix::io::RawFd, std::os::unix::io::RawFd)>,
-        pids: Vec<i32>,
-    ) -> Self {
+    fn new(fds: Vec<(std::os::unix::io::RawFd, std::os::unix::io::RawFd)>, pids: Vec<i32>) -> Self {
         let count = fds.len();
         let mut queue = std::collections::VecDeque::with_capacity(count);
         for i in 0..count {
