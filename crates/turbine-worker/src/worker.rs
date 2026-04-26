@@ -25,22 +25,32 @@ impl ManualFd {
 
 impl Read for ManualFd {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let ret = unsafe { libc::read(self.fd, buf.as_mut_ptr() as *mut _, buf.len()) };
-        if ret < 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(ret as usize)
+        loop {
+            let ret = unsafe { libc::read(self.fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+            if ret < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(err);
+            }
+            return Ok(ret as usize);
         }
     }
 }
 
 impl Write for ManualFd {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let ret = unsafe { libc::write(self.fd, buf.as_ptr() as *const _, buf.len()) };
-        if ret < 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(ret as usize)
+        loop {
+            let ret = unsafe { libc::write(self.fd, buf.as_ptr() as *const _, buf.len()) };
+            if ret < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(err);
+            }
+            return Ok(ret as usize);
         }
     }
 
@@ -281,21 +291,22 @@ impl Worker {
     ///
     /// Returns (success: bool, output: Vec<u8>).
     pub fn read_response(&self) -> std::io::Result<(bool, Vec<u8>)> {
-        let mut file = unsafe { ManualFd::new(self.resp_fd) };
+        let file = unsafe { ManualFd::new(self.resp_fd) };
+        let mut r = std::io::BufReader::with_capacity(8192, file);
 
         // Read status byte
         let mut status_buf = [0u8; 1];
-        file.read_exact(&mut status_buf)?;
+        r.read_exact(&mut status_buf)?;
 
         // Read payload length
         let mut len_buf = [0u8; 4];
-        file.read_exact(&mut len_buf)?;
+        r.read_exact(&mut len_buf)?;
         let payload_len = u32::from_le_bytes(len_buf) as usize;
 
         // Read payload
         let mut payload = vec![0u8; payload_len];
         if payload_len > 0 {
-            file.read_exact(&mut payload)?;
+            r.read_exact(&mut payload)?;
         }
 
         let success =

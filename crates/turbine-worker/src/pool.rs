@@ -782,7 +782,8 @@ pub fn write_to_fd(fd: RawFd, data: &[u8]) -> std::io::Result<()> {
 pub fn worker_event_loop(cmd_fd: RawFd, resp_fd: RawFd) {
     debug!(pid = std::process::id(), "Worker event loop started");
 
-    let mut cmd_reader = unsafe { std::fs::File::from_raw_fd(cmd_fd) };
+    let cmd_file = unsafe { std::fs::File::from_raw_fd(cmd_fd) };
+    let mut cmd_reader = std::io::BufReader::with_capacity(8192, cmd_file);
     let mut resp_writer = unsafe { std::fs::File::from_raw_fd(resp_fd) };
 
     // The PHP engine was initialized in the parent before fork().
@@ -942,7 +943,8 @@ pub fn worker_event_loop_native(cmd_fd: RawFd, resp_fd: RawFd) {
         "Native SAPI worker event loop started"
     );
 
-    let mut cmd_reader = unsafe { std::fs::File::from_raw_fd(cmd_fd) };
+    let cmd_file = unsafe { std::fs::File::from_raw_fd(cmd_fd) };
+    let mut cmd_reader = std::io::BufReader::with_capacity(8192, cmd_file);
     let mut resp_writer = unsafe { std::fs::File::from_raw_fd(resp_fd) };
 
     use turbine_engine::output;
@@ -998,33 +1000,35 @@ pub fn worker_event_loop_native(cmd_fd: RawFd, resp_fd: RawFd) {
                     }
                 };
 
-                debug!(pid = std::process::id(), script = %req.script_path, "Executing via native SAPI");
+                debug!(pid = std::process::id(), script = ?req.script_path, "Executing via native SAPI");
 
-                // Build CStrings for the C API (strip interior null bytes)
-                let c_method = safe_cstring(req.method.as_bytes());
-                let c_uri = safe_cstring(req.uri.as_bytes());
-                let c_qs = safe_cstring(req.query_string.as_bytes());
-                let c_ct = safe_cstring(req.content_type.as_bytes());
-                let c_cookie = safe_cstring(req.cookie.as_bytes());
-                let c_script = safe_cstring(req.script_path.as_bytes());
-                let c_docroot = safe_cstring(req.document_root.as_bytes());
-                let c_addr = safe_cstring(req.remote_addr.as_bytes());
-                let c_pathinfo = safe_cstring(req.path_info.as_bytes());
-                let c_scriptname = safe_cstring(req.script_name.as_bytes());
+                // CStrings without allocations (zero-copy references from binary protocol)
+                let c_method = req.method;
+                let c_uri = req.uri;
+                let c_qs = req.query_string;
+                let c_ct = req.content_type;
+                let c_cookie = req.cookie;
+                let c_script = req.script_path;
+                let c_docroot = req.document_root;
+                let c_addr = req.remote_addr;
+                let c_pathinfo = req.path_info;
+                let c_scriptname = req.script_name;
 
                 // Headers as raw (ptr, len) — no per-request CString allocation.
-                let key_ptrs: Vec<*const std::ffi::c_char> = req
+                let key_ptrs: Vec<*const std::ffi::c_char> =
+                    req.headers.iter().map(|(k, _)| k.as_ptr()).collect();
+                let key_lens: Vec<usize> = req
                     .headers
                     .iter()
-                    .map(|(k, _)| k.as_ptr() as *const std::ffi::c_char)
+                    .map(|(k, _)| k.to_bytes().len())
                     .collect();
-                let key_lens: Vec<usize> = req.headers.iter().map(|(k, _)| k.len()).collect();
-                let val_ptrs: Vec<*const std::ffi::c_char> = req
+                let val_ptrs: Vec<*const std::ffi::c_char> =
+                    req.headers.iter().map(|(_, v)| v.as_ptr()).collect();
+                let val_lens: Vec<usize> = req
                     .headers
                     .iter()
-                    .map(|(_, v)| v.as_ptr() as *const std::ffi::c_char)
+                    .map(|(_, v)| v.to_bytes().len())
                     .collect();
-                let val_lens: Vec<usize> = req.headers.iter().map(|(_, v)| v.len()).collect();
 
                 let content_length: libc::c_long = if req.body.is_empty() {
                     -1
@@ -1038,13 +1042,13 @@ pub fn worker_event_loop_native(cmd_fd: RawFd, resp_fd: RawFd) {
                         c_method.as_ptr(),
                         c_uri.as_ptr(),
                         c_qs.as_ptr(),
-                        if req.content_type.is_empty() {
+                        if req.content_type.to_bytes().is_empty() {
                             std::ptr::null()
                         } else {
                             c_ct.as_ptr()
                         },
                         content_length,
-                        if req.cookie.is_empty() {
+                        if req.cookie.to_bytes().is_empty() {
                             std::ptr::null()
                         } else {
                             c_cookie.as_ptr()
@@ -1223,30 +1227,32 @@ pub fn worker_event_loop_channel(
                 }
             };
 
-            let c_method = safe_cstring(req.method.as_bytes());
-            let c_uri = safe_cstring(req.uri.as_bytes());
-            let c_qs = safe_cstring(req.query_string.as_bytes());
-            let c_ct = safe_cstring(req.content_type.as_bytes());
-            let c_cookie = safe_cstring(req.cookie.as_bytes());
-            let c_script = safe_cstring(req.script_path.as_bytes());
-            let c_docroot = safe_cstring(req.document_root.as_bytes());
-            let c_addr = safe_cstring(req.remote_addr.as_bytes());
-            let c_pathinfo = safe_cstring(req.path_info.as_bytes());
-            let c_scriptname = safe_cstring(req.script_name.as_bytes());
+            let c_method = req.method;
+            let c_uri = req.uri;
+            let c_qs = req.query_string;
+            let c_ct = req.content_type;
+            let c_cookie = req.cookie;
+            let c_script = req.script_path;
+            let c_docroot = req.document_root;
+            let c_addr = req.remote_addr;
+            let c_pathinfo = req.path_info;
+            let c_scriptname = req.script_name;
 
             // Headers as raw (ptr, len) — no per-request CString allocation.
-            let key_ptrs: Vec<*const std::ffi::c_char> = req
+            let key_ptrs: Vec<*const std::ffi::c_char> =
+                req.headers.iter().map(|(k, _)| k.as_ptr()).collect();
+            let key_lens: Vec<usize> = req
                 .headers
                 .iter()
-                .map(|(k, _)| k.as_ptr() as *const std::ffi::c_char)
+                .map(|(k, _)| k.to_bytes().len())
                 .collect();
-            let key_lens: Vec<usize> = req.headers.iter().map(|(k, _)| k.len()).collect();
-            let val_ptrs: Vec<*const std::ffi::c_char> = req
+            let val_ptrs: Vec<*const std::ffi::c_char> =
+                req.headers.iter().map(|(_, v)| v.as_ptr()).collect();
+            let val_lens: Vec<usize> = req
                 .headers
                 .iter()
-                .map(|(_, v)| v.as_ptr() as *const std::ffi::c_char)
+                .map(|(_, v)| v.to_bytes().len())
                 .collect();
-            let val_lens: Vec<usize> = req.headers.iter().map(|(_, v)| v.len()).collect();
 
             let content_length: libc::c_long = if req.body.is_empty() {
                 -1
@@ -1259,13 +1265,13 @@ pub fn worker_event_loop_channel(
                     c_method.as_ptr(),
                     c_uri.as_ptr(),
                     c_qs.as_ptr(),
-                    if req.content_type.is_empty() {
+                    if req.content_type.to_bytes().is_empty() {
                         std::ptr::null()
                     } else {
                         c_ct.as_ptr()
                     },
                     content_length,
-                    if req.cookie.is_empty() {
+                    if req.cookie.to_bytes().is_empty() {
                         std::ptr::null()
                     } else {
                         c_cookie.as_ptr()
@@ -1340,48 +1346,48 @@ pub fn worker_event_loop_channel(
 }
 
 /// Binary request data for the native SAPI worker.
-struct NativeRequest {
-    script_path: String,
-    method: String,
-    uri: String,
-    query_string: String,
-    content_type: String,
-    cookie: String,
-    document_root: String,
-    remote_addr: String,
+struct NativeRequest<'a> {
+    script_path: &'a std::ffi::CStr,
+    method: &'a std::ffi::CStr,
+    uri: &'a std::ffi::CStr,
+    query_string: &'a std::ffi::CStr,
+    content_type: &'a std::ffi::CStr,
+    cookie: &'a std::ffi::CStr,
+    document_root: &'a std::ffi::CStr,
+    remote_addr: &'a std::ffi::CStr,
     remote_port: u16,
     server_port: u16,
     is_https: bool,
-    path_info: String,
-    script_name: String,
-    body: Vec<u8>,
-    headers: Vec<(String, String)>,
+    path_info: &'a std::ffi::CStr,
+    script_name: &'a std::ffi::CStr,
+    body: &'a [u8],
+    headers: Vec<(&'a std::ffi::CStr, &'a std::ffi::CStr)>,
 }
 
-impl NativeRequest {
+impl<'a> NativeRequest<'a> {
     /// Decode from binary payload (after cmd byte + total_len).
-    fn decode(data: &[u8]) -> Option<Self> {
+    fn decode(data: &'a [u8]) -> Option<Self> {
         let mut pos = 0;
 
-        let read_str = |data: &[u8], pos: &mut usize| -> Option<String> {
+        let read_cstr = |data: &'a [u8], pos: &mut usize| -> Option<&'a std::ffi::CStr> {
             if *pos + 2 > data.len() {
                 return None;
             }
             let len = u16::from_le_bytes([data[*pos], data[*pos + 1]]) as usize;
             *pos += 2;
-            if *pos + len > data.len() {
+            if *pos + len + 1 > data.len() {
                 return None;
             }
-            let s = String::from_utf8_lossy(&data[*pos..*pos + len]).into_owned();
-            *pos += len;
-            Some(s)
+            let slice = &data[*pos..*pos + len + 1];
+            *pos += len + 1;
+            std::ffi::CStr::from_bytes_with_nul(slice).ok()
         };
 
-        let script_path = read_str(data, &mut pos)?;
-        let method = read_str(data, &mut pos)?;
-        let uri = read_str(data, &mut pos)?;
-        let query_string = read_str(data, &mut pos)?;
-        let content_type = read_str(data, &mut pos)?;
+        let script_path = read_cstr(data, &mut pos)?;
+        let method = read_cstr(data, &mut pos)?;
+        let uri = read_cstr(data, &mut pos)?;
+        let query_string = read_cstr(data, &mut pos)?;
+        let content_type = read_cstr(data, &mut pos)?;
 
         if pos + 4 > data.len() {
             return None;
@@ -1390,9 +1396,9 @@ impl NativeRequest {
             i32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
         pos += 4;
 
-        let cookie = read_str(data, &mut pos)?;
-        let document_root = read_str(data, &mut pos)?;
-        let remote_addr = read_str(data, &mut pos)?;
+        let cookie = read_cstr(data, &mut pos)?;
+        let document_root = read_cstr(data, &mut pos)?;
+        let remote_addr = read_cstr(data, &mut pos)?;
 
         if pos + 2 > data.len() {
             return None;
@@ -1412,8 +1418,8 @@ impl NativeRequest {
         let is_https = data[pos] != 0;
         pos += 1;
 
-        let path_info = read_str(data, &mut pos)?;
-        let script_name = read_str(data, &mut pos)?;
+        let path_info = read_cstr(data, &mut pos)?;
+        let script_name = read_cstr(data, &mut pos)?;
 
         // Body
         if pos + 4 > data.len() {
@@ -1425,7 +1431,7 @@ impl NativeRequest {
         if pos + body_len > data.len() {
             return None;
         }
-        let body = data[pos..pos + body_len].to_vec();
+        let body = &data[pos..pos + body_len];
         pos += body_len;
 
         // Headers
@@ -1437,8 +1443,8 @@ impl NativeRequest {
 
         let mut headers = Vec::with_capacity(header_count);
         for _ in 0..header_count {
-            let k = read_str(data, &mut pos)?;
-            let v = read_str(data, &mut pos)?;
+            let k = read_cstr(data, &mut pos)?;
+            let v = read_cstr(data, &mut pos)?;
             headers.push((k, v));
         }
 
@@ -1498,7 +1504,7 @@ pub fn encode_native_request_into(
         + remote_addr.len()
         + headers
             .iter()
-            .map(|(k, v)| k.len() + v.len() + 4)
+            .map(|(k, v)| k.len() + v.len() + 6)
             .sum::<usize>();
     msg.reserve(est);
 
@@ -1510,6 +1516,7 @@ pub fn encode_native_request_into(
     let write_str = |buf: &mut Vec<u8>, s: &str| {
         buf.extend_from_slice(&(s.len() as u16).to_le_bytes());
         buf.extend_from_slice(s.as_bytes());
+        buf.push(0);
     };
 
     write_str(msg, script_path);
@@ -1598,17 +1605,27 @@ fn write_native_response(
     headers: &[(String, String)],
     body: &[u8],
 ) -> std::io::Result<()> {
-    writer.write_all(&[status as u8])?;
-    writer.write_all(&http_status.to_le_bytes())?;
-    writer.write_all(&(headers.len() as u16).to_le_bytes())?;
+    let cap = 128 + headers.len() * 64 + if body.len() <= 8192 { body.len() } else { 0 };
+    let mut buf = Vec::with_capacity(cap);
+    buf.push(status as u8);
+    buf.extend_from_slice(&http_status.to_le_bytes());
+    buf.extend_from_slice(&(headers.len() as u16).to_le_bytes());
     for (k, v) in headers {
-        writer.write_all(&(k.len() as u16).to_le_bytes())?;
-        writer.write_all(k.as_bytes())?;
-        writer.write_all(&(v.len() as u16).to_le_bytes())?;
-        writer.write_all(v.as_bytes())?;
+        buf.extend_from_slice(&(k.len() as u16).to_le_bytes());
+        buf.extend_from_slice(k.as_bytes());
+        buf.extend_from_slice(&(v.len() as u16).to_le_bytes());
+        buf.extend_from_slice(v.as_bytes());
     }
-    writer.write_all(&(body.len() as u32).to_le_bytes())?;
-    writer.write_all(body)?;
+    buf.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    if body.is_empty() {
+        writer.write_all(&buf)?;
+    } else if body.len() <= 8192 {
+        buf.extend_from_slice(body);
+        writer.write_all(&buf)?;
+    } else {
+        writer.write_all(&buf)?;
+        writer.write_all(body)?;
+    }
     writer.flush()
 }
 
@@ -1625,16 +1642,21 @@ pub fn read_native_response_from_fd(resp_fd: RawFd) -> std::io::Result<NativeRes
     struct RawReader(RawFd);
     impl Read for RawReader {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            let ret = unsafe { libc::read(self.0, buf.as_mut_ptr() as *mut _, buf.len()) };
-            if ret < 0 {
-                Err(std::io::Error::last_os_error())
-            } else {
-                Ok(ret as usize)
+            loop {
+                let ret = unsafe { libc::read(self.0, buf.as_mut_ptr() as *mut _, buf.len()) };
+                if ret < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(err);
+                }
+                return Ok(ret as usize);
             }
         }
     }
 
-    let mut r = RawReader(resp_fd);
+    let mut r = std::io::BufReader::with_capacity(8192, RawReader(resp_fd));
 
     let mut status_buf = [0u8; 1];
     r.read_exact(&mut status_buf)?;
@@ -1696,6 +1718,8 @@ where
     R: tokio::io::AsyncRead + Unpin,
 {
     use tokio::io::AsyncReadExt;
+
+    let mut r = tokio::io::BufReader::with_capacity(8192, r);
 
     let mut status_buf = [0u8; 1];
     r.read_exact(&mut status_buf).await?;
@@ -1776,16 +1800,21 @@ pub fn read_response_from_fd(
     struct RawReader(std::os::unix::io::RawFd);
     impl Read for RawReader {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            let ret = unsafe { libc::read(self.0, buf.as_mut_ptr() as *mut _, buf.len()) };
-            if ret < 0 {
-                Err(std::io::Error::last_os_error())
-            } else {
-                Ok(ret as usize)
+            loop {
+                let ret = unsafe { libc::read(self.0, buf.as_mut_ptr() as *mut _, buf.len()) };
+                if ret < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(err);
+                }
+                return Ok(ret as usize);
             }
         }
     }
 
-    let mut r = RawReader(resp_fd);
+    let mut r = std::io::BufReader::with_capacity(8192, RawReader(resp_fd));
 
     let mut status_buf = [0u8; 1];
     r.read_exact(&mut status_buf)?;
@@ -1810,9 +1839,21 @@ fn write_response(
     status: WorkerResp,
     payload: &[u8],
 ) -> std::io::Result<()> {
-    writer.write_all(&[status as u8])?;
-    writer.write_all(&(payload.len() as u32).to_le_bytes())?;
-    writer.write_all(payload)?;
+    let cap = 5 + if payload.len() <= 8192 {
+        payload.len()
+    } else {
+        0
+    };
+    let mut buf = Vec::with_capacity(cap);
+    buf.push(status as u8);
+    buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    if payload.len() <= 8192 {
+        buf.extend_from_slice(payload);
+        writer.write_all(&buf)?;
+    } else {
+        writer.write_all(&buf)?;
+        writer.write_all(payload)?;
+    }
     writer.flush()
 }
 
@@ -1972,16 +2013,16 @@ mod tests {
         let payload = &encoded[5..5 + total_len];
 
         let decoded = NativeRequest::decode(payload).expect("decode failed");
-        assert_eq!(decoded.script_path, "/var/www/index.php");
-        assert_eq!(decoded.method, "GET");
-        assert_eq!(decoded.uri, "/");
-        assert_eq!(decoded.query_string, "");
-        assert_eq!(decoded.document_root, "/var/www");
-        assert_eq!(decoded.remote_addr, "127.0.0.1");
+        assert_eq!(decoded.script_path.to_str().unwrap(), "/var/www/index.php");
+        assert_eq!(decoded.method.to_str().unwrap(), "GET");
+        assert_eq!(decoded.uri.to_str().unwrap(), "/");
+        assert_eq!(decoded.query_string.to_str().unwrap(), "");
+        assert_eq!(decoded.document_root.to_str().unwrap(), "/var/www");
+        assert_eq!(decoded.remote_addr.to_str().unwrap(), "127.0.0.1");
         assert_eq!(decoded.server_port, 8080);
         assert!(!decoded.is_https);
-        assert_eq!(decoded.path_info, "/");
-        assert_eq!(decoded.script_name, "/index.php");
+        assert_eq!(decoded.path_info.to_str().unwrap(), "/");
+        assert_eq!(decoded.script_name.to_str().unwrap(), "/index.php");
         assert!(decoded.body.is_empty());
         assert!(decoded.headers.is_empty());
     }
@@ -2018,36 +2059,36 @@ mod tests {
         let payload = &encoded[5..5 + total_len];
 
         let decoded = NativeRequest::decode(payload).expect("decode failed");
-        assert_eq!(decoded.script_path, "/app/public/index.php");
-        assert_eq!(decoded.method, "POST");
-        assert_eq!(decoded.uri, "/api/submit?debug=1");
-        assert_eq!(decoded.query_string, "debug=1");
-        assert_eq!(decoded.content_type, "application/x-www-form-urlencoded");
-        assert_eq!(decoded.cookie, "session=abc123; lang=en");
-        assert_eq!(decoded.document_root, "/app/public");
-        assert_eq!(decoded.remote_addr, "10.0.0.1");
+        assert_eq!(
+            decoded.script_path.to_str().unwrap(),
+            "/app/public/index.php"
+        );
+        assert_eq!(decoded.method.to_str().unwrap(), "POST");
+        assert_eq!(decoded.uri.to_str().unwrap(), "/api/submit?debug=1");
+        assert_eq!(decoded.query_string.to_str().unwrap(), "debug=1");
+        assert_eq!(
+            decoded.content_type.to_str().unwrap(),
+            "application/x-www-form-urlencoded"
+        );
+        assert_eq!(decoded.cookie.to_str().unwrap(), "session=abc123; lang=en");
+        assert_eq!(decoded.document_root.to_str().unwrap(), "/app/public");
+        assert_eq!(decoded.remote_addr.to_str().unwrap(), "10.0.0.1");
         assert_eq!(decoded.remote_port, 54321);
         assert_eq!(decoded.server_port, 443);
         assert!(decoded.is_https);
-        assert_eq!(decoded.path_info, "/api/submit");
-        assert_eq!(decoded.script_name, "/index.php");
+        assert_eq!(decoded.path_info.to_str().unwrap(), "/api/submit");
+        assert_eq!(decoded.script_name.to_str().unwrap(), "/index.php");
         assert_eq!(decoded.body, body);
         assert_eq!(decoded.headers.len(), 3);
+        assert_eq!(decoded.headers[0].0.to_str().unwrap(), "Content-Type");
         assert_eq!(
-            decoded.headers[0],
-            (
-                "Content-Type".to_string(),
-                "application/x-www-form-urlencoded".to_string()
-            )
+            decoded.headers[0].1.to_str().unwrap(),
+            "application/x-www-form-urlencoded"
         );
-        assert_eq!(
-            decoded.headers[1],
-            ("Host".to_string(), "example.com".to_string())
-        );
-        assert_eq!(
-            decoded.headers[2],
-            ("Accept".to_string(), "text/html".to_string())
-        );
+        assert_eq!(decoded.headers[1].0.to_str().unwrap(), "Host");
+        assert_eq!(decoded.headers[1].1.to_str().unwrap(), "example.com");
+        assert_eq!(decoded.headers[2].0.to_str().unwrap(), "Accept");
+        assert_eq!(decoded.headers[2].1.to_str().unwrap(), "text/html");
     }
 
     #[test]
@@ -2131,8 +2172,8 @@ mod tests {
 
         let decoded = NativeRequest::decode(payload).expect("decode failed");
         assert_eq!(decoded.headers.len(), 20);
-        assert_eq!(decoded.headers[0].0, "X-Header-0");
-        assert_eq!(decoded.headers[19].0, "X-Header-19");
+        assert_eq!(decoded.headers[0].0.to_str().unwrap(), "X-Header-0");
+        assert_eq!(decoded.headers[19].0.to_str().unwrap(), "X-Header-19");
     }
 
     // ── NativeResponse via pipes ────────────────────────────────────
