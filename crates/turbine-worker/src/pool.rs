@@ -762,6 +762,13 @@ impl WorkerPool {
             .collect()
     }
 
+    /// Collect raw PIDs for all workers (used by ThreadDispatch's poison
+    /// path to SIGKILL a worker whose pipe was abandoned mid-response).
+    /// Thread workers report 0 (no pid).
+    pub fn worker_pids(&self) -> Vec<i32> {
+        self.workers.iter().map(|w| w.pid().as_raw()).collect()
+    }
+
     /// Register a thread worker that uses in-memory channels instead of pipes.
     ///
     /// The worker is tracked for lifecycle purposes (alive flag, counts) but
