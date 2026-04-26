@@ -192,6 +192,12 @@ struct ThreadDispatch {
     /// RwLock because fds can change on worker respawn (rare cold path).
     /// Empty when using in-memory channels.
     worker_fds: parking_lot::RwLock<Vec<(std::os::unix::io::RawFd, std::os::unix::io::RawFd)>>,
+    /// Per-worker raw PIDs (process mode).  0 for thread mode / channel mode.
+    /// Refreshed alongside `worker_fds` on respawn.  Used by IdleGuard's
+    /// poison-on-drop path to SIGKILL a worker whose response pipe was
+    /// abandoned mid-write — the 0xFF graceful shutdown byte deadlocks if
+    /// the worker is blocked on a full resp pipe (no reader to drain it).
+    worker_pids: parking_lot::RwLock<Vec<i32>>,
     /// Per-worker request senders (in-memory channel mode).
     /// Empty when using pipe-based mode.
     request_txs: Vec<std::sync::mpsc::Sender<Vec<u8>>>,
@@ -217,7 +223,10 @@ struct ThreadDispatch {
 
 impl ThreadDispatch {
     /// Create a pipe-based ThreadDispatch (legacy / persistent workers).
-    fn new(fds: Vec<(std::os::unix::io::RawFd, std::os::unix::io::RawFd)>) -> Self {
+    fn new(
+        fds: Vec<(std::os::unix::io::RawFd, std::os::unix::io::RawFd)>,
+        pids: Vec<i32>,
+    ) -> Self {
         let count = fds.len();
         let mut queue = std::collections::VecDeque::with_capacity(count);
         for i in 0..count {
@@ -229,10 +238,14 @@ impl ThreadDispatch {
             requests_served.push(std::sync::atomic::AtomicU64::new(0));
             unhealthy.push(std::sync::atomic::AtomicBool::new(false));
         }
+        // Pad pids to match fds.len() if caller passed a shorter vec.
+        let mut pids = pids;
+        pids.resize(count, 0);
         ThreadDispatch {
             idle_sem: tokio::sync::Semaphore::new(count),
             idle_queue: parking_lot::Mutex::new(queue),
             worker_fds: parking_lot::RwLock::new(fds),
+            worker_pids: parking_lot::RwLock::new(pids),
             request_txs: Vec::new(),
             response_rxs: Vec::new(),
             requests_served,
@@ -453,6 +466,7 @@ impl ThreadDispatch {
             idle_sem: tokio::sync::Semaphore::new(idle_count),
             idle_queue: parking_lot::Mutex::new(idle_queue),
             worker_fds: parking_lot::RwLock::new(Vec::new()),
+            worker_pids: parking_lot::RwLock::new(Vec::new()),
             request_txs,
             response_rxs,
             requests_served,
@@ -556,6 +570,12 @@ impl ThreadDispatch {
         self.worker_fds.read()[idx]
     }
 
+    /// Get the raw PID for worker `idx` (process mode).  Returns 0 for
+    /// thread/channel mode or out-of-range indices.
+    fn pid(&self, idx: usize) -> i32 {
+        self.worker_pids.read().get(idx).copied().unwrap_or(0)
+    }
+
     /// Update fds after a worker respawn.
     #[allow(dead_code)]
     fn update_fds(
@@ -581,7 +601,11 @@ impl ThreadDispatch {
     /// the pipe fds are fresh, so any previous "dead pipe" verdict no
     /// longer applies.  Also resets the per-worker request counter so
     /// `max_requests` enforcement starts from zero on the new interpreter.
-    fn refresh_fds(&self, new_fds: Vec<(std::os::unix::io::RawFd, std::os::unix::io::RawFd)>) {
+    fn refresh_fds(
+        &self,
+        new_fds: Vec<(std::os::unix::io::RawFd, std::os::unix::io::RawFd)>,
+        new_pids: Vec<i32>,
+    ) {
         let prev_len = {
             let mut fds = self.worker_fds.write();
             let prev = fds.len();
@@ -589,6 +613,13 @@ impl ThreadDispatch {
             prev
         };
         let new_len = self.worker_fds.read().len();
+        // Refresh pids in lockstep (pad with 0 if caller passed shorter vec).
+        {
+            let mut pids = self.worker_pids.write();
+            let mut new_pids = new_pids;
+            new_pids.resize(new_len, 0);
+            *pids = new_pids;
+        }
 
         // Reset health/counter state for all known worker slots.  We track
         // which slots transition from unhealthy/quota-exhausted back to
@@ -686,6 +717,11 @@ struct IdleGuard {
     idx: Option<usize>,
     /// `Some(cmd_fd)` enables kill-on-drop semantics for pipe paths.
     poison_on_drop: Option<std::os::unix::io::RawFd>,
+    /// PID to SIGKILL on poison-drop (process mode).  0 = no SIGKILL
+    /// (thread mode or unknown).  SIGKILL is the only reliable shutdown:
+    /// the 0xFF graceful command byte deadlocks if the worker is blocked
+    /// writing to a full resp pipe (no reader to drain it after cancel).
+    poison_pid: i32,
     /// Set by `mark_completed()` when the response was decoded successfully.
     completed: bool,
 }
@@ -696,6 +732,7 @@ impl IdleGuard {
             td,
             idx: Some(idx),
             poison_on_drop: None,
+            poison_pid: 0,
             completed: false,
         }
     }
@@ -703,8 +740,9 @@ impl IdleGuard {
     /// this, a cancelled future would silently return a worker whose
     /// resp pipe still holds an unread response — corrupting the next
     /// request that picks the same slot.
-    fn arm_poison(&mut self, cmd_fd: std::os::unix::io::RawFd) {
+    fn arm_poison(&mut self, cmd_fd: std::os::unix::io::RawFd, pid: i32) {
         self.poison_on_drop = Some(cmd_fd);
+        self.poison_pid = pid;
     }
     /// Signal that the request finished cleanly (response fully decoded).
     /// Cancels the kill-on-drop behaviour for armed guards.
@@ -732,10 +770,20 @@ impl Drop for IdleGuard {
                     // the reaper will respawn it with fresh pipes and
                     // refresh_fds will revive the slot.
                     self.td.mark_unhealthy(idx);
+                    // Best-effort graceful shutdown byte (works only if the
+                    // worker is actually reading the cmd pipe — i.e. NOT
+                    // blocked on a full resp pipe).
                     let shutdown_byte: [u8; 1] = [0xFF];
                     let _ = unsafe {
                         libc::write(cmd_fd, shutdown_byte.as_ptr() as *const libc::c_void, 1)
                     };
+                    // Hard kill (process mode only): SIGKILL is the only
+                    // reliable shutdown when the worker is blocked writing
+                    // to a resp pipe whose reader has gone away (the 0xFF
+                    // byte above will sit in the cmd pipe forever).
+                    if self.poison_pid > 0 {
+                        let _ = unsafe { libc::kill(self.poison_pid, libc::SIGKILL) };
+                    }
                     // Intentionally do NOT call `return_idle`: the slot
                     // is unhealthy and refresh_fds will restore the
                     // semaphore permit + idle-queue entry once the
@@ -1881,7 +1929,8 @@ fn cmd_serve(
             } else {
                 // Both thread and process pipe-based modes use pipe fds.
                 let fds = pool.worker_fds();
-                let mut td = ThreadDispatch::new(fds);
+                let pids = pool.worker_pids();
+                let mut td = ThreadDispatch::new(fds, pids);
                 td.set_max_requests(config.server.worker_max_requests);
                 Some(Arc::new(td))
             };
@@ -2034,7 +2083,7 @@ fn cmd_serve(
                         Some(pm) => pm,
                         None => break,
                     };
-                    let new_fds = {
+                    let (new_fds, new_pids) = {
                         let mut pool = pm.lock();
                         if reaper_state.persistent_workers {
                             // Proactively retire workers that have served
@@ -2101,9 +2150,9 @@ fn cmd_serve(
                             let _ = pool
                                 .reap_and_respawn(turbine_worker::pool::worker_event_loop_native);
                         }
-                        pool.worker_fds()
+                        (pool.worker_fds(), pool.worker_pids())
                     };
-                    td.refresh_fds(new_fds);
+                    td.refresh_fds(new_fds, new_pids);
                 }
             });
         }
@@ -3446,13 +3495,14 @@ async fn handle_request_inner(
             };
             let mut guard = IdleGuard::new(td.clone(), worker_idx);
             let (cmd_fd, resp_fd) = td.fds(worker_idx);
+            let worker_pid = td.pid(worker_idx);
             // Arm pipe-poison: if the request future is cancelled mid-await
             // (e.g. client TCP close, hyper timeout) OR decode fails, the
             // guard's Drop will force the worker to exit so its (possibly
             // partially-drained) resp pipe is replaced with a fresh one.
             // Without this, leftover response bytes get misread as the
             // next request's frame discriminant ("0x78" / "0x70" / etc.).
-            guard.arm_poison(cmd_fd);
+            guard.arm_poison(cmd_fd, worker_pid);
             let write_result = turbine_worker::with_encode_scratch(|buf| {
                 turbine_worker::encode_request_into(buf, &per);
                 write_to_fd(cmd_fd, buf)
@@ -3973,8 +4023,9 @@ async fn handle_request_inner(
         } else {
             // Pipe-based IPC (legacy / persistent fallback)
             let (cmd_fd, resp_fd) = td.fds(worker_idx);
+            let worker_pid = td.pid(worker_idx);
             // Arm pipe-poison so a cancelled mid-read forces worker recycle.
-            guard.arm_poison(cmd_fd);
+            guard.arm_poison(cmd_fd, worker_pid);
             let write_result = turbine_worker::with_encode_scratch(|buf| {
                 turbine_worker::encode_native_request_into(
                     buf,
