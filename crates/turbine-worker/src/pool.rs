@@ -110,6 +110,36 @@ pub fn pin_to_core(cpu: usize) {
 /// Global thread ID counter for thread-mode workers.
 static THREAD_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+/// Compute a per-slot staggered `max_requests` value to avoid the thundering
+/// herd recycle problem.
+///
+/// When all workers start with the same `max_requests` they tend to reach the
+/// limit at almost the same instant under uniform load.  Recycling several
+/// persistent workers at once is expensive (each `respawn_persistent_at` blocks
+/// the master loop on `read_ready_signal` until the new PHP boot is done),
+/// which can leave the pool with zero idle workers for hundreds of milliseconds
+/// — long enough for in-flight wrk connections and preflight curl probes to
+/// time out.
+///
+/// We spread the recycle events deterministically across `[80%, 100%]` of the
+/// configured base.  Worker 0 recycles first (at 80% of base), the last worker
+/// at 100%.  Subsequent recycles inherit the same per-slot offset, so the
+/// staggering persists across the lifetime of the pool.
+///
+/// `base == 0` means "unlimited" and is preserved.
+#[inline]
+pub fn staggered_max_requests(base: u64, slot_idx: usize, total: usize) -> u64 {
+    if base == 0 || total <= 1 {
+        return base;
+    }
+    // Spread evenly across [0.80, 1.00].
+    // slot 0 -> 0.80, slot (total-1) -> 1.00
+    let denom = (total - 1) as f64;
+    let frac = 0.80 + 0.20 * (slot_idx as f64) / denom;
+    let scaled = (base as f64 * frac).round() as i64;
+    scaled.max(1) as u64
+}
+
 /// Protocol for master ↔ worker communication over pipes.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,7 +250,9 @@ impl WorkerPool {
                 // workers) relies on blocking `libc::read`.  `AsyncPipe::new`
                 // flips the fd to non-blocking on first async use.
 
-                let worker = Worker::new(child, self.config.max_requests, cmd_write, resp_read);
+                let staggered =
+                    staggered_max_requests(self.config.max_requests, index, self.config.workers);
+                let worker = Worker::new(child, staggered, cmd_write, resp_read);
 
                 // Master keeps cmd_write and resp_read (no forget needed)
                 self.idle_queue.push_back(self.workers.len());
@@ -624,13 +656,9 @@ impl WorkerPool {
             })?;
 
         // Master keeps cmd_write and resp_read
-        let worker = Worker::new_thread(
-            alive,
-            thread_id,
-            self.config.max_requests,
-            cmd_write,
-            resp_read,
-        );
+        let staggered =
+            staggered_max_requests(self.config.max_requests, index, self.config.workers);
+        let worker = Worker::new_thread(alive, thread_id, staggered, cmd_write, resp_read);
         self.idle_queue.push_back(self.workers.len());
         self.workers.push(worker);
 
@@ -712,13 +740,9 @@ impl WorkerPool {
                 })
                 .map_err(|_| WorkerError::Fork(nix::Error::ENOMEM))?;
 
-            let worker = Worker::new_thread(
-                alive,
-                thread_id,
-                self.config.max_requests,
-                cmd_write,
-                resp_read,
-            );
+            let staggered =
+                staggered_max_requests(self.config.max_requests, idx, self.config.workers);
+            let worker = Worker::new_thread(alive, thread_id, staggered, cmd_write, resp_read);
             self.replace_worker(idx, worker);
             info!(
                 thread_id = thread_id,
@@ -743,7 +767,10 @@ impl WorkerPool {
     /// The worker is tracked for lifecycle purposes (alive flag, counts) but
     /// has dummy fds (-1, -1) since IPC goes through `ThreadDispatch` channels.
     pub fn register_channel_thread(&mut self, alive: Arc<AtomicBool>, thread_id: u64) {
-        let worker = Worker::new_thread(alive, thread_id, self.config.max_requests, -1, -1);
+        let slot_idx = self.workers.len();
+        let staggered =
+            staggered_max_requests(self.config.max_requests, slot_idx, self.config.workers);
+        let worker = Worker::new_thread(alive, thread_id, staggered, -1, -1);
         self.idle_queue.push_back(self.workers.len());
         self.workers.push(worker);
     }

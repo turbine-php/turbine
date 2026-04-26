@@ -261,7 +261,7 @@ pub fn decode_response(resp_fd: RawFd) -> io::Result<PersistentResponse> {
                         "decode_response: duplicate Headers frame",
                     ));
                 }
-                if h.len() > 256 {
+                if h.len() > 1024 {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!(
@@ -317,15 +317,13 @@ where
 {
     use crate::stream::{read_frame_async, Frame};
 
-    let mut r = tokio::io::BufReader::with_capacity(8192, r);
-
     let mut status: u16 = 0;
     let mut headers: Vec<(String, String)> = Vec::new();
     let mut body: Vec<u8> = Vec::new();
     let mut got_headers = false;
 
     loop {
-        let frame = read_frame_async(&mut r).await?.ok_or_else(|| {
+        let frame = read_frame_async(r).await?.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "decode_response_async: pipe closed before End frame",
@@ -342,7 +340,7 @@ where
                         "decode_response_async: duplicate Headers frame",
                     ));
                 }
-                if h.len() > 256 {
+                if h.len() > 1024 {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!(
@@ -665,31 +663,29 @@ fn write_all_fd(fd: RawFd, data: &[u8]) -> io::Result<()> {
 /// single syscall WITHOUT first memcpy-ing the body into a scratch
 /// `Vec`. For large responses (e.g. the 50 KB binary in issue #19) this
 /// eliminates a full body-sized memcpy on the worker side.
-fn writev_all_fd(fd: RawFd, mut slices: &mut [&[u8]]) -> io::Result<()> {
-    // Clone slice refs into a mutable stack-friendly Vec we can advance.
-    // Keeping this on the heap is fine — the caller already owns the
-    // body Vec and header frames.
+fn writev_all_fd(fd: RawFd, slices: &mut [&[u8]]) -> io::Result<()> {
+    let mut current_slices = slices;
     loop {
         // Skip leading empty slices.
-        while let Some(first) = slices.first() {
+        while let Some(first) = current_slices.first() {
             if first.is_empty() {
-                slices = &mut slices[1..];
+                current_slices = &mut current_slices[1..];
             } else {
                 break;
             }
         }
-        if slices.is_empty() {
+        if current_slices.is_empty() {
             return Ok(());
         }
 
         // Build iovec array (cap at IOV_MAX to be safe — typically 1024).
         const IOV_MAX: usize = 1024;
-        let n = slices.len().min(IOV_MAX);
+        let n = current_slices.len().min(IOV_MAX);
         let mut iov: [libc::iovec; IOV_MAX] = unsafe { std::mem::zeroed() };
         for i in 0..n {
             iov[i] = libc::iovec {
-                iov_base: slices[i].as_ptr() as *mut _,
-                iov_len: slices[i].len(),
+                iov_base: current_slices[i].as_ptr() as *mut _,
+                iov_len: current_slices[i].len(),
             };
         }
 
@@ -702,14 +698,14 @@ fn writev_all_fd(fd: RawFd, mut slices: &mut [&[u8]]) -> io::Result<()> {
             return Err(err);
         }
         let mut written = ret as usize;
-        // Advance slices by `written` bytes.
+        // Advance current_slices by `written` bytes.
         while written > 0 {
-            let first_len = slices[0].len();
+            let first_len = current_slices[0].len();
             if written >= first_len {
                 written -= first_len;
-                slices = &mut slices[1..];
+                current_slices = &mut current_slices[1..];
             } else {
-                slices[0] = &slices[0][written..];
+                current_slices[0] = &current_slices[0][written..];
                 written = 0;
             }
         }
@@ -1304,7 +1300,11 @@ impl WorkerPool {
                     libc::close(cmd_read);
                     libc::close(resp_write);
                 }
-                let max_req = self.config().max_requests;
+                let max_req = crate::pool::staggered_max_requests(
+                    self.config().max_requests,
+                    index,
+                    self.config().workers,
+                );
                 let worker = Worker::new(child, max_req, cmd_write, resp_read);
                 self.push_worker(worker);
                 debug!(
@@ -1394,7 +1394,11 @@ impl WorkerPool {
                     libc::close(cmd_read);
                     libc::close(resp_write);
                 }
-                let max_req = self.config().max_requests;
+                let max_req = crate::pool::staggered_max_requests(
+                    self.config().max_requests,
+                    index,
+                    self.config().workers,
+                );
                 let worker = Worker::new(child, max_req, cmd_write, resp_read);
                 self.replace_worker(index, worker);
 

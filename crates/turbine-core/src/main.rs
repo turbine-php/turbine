@@ -275,6 +275,18 @@ impl ThreadDispatch {
         }
     }
 
+    /// Per-worker recycle threshold, staggered across [80%, 100%] of
+    /// the configured `max_requests_per_worker` so the worker fleet
+    /// doesn't all hit the limit on the same request and trigger a
+    /// thundering-herd respawn that stalls the master.
+    fn quota_for(&self, idx: usize) -> u64 {
+        turbine_worker::pool::staggered_max_requests(
+            self.max_requests_per_worker,
+            idx,
+            self.unhealthy.len(),
+        )
+    }
+
     /// Returns true when `idx` is still safe to dispatch to.  Used by
     /// `get_idle` to reject dead pipes / quota-exhausted workers.
     fn is_pickable(&self, idx: usize) -> bool {
@@ -284,13 +296,44 @@ impl ThreadDispatch {
         if self.unhealthy[idx].load(std::sync::atomic::Ordering::Acquire) {
             return false;
         }
-        if self.max_requests_per_worker > 0 {
+        let quota = self.quota_for(idx);
+        if quota > 0 {
             let served = self.requests_served[idx].load(std::sync::atomic::Ordering::Relaxed);
-            if served >= self.max_requests_per_worker {
+            if served >= quota {
                 return false;
             }
         }
         true
+    }
+
+    /// Indices of workers whose served counter has reached the staggered
+    /// quota and which therefore need recycling by the reaper.  Used by
+    /// the background reaper to proactively send a shutdown byte to
+    /// over-quota workers — without this, the persistent ThreadDispatch
+    /// hot path never calls `pool.return_worker_persistent`, so workers
+    /// that hit the quota become unpickable forever (the existing
+    /// `reap_and_respawn_persistent` only respawns workers whose process
+    /// has already exited).
+    fn over_quota_indices(&self) -> Vec<usize> {
+        if self.max_requests_per_worker == 0 {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for idx in 0..self.requests_served.len() {
+            // Skip workers we already flagged unhealthy (a 0xFF was
+            // already sent on a prior tick).
+            if self.unhealthy[idx].load(std::sync::atomic::Ordering::Acquire) {
+                continue;
+            }
+            let quota = self.quota_for(idx);
+            if quota > 0 {
+                let served = self.requests_served[idx].load(std::sync::atomic::Ordering::Relaxed);
+                if served >= quota {
+                    out.push(idx);
+                }
+            }
+        }
+        out
     }
 
     /// Spawn channel-based worker threads and return a `ThreadDispatch` that
@@ -547,10 +590,42 @@ impl ThreadDispatch {
         };
         let new_len = self.worker_fds.read().len();
 
-        // Reset health/counter state for all known worker slots.
+        // Reset health/counter state for all known worker slots.  We track
+        // which slots transition from unhealthy/quota-exhausted back to
+        // healthy so we can return their semaphore permit + idle-queue
+        // entry: when `get_idle` skipped a worker on quota or unhealth, it
+        // consumed its permit without re-adding it (the reaper was meant
+        // to respawn the dead pid and bring the slot back).  Without this
+        // step the pool would silently shrink to zero pickable workers.
+        let mut revived: Vec<usize> = Vec::new();
         for i in 0..new_len.min(self.unhealthy.len()) {
-            self.unhealthy[i].store(false, std::sync::atomic::Ordering::Release);
-            self.requests_served[i].store(0, std::sync::atomic::Ordering::Release);
+            let was_unhealthy = self.unhealthy[i].swap(false, std::sync::atomic::Ordering::AcqRel);
+            let prev_served = self.requests_served[i].swap(0, std::sync::atomic::Ordering::AcqRel);
+            let was_over_quota =
+                self.max_requests_per_worker > 0 && prev_served >= self.quota_for(i);
+            // Only revive slots that already exist (i < prev_len).  Newer
+            // slots are added below in the scale-up branch.
+            if i < prev_len && (was_unhealthy || was_over_quota) {
+                revived.push(i);
+            }
+        }
+        if !revived.is_empty() {
+            let count = revived.len();
+            {
+                let mut q = self.idle_queue.lock();
+                for idx in revived {
+                    // Avoid double-queueing if the worker is somehow
+                    // already idle (defensive).
+                    if !q.iter().any(|&i| i == idx) {
+                        q.push_back(idx);
+                    }
+                }
+            }
+            self.idle_sem.add_permits(count);
+            tracing::debug!(
+                count = count,
+                "ThreadDispatch: revived recycled workers (returned permits and queue entries)"
+            );
         }
 
         if new_len > prev_len {
@@ -605,7 +680,6 @@ impl IdleGuard {
     }
     /// Consume the guard without returning the worker (e.g. on send error
     /// where we manually call return_idle).
-    #[allow(dead_code)]
     fn defuse(&mut self) {
         self.idx = None;
     }
@@ -1894,7 +1968,7 @@ fn cmd_serve(
         if let (Some(td), true) = (state.thread_dispatch.clone(), state.worker_pool.is_some()) {
             let reaper_state = state.clone();
             rt.spawn(async move {
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+                let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
                     interval.tick().await;
@@ -1907,6 +1981,47 @@ fn cmd_serve(
                     let new_fds = {
                         let mut pool = pm.lock();
                         if reaper_state.persistent_workers {
+                            // Proactively retire workers that have served
+                            // their staggered quota: persistent dispatch
+                            // never goes through `pool.return_worker_persistent`,
+                            // so `mark_idle` (which sends 0xFF on quota
+                            // exhaustion) is never called.  Without this,
+                            // over-quota workers stay alive but unpickable
+                            // forever, and traffic eventually 504s when
+                            // every worker has hit the limit.
+                            let over_quota = td.over_quota_indices();
+                            if !over_quota.is_empty() {
+                                info!(
+                                    count = over_quota.len(),
+                                    indices = ?over_quota,
+                                    "Reaper: recycling over-quota persistent workers"
+                                );
+                            }
+                            for idx in over_quota {
+                                // Mark unhealthy so dispatch drops the worker
+                                // on the floor instead of waiting on stale fds
+                                // while the worker drains.
+                                td.mark_unhealthy(idx);
+                                if let Some(worker) = pool.worker_mut(idx) {
+                                    let cmd_fd = worker.cmd_fd();
+                                    let shutdown_byte: [u8; 1] = [0xFF];
+                                    // Best-effort: worker may have already
+                                    // exited or the pipe may be full.  Either
+                                    // way, the next reaper tick will reap+
+                                    // respawn via `reap_and_respawn_persistent`.
+                                    let _ = unsafe {
+                                        libc::write(
+                                            cmd_fd,
+                                            shutdown_byte.as_ptr() as *const libc::c_void,
+                                            1,
+                                        )
+                                    };
+                                    debug!(
+                                        index = idx,
+                                        "Reaper: signalled over-quota persistent worker for shutdown"
+                                    );
+                                }
+                            }
                             if reaper_state.worker_mode == WorkerMode::Thread {
                                 let _ = pool.reap_and_respawn_persistent_threaded(
                                     &reaper_state.persistent_app_root,
@@ -3273,7 +3388,7 @@ async fn handle_request_inner(
                 path_info: &request.path,
                 script_name: &script_name,
             };
-            let guard = IdleGuard::new(td.clone(), worker_idx);
+            let mut guard = IdleGuard::new(td.clone(), worker_idx);
             let (cmd_fd, resp_fd) = td.fds(worker_idx);
             let write_result = turbine_worker::with_encode_scratch(|buf| {
                 turbine_worker::encode_request_into(buf, &per);
@@ -3297,23 +3412,35 @@ async fn handle_request_inner(
             // AsyncFd-based read: no spawn_blocking thread consumed.
             let bin_result: std::io::Result<_> =
                 match turbine_worker::async_io::AsyncPipe::new(resp_fd) {
-                    Ok(mut pipe) => {
-                        let res = turbine_worker::decode_response_async(&mut pipe).await;
+                    Ok(pipe) => {
+                        let mut buffered = tokio::io::BufReader::with_capacity(65536, pipe);
+                        let res = turbine_worker::decode_response_async(&mut buffered).await;
                         // Explicit drop BEFORE releasing the worker slot:
                         // deregister the fd from the tokio reactor
                         // (epoll_ctl EPOLL_CTL_DEL) so a follow-up request
                         // that claims the same worker_idx and calls
                         // `AsyncPipe::new(same_fd)` won't hit `EEXIST` from
                         // the stale registration.
-                        drop(pipe);
+                        drop(buffered);
                         res
                     }
                     Err(e) => Err(e),
                 };
-            // If decode failed, tag the worker unhealthy before releasing
-            // the guard so the next get_idle() can't pick it again.
+            // If decode failed, tag the worker unhealthy AND send a
+            // shutdown byte so the worker exits — its pipe state may
+            // contain trailing bytes from a partial/oversized frame
+            // that would corrupt the very next request if the same
+            // pipe is reused.  Defuse the guard so the slot is NOT
+            // returned to the idle queue: the reaper will reap+respawn
+            // the now-exiting child and `refresh_fds` will revive the
+            // slot with fresh pipe fds.
             if bin_result.is_err() {
                 td.mark_unhealthy(worker_idx);
+                let shutdown_byte: [u8; 1] = [0xFF];
+                let _ = unsafe {
+                    libc::write(cmd_fd, shutdown_byte.as_ptr() as *const libc::c_void, 1)
+                };
+                guard.defuse();
             } else {
                 td.record_served(worker_idx);
             }
@@ -4344,14 +4471,15 @@ async fn handle_request_inner(
             let _permit_guard = permit;
             // AsyncFd-based read: no blocking pool thread consumed per request.
             let result = match turbine_worker::async_io::AsyncPipe::new(resp_fd) {
-                Ok(mut pipe) => {
+                Ok(pipe) => {
+                    let mut buffered = tokio::io::BufReader::with_capacity(65536, pipe);
                     let res = if is_persistent {
                         WorkerResult::Persistent(
-                            turbine_worker::decode_response_async(&mut pipe).await,
+                            turbine_worker::decode_response_async(&mut buffered).await,
                         )
                     } else {
                         WorkerResult::Native(
-                            turbine_worker::read_native_response_async(&mut pipe).await,
+                            turbine_worker::read_native_response_async(&mut buffered).await,
                         )
                     };
                     // Explicit drop BEFORE `return_worker_to_pool`:
@@ -4359,7 +4487,7 @@ async fn handle_request_inner(
                     // follow-up request that claims the same worker_idx
                     // and calls `AsyncPipe::new(same_fd)` won't hit
                     // `EEXIST` from the stale registration.
-                    drop(pipe);
+                    drop(buffered);
                     res
                 }
                 Err(e) => {
