@@ -250,11 +250,8 @@ impl WorkerPool {
                 // workers) relies on blocking `libc::read`.  `AsyncPipe::new`
                 // flips the fd to non-blocking on first async use.
 
-                let staggered = staggered_max_requests(
-                    self.config.max_requests,
-                    index,
-                    self.config.workers,
-                );
+                let staggered =
+                    staggered_max_requests(self.config.max_requests, index, self.config.workers);
                 let worker = Worker::new(child, staggered, cmd_write, resp_read);
 
                 // Master keeps cmd_write and resp_read (no forget needed)
@@ -659,18 +656,9 @@ impl WorkerPool {
             })?;
 
         // Master keeps cmd_write and resp_read
-        let staggered = staggered_max_requests(
-            self.config.max_requests,
-            index,
-            self.config.workers,
-        );
-        let worker = Worker::new_thread(
-            alive,
-            thread_id,
-            staggered,
-            cmd_write,
-            resp_read,
-        );
+        let staggered =
+            staggered_max_requests(self.config.max_requests, index, self.config.workers);
+        let worker = Worker::new_thread(alive, thread_id, staggered, cmd_write, resp_read);
         self.idle_queue.push_back(self.workers.len());
         self.workers.push(worker);
 
@@ -752,18 +740,9 @@ impl WorkerPool {
                 })
                 .map_err(|_| WorkerError::Fork(nix::Error::ENOMEM))?;
 
-            let staggered = staggered_max_requests(
-                self.config.max_requests,
-                idx,
-                self.config.workers,
-            );
-            let worker = Worker::new_thread(
-                alive,
-                thread_id,
-                staggered,
-                cmd_write,
-                resp_read,
-            );
+            let staggered =
+                staggered_max_requests(self.config.max_requests, idx, self.config.workers);
+            let worker = Worker::new_thread(alive, thread_id, staggered, cmd_write, resp_read);
             self.replace_worker(idx, worker);
             info!(
                 thread_id = thread_id,
@@ -789,11 +768,8 @@ impl WorkerPool {
     /// has dummy fds (-1, -1) since IPC goes through `ThreadDispatch` channels.
     pub fn register_channel_thread(&mut self, alive: Arc<AtomicBool>, thread_id: u64) {
         let slot_idx = self.workers.len();
-        let staggered = staggered_max_requests(
-            self.config.max_requests,
-            slot_idx,
-            self.config.workers,
-        );
+        let staggered =
+            staggered_max_requests(self.config.max_requests, slot_idx, self.config.workers);
         let worker = Worker::new_thread(alive, thread_id, staggered, -1, -1);
         self.idle_queue.push_back(self.workers.len());
         self.workers.push(worker);

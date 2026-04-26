@@ -599,14 +599,10 @@ impl ThreadDispatch {
         // step the pool would silently shrink to zero pickable workers.
         let mut revived: Vec<usize> = Vec::new();
         for i in 0..new_len.min(self.unhealthy.len()) {
-            let was_unhealthy = self
-                .unhealthy[i]
-                .swap(false, std::sync::atomic::Ordering::AcqRel);
-            let prev_served = self
-                .requests_served[i]
-                .swap(0, std::sync::atomic::Ordering::AcqRel);
-            let was_over_quota = self.max_requests_per_worker > 0
-                && prev_served >= self.quota_for(i);
+            let was_unhealthy = self.unhealthy[i].swap(false, std::sync::atomic::Ordering::AcqRel);
+            let prev_served = self.requests_served[i].swap(0, std::sync::atomic::Ordering::AcqRel);
+            let was_over_quota =
+                self.max_requests_per_worker > 0 && prev_served >= self.quota_for(i);
             // Only revive slots that already exist (i < prev_len).  Newer
             // slots are added below in the scale-up branch.
             if i < prev_len && (was_unhealthy || was_over_quota) {
@@ -3442,11 +3438,7 @@ async fn handle_request_inner(
                 td.mark_unhealthy(worker_idx);
                 let shutdown_byte: [u8; 1] = [0xFF];
                 let _ = unsafe {
-                    libc::write(
-                        cmd_fd,
-                        shutdown_byte.as_ptr() as *const libc::c_void,
-                        1,
-                    )
+                    libc::write(cmd_fd, shutdown_byte.as_ptr() as *const libc::c_void, 1)
                 };
                 guard.defuse();
             } else {
