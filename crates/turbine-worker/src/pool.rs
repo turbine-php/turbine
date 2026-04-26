@@ -782,7 +782,8 @@ pub fn write_to_fd(fd: RawFd, data: &[u8]) -> std::io::Result<()> {
 pub fn worker_event_loop(cmd_fd: RawFd, resp_fd: RawFd) {
     debug!(pid = std::process::id(), "Worker event loop started");
 
-    let mut cmd_reader = unsafe { std::fs::File::from_raw_fd(cmd_fd) };
+    let cmd_file = unsafe { std::fs::File::from_raw_fd(cmd_fd) };
+    let mut cmd_reader = std::io::BufReader::with_capacity(8192, cmd_file);
     let mut resp_writer = unsafe { std::fs::File::from_raw_fd(resp_fd) };
 
     // The PHP engine was initialized in the parent before fork().
@@ -942,7 +943,8 @@ pub fn worker_event_loop_native(cmd_fd: RawFd, resp_fd: RawFd) {
         "Native SAPI worker event loop started"
     );
 
-    let mut cmd_reader = unsafe { std::fs::File::from_raw_fd(cmd_fd) };
+    let cmd_file = unsafe { std::fs::File::from_raw_fd(cmd_fd) };
+    let mut cmd_reader = std::io::BufReader::with_capacity(8192, cmd_file);
     let mut resp_writer = unsafe { std::fs::File::from_raw_fd(resp_fd) };
 
     use turbine_engine::output;
@@ -1598,17 +1600,27 @@ fn write_native_response(
     headers: &[(String, String)],
     body: &[u8],
 ) -> std::io::Result<()> {
-    writer.write_all(&[status as u8])?;
-    writer.write_all(&http_status.to_le_bytes())?;
-    writer.write_all(&(headers.len() as u16).to_le_bytes())?;
+    let cap = 128 + headers.len() * 64 + if body.len() <= 8192 { body.len() } else { 0 };
+    let mut buf = Vec::with_capacity(cap);
+    buf.push(status as u8);
+    buf.extend_from_slice(&http_status.to_le_bytes());
+    buf.extend_from_slice(&(headers.len() as u16).to_le_bytes());
     for (k, v) in headers {
-        writer.write_all(&(k.len() as u16).to_le_bytes())?;
-        writer.write_all(k.as_bytes())?;
-        writer.write_all(&(v.len() as u16).to_le_bytes())?;
-        writer.write_all(v.as_bytes())?;
+        buf.extend_from_slice(&(k.len() as u16).to_le_bytes());
+        buf.extend_from_slice(k.as_bytes());
+        buf.extend_from_slice(&(v.len() as u16).to_le_bytes());
+        buf.extend_from_slice(v.as_bytes());
     }
-    writer.write_all(&(body.len() as u32).to_le_bytes())?;
-    writer.write_all(body)?;
+    buf.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    if body.is_empty() {
+        writer.write_all(&buf)?;
+    } else if body.len() <= 8192 {
+        buf.extend_from_slice(body);
+        writer.write_all(&buf)?;
+    } else {
+        writer.write_all(&buf)?;
+        writer.write_all(body)?;
+    }
     writer.flush()
 }
 
@@ -1625,16 +1637,21 @@ pub fn read_native_response_from_fd(resp_fd: RawFd) -> std::io::Result<NativeRes
     struct RawReader(RawFd);
     impl Read for RawReader {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            let ret = unsafe { libc::read(self.0, buf.as_mut_ptr() as *mut _, buf.len()) };
-            if ret < 0 {
-                Err(std::io::Error::last_os_error())
-            } else {
-                Ok(ret as usize)
+            loop {
+                let ret = unsafe { libc::read(self.0, buf.as_mut_ptr() as *mut _, buf.len()) };
+                if ret < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(err);
+                }
+                return Ok(ret as usize);
             }
         }
     }
 
-    let mut r = RawReader(resp_fd);
+    let mut r = std::io::BufReader::with_capacity(8192, RawReader(resp_fd));
 
     let mut status_buf = [0u8; 1];
     r.read_exact(&mut status_buf)?;
@@ -1696,6 +1713,8 @@ where
     R: tokio::io::AsyncRead + Unpin,
 {
     use tokio::io::AsyncReadExt;
+
+    let mut r = tokio::io::BufReader::with_capacity(8192, r);
 
     let mut status_buf = [0u8; 1];
     r.read_exact(&mut status_buf).await?;
@@ -1776,16 +1795,21 @@ pub fn read_response_from_fd(
     struct RawReader(std::os::unix::io::RawFd);
     impl Read for RawReader {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            let ret = unsafe { libc::read(self.0, buf.as_mut_ptr() as *mut _, buf.len()) };
-            if ret < 0 {
-                Err(std::io::Error::last_os_error())
-            } else {
-                Ok(ret as usize)
+            loop {
+                let ret = unsafe { libc::read(self.0, buf.as_mut_ptr() as *mut _, buf.len()) };
+                if ret < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(err);
+                }
+                return Ok(ret as usize);
             }
         }
     }
 
-    let mut r = RawReader(resp_fd);
+    let mut r = std::io::BufReader::with_capacity(8192, RawReader(resp_fd));
 
     let mut status_buf = [0u8; 1];
     r.read_exact(&mut status_buf)?;
@@ -1810,9 +1834,17 @@ fn write_response(
     status: WorkerResp,
     payload: &[u8],
 ) -> std::io::Result<()> {
-    writer.write_all(&[status as u8])?;
-    writer.write_all(&(payload.len() as u32).to_le_bytes())?;
-    writer.write_all(payload)?;
+    let cap = 5 + if payload.len() <= 8192 { payload.len() } else { 0 };
+    let mut buf = Vec::with_capacity(cap);
+    buf.push(status as u8);
+    buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    if payload.len() <= 8192 {
+        buf.extend_from_slice(payload);
+        writer.write_all(&buf)?;
+    } else {
+        writer.write_all(&buf)?;
+        writer.write_all(payload)?;
+    }
     writer.flush()
 }
 

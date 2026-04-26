@@ -224,7 +224,7 @@ where
 pub fn decode_response(resp_fd: RawFd) -> io::Result<PersistentResponse> {
     use crate::stream::{read_frame, Frame};
 
-    let mut reader = FdReader(resp_fd);
+    let mut reader = std::io::BufReader::with_capacity(8192, FdReader(resp_fd));
     let mut status: u16 = 0;
     let mut headers: Vec<(String, String)> = Vec::new();
     let mut body: Vec<u8> = Vec::new();
@@ -303,6 +303,8 @@ where
     R: tokio::io::AsyncRead + Unpin,
 {
     use crate::stream::{read_frame_async, Frame};
+
+    let mut r = tokio::io::BufReader::with_capacity(8192, r);
 
     let mut status: u16 = 0;
     let mut headers: Vec<(String, String)> = Vec::new();
@@ -483,9 +485,10 @@ fn decode_request_from_reader<R: Read>(r: &mut R) -> io::Result<DecodedRequest> 
     })
 }
 
-/// Decode a full request from the cmd pipe (blocking).
+#[cfg(test)]
 fn decode_request_from_fd(cmd_fd: RawFd) -> io::Result<DecodedRequest> {
-    decode_request_from_reader(&mut FdReader(cmd_fd))
+    let mut reader = std::io::BufReader::with_capacity(8192, FdReader(cmd_fd));
+    decode_request_from_reader(&mut reader)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -741,11 +744,14 @@ pub fn worker_event_loop_persistent(
         std::process::exit(1);
     }
 
+    let mut cmd_reader = std::io::BufReader::with_capacity(8192, FdReader(cmd_fd));
+
     // ── Request loop ─────────────────────────────────────────────────
     loop {
         // Read command byte.
-        let cmd = match read_u8_fd(cmd_fd) {
-            Ok(c) => c,
+        let mut cmd_buf = [0u8; 1];
+        let cmd = match cmd_reader.read_exact(&mut cmd_buf) {
+            Ok(_) => cmd_buf[0],
             Err(e) => {
                 debug!(pid = std::process::id(), error = %e, "Command pipe closed — shutting down");
                 break;
@@ -764,7 +770,7 @@ pub fn worker_event_loop_persistent(
         }
 
         // Decode request payload.
-        let req = match decode_request_from_fd(cmd_fd) {
+        let req = match decode_request_from_reader(&mut cmd_reader) {
             Ok(r) => r,
             Err(e) => {
                 error!(pid = std::process::id(), error = %e, "Failed to decode request");
