@@ -734,11 +734,7 @@ impl Drop for IdleGuard {
                     self.td.mark_unhealthy(idx);
                     let shutdown_byte: [u8; 1] = [0xFF];
                     let _ = unsafe {
-                        libc::write(
-                            cmd_fd,
-                            shutdown_byte.as_ptr() as *const libc::c_void,
-                            1,
-                        )
+                        libc::write(cmd_fd, shutdown_byte.as_ptr() as *const libc::c_void, 1)
                     };
                     // Intentionally do NOT call `return_idle`: the slot
                     // is unhealthy and refresh_fds will restore the
@@ -4002,7 +3998,10 @@ async fn handle_request_inner(
                 write_to_fd(cmd_fd, buf)
             });
             if write_result.is_err() {
-                error!(worker = worker_idx, "Failed to send to worker (thread dispatch)");
+                error!(
+                    worker = worker_idx,
+                    "Failed to send to worker (thread dispatch)"
+                );
                 // guard's Drop (poison armed, !completed) handles cleanup.
                 return Ok(build_response(
                     502,
