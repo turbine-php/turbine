@@ -1015,18 +1015,20 @@ pub fn worker_event_loop_native(cmd_fd: RawFd, resp_fd: RawFd) {
                 let c_scriptname = req.script_name;
 
                 // Headers as raw (ptr, len) — no per-request CString allocation.
-                let key_ptrs: Vec<*const std::ffi::c_char> = req
+                let key_ptrs: Vec<*const std::ffi::c_char> =
+                    req.headers.iter().map(|(k, _)| k.as_ptr()).collect();
+                let key_lens: Vec<usize> = req
                     .headers
                     .iter()
-                    .map(|(k, _)| k.as_ptr())
+                    .map(|(k, _)| k.to_bytes().len())
                     .collect();
-                let key_lens: Vec<usize> = req.headers.iter().map(|(k, _)| k.to_bytes().len()).collect();
-                let val_ptrs: Vec<*const std::ffi::c_char> = req
+                let val_ptrs: Vec<*const std::ffi::c_char> =
+                    req.headers.iter().map(|(_, v)| v.as_ptr()).collect();
+                let val_lens: Vec<usize> = req
                     .headers
                     .iter()
-                    .map(|(_, v)| v.as_ptr())
+                    .map(|(_, v)| v.to_bytes().len())
                     .collect();
-                let val_lens: Vec<usize> = req.headers.iter().map(|(_, v)| v.to_bytes().len()).collect();
 
                 let content_length: libc::c_long = if req.body.is_empty() {
                     -1
@@ -1237,18 +1239,20 @@ pub fn worker_event_loop_channel(
             let c_scriptname = req.script_name;
 
             // Headers as raw (ptr, len) — no per-request CString allocation.
-            let key_ptrs: Vec<*const std::ffi::c_char> = req
+            let key_ptrs: Vec<*const std::ffi::c_char> =
+                req.headers.iter().map(|(k, _)| k.as_ptr()).collect();
+            let key_lens: Vec<usize> = req
                 .headers
                 .iter()
-                .map(|(k, _)| k.as_ptr())
+                .map(|(k, _)| k.to_bytes().len())
                 .collect();
-            let key_lens: Vec<usize> = req.headers.iter().map(|(k, _)| k.to_bytes().len()).collect();
-            let val_ptrs: Vec<*const std::ffi::c_char> = req
+            let val_ptrs: Vec<*const std::ffi::c_char> =
+                req.headers.iter().map(|(_, v)| v.as_ptr()).collect();
+            let val_lens: Vec<usize> = req
                 .headers
                 .iter()
-                .map(|(_, v)| v.as_ptr())
+                .map(|(_, v)| v.to_bytes().len())
                 .collect();
-            let val_lens: Vec<usize> = req.headers.iter().map(|(_, v)| v.to_bytes().len()).collect();
 
             let content_length: libc::c_long = if req.body.is_empty() {
                 -1
@@ -1835,7 +1839,11 @@ fn write_response(
     status: WorkerResp,
     payload: &[u8],
 ) -> std::io::Result<()> {
-    let cap = 5 + if payload.len() <= 8192 { payload.len() } else { 0 };
+    let cap = 5 + if payload.len() <= 8192 {
+        payload.len()
+    } else {
+        0
+    };
     let mut buf = Vec::with_capacity(cap);
     buf.push(status as u8);
     buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
@@ -2051,11 +2059,17 @@ mod tests {
         let payload = &encoded[5..5 + total_len];
 
         let decoded = NativeRequest::decode(payload).expect("decode failed");
-        assert_eq!(decoded.script_path.to_str().unwrap(), "/app/public/index.php");
+        assert_eq!(
+            decoded.script_path.to_str().unwrap(),
+            "/app/public/index.php"
+        );
         assert_eq!(decoded.method.to_str().unwrap(), "POST");
         assert_eq!(decoded.uri.to_str().unwrap(), "/api/submit?debug=1");
         assert_eq!(decoded.query_string.to_str().unwrap(), "debug=1");
-        assert_eq!(decoded.content_type.to_str().unwrap(), "application/x-www-form-urlencoded");
+        assert_eq!(
+            decoded.content_type.to_str().unwrap(),
+            "application/x-www-form-urlencoded"
+        );
         assert_eq!(decoded.cookie.to_str().unwrap(), "session=abc123; lang=en");
         assert_eq!(decoded.document_root.to_str().unwrap(), "/app/public");
         assert_eq!(decoded.remote_addr.to_str().unwrap(), "10.0.0.1");
@@ -2067,7 +2081,10 @@ mod tests {
         assert_eq!(decoded.body, body);
         assert_eq!(decoded.headers.len(), 3);
         assert_eq!(decoded.headers[0].0.to_str().unwrap(), "Content-Type");
-        assert_eq!(decoded.headers[0].1.to_str().unwrap(), "application/x-www-form-urlencoded");
+        assert_eq!(
+            decoded.headers[0].1.to_str().unwrap(),
+            "application/x-www-form-urlencoded"
+        );
         assert_eq!(decoded.headers[1].0.to_str().unwrap(), "Host");
         assert_eq!(decoded.headers[1].1.to_str().unwrap(), "example.com");
         assert_eq!(decoded.headers[2].0.to_str().unwrap(), "Accept");

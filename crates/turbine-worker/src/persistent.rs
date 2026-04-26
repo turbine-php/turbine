@@ -168,7 +168,7 @@ pub fn encode_request_into(buf: &mut Vec<u8>, req: &PersistentRequest<'_>) {
     buf.reserve(256 + req.body.len());
 
     write_u8(buf, 0x01); // HandleRequest command
-    
+
     let payload_start = buf.len();
     write_u32_le(buf, 0); // Placeholder for payload_len
 
@@ -436,20 +436,32 @@ impl<'a> DecodedRequest<'a> {
         let mut pos = 0;
 
         let read_cstr = |data: &'a [u8], pos: &mut usize| -> Option<&'a std::ffi::CStr> {
-            if *pos + 4 > data.len() { return None; }
-            let len = u32::from_le_bytes([data[*pos], data[*pos+1], data[*pos+2], data[*pos+3]]) as usize;
+            if *pos + 4 > data.len() {
+                return None;
+            }
+            let len =
+                u32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]])
+                    as usize;
             *pos += 4;
-            if *pos + len + 1 > data.len() { return None; }
+            if *pos + len + 1 > data.len() {
+                return None;
+            }
             let slice = &data[*pos..*pos + len + 1];
             *pos += len + 1;
             std::ffi::CStr::from_bytes_with_nul(slice).ok()
         };
 
         let read_bytes = |data: &'a [u8], pos: &mut usize| -> Option<&'a [u8]> {
-            if *pos + 4 > data.len() { return None; }
-            let len = u32::from_le_bytes([data[*pos], data[*pos+1], data[*pos+2], data[*pos+3]]) as usize;
+            if *pos + 4 > data.len() {
+                return None;
+            }
+            let len =
+                u32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]])
+                    as usize;
             *pos += 4;
-            if *pos + len > data.len() { return None; }
+            if *pos + len > data.len() {
+                return None;
+            }
             let slice = &data[*pos..*pos + len];
             *pos += len;
             Some(slice)
@@ -460,16 +472,24 @@ impl<'a> DecodedRequest<'a> {
         let body = read_bytes(data, &mut pos)?;
         let client_ip = read_cstr(data, &mut pos)?;
 
-        if pos + 4 > data.len() { return None; }
-        let port = u32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]) as u16;
+        if pos + 4 > data.len() {
+            return None;
+        }
+        let port =
+            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as u16;
         pos += 4;
 
-        if pos + 1 > data.len() { return None; }
+        if pos + 1 > data.len() {
+            return None;
+        }
         let is_https = data[pos] != 0;
         pos += 1;
 
-        if pos + 4 > data.len() { return None; }
-        let hdr_count = u32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]) as usize;
+        if pos + 4 > data.len() {
+            return None;
+        }
+        let hdr_count =
+            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
         pos += 4;
 
         let mut headers = Vec::with_capacity(hdr_count);
@@ -488,8 +508,20 @@ impl<'a> DecodedRequest<'a> {
         let script_name = read_cstr(data, &mut pos)?;
 
         Some(DecodedRequest {
-            method, uri, body, client_ip, port, is_https, headers,
-            script_filename, query_string, document_root, content_type, cookie, path_info, script_name
+            method,
+            uri,
+            body,
+            client_ip,
+            port,
+            is_https,
+            headers,
+            script_filename,
+            query_string,
+            document_root,
+            content_type,
+            cookie,
+            path_info,
+            script_name,
         })
     }
 }
@@ -518,7 +550,10 @@ fn decode_request_from_fd(cmd_fd: RawFd) -> io::Result<DecodedRequestOwned> {
     let mut cmd = [0u8; 1];
     reader.read_exact(&mut cmd)?;
     if cmd[0] != 0x01 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "Unknown command byte"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Unknown command byte",
+        ));
     }
 
     let mut len_buf = [0u8; 4];
@@ -528,11 +563,10 @@ fn decode_request_from_fd(cmd_fd: RawFd) -> io::Result<DecodedRequestOwned> {
     if payload_len > 0 {
         reader.read_exact(&mut payload)?;
     }
-    
-    let req = DecodedRequest::decode(&payload).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "Failed to decode payload")
-    })?;
-    
+
+    let req = DecodedRequest::decode(&payload)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Failed to decode payload"))?;
+
     Ok(DecodedRequestOwned {
         method: req.method.to_string_lossy().into_owned(),
         uri: req.uri.to_string_lossy().into_owned(),
@@ -540,7 +574,16 @@ fn decode_request_from_fd(cmd_fd: RawFd) -> io::Result<DecodedRequestOwned> {
         client_ip: req.client_ip.to_string_lossy().into_owned(),
         port: req.port,
         is_https: req.is_https,
-        headers: req.headers.iter().map(|(k, v)| (k.to_string_lossy().into_owned(), v.to_string_lossy().into_owned())).collect(),
+        headers: req
+            .headers
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.to_string_lossy().into_owned(),
+                )
+            })
+            .collect(),
         script_filename: req.script_filename.to_string_lossy().into_owned(),
         query_string: req.query_string.to_string_lossy().into_owned(),
         document_root: req.document_root.to_string_lossy().into_owned(),
@@ -831,7 +874,7 @@ pub fn worker_event_loop_persistent(
             break;
         }
         let payload_len = u32::from_le_bytes(len_buf) as usize;
-        
+
         let mut payload = vec![0u8; payload_len];
         if cmd_reader.read_exact(&mut payload).is_err() {
             break;
@@ -867,18 +910,20 @@ pub fn worker_event_loop_persistent(
         let c_pathinfo = req.path_info;
         let c_scriptname = req.script_name;
 
-        let key_ptrs: Vec<*const std::ffi::c_char> = req
+        let key_ptrs: Vec<*const std::ffi::c_char> =
+            req.headers.iter().map(|(k, _)| k.as_ptr()).collect();
+        let key_lens: Vec<usize> = req
             .headers
             .iter()
-            .map(|(k, _)| k.as_ptr())
+            .map(|(k, _)| k.to_bytes().len())
             .collect();
-        let key_lens: Vec<usize> = req.headers.iter().map(|(k, _)| k.to_bytes().len()).collect();
-        let val_ptrs: Vec<*const std::ffi::c_char> = req
+        let val_ptrs: Vec<*const std::ffi::c_char> =
+            req.headers.iter().map(|(_, v)| v.as_ptr()).collect();
+        let val_lens: Vec<usize> = req
             .headers
             .iter()
-            .map(|(_, v)| v.as_ptr())
+            .map(|(_, v)| v.to_bytes().len())
             .collect();
-        let val_lens: Vec<usize> = req.headers.iter().map(|(_, v)| v.to_bytes().len()).collect();
 
         let content_length: libc::c_long = if req.body.is_empty() {
             -1
@@ -969,7 +1014,8 @@ pub fn worker_event_loop_persistent(
                         pid = std::process::id(),
                         "Running worker cleanup (lightweight path)"
                     );
-                    let cleanup_result = turbine_php_sys::turbine_execute_script(c_cleanup.as_ptr());
+                    let cleanup_result =
+                        turbine_php_sys::turbine_execute_script(c_cleanup.as_ptr());
                     if cleanup_result != turbine_php_sys::SUCCESS {
                         warn!(
                             pid = std::process::id(),
@@ -1021,7 +1067,8 @@ pub fn worker_event_loop_persistent(
                         pid = std::process::id(),
                         "Running worker cleanup (full lifecycle path)"
                     );
-                    let cleanup_result = turbine_php_sys::turbine_execute_script(c_cleanup.as_ptr());
+                    let cleanup_result =
+                        turbine_php_sys::turbine_execute_script(c_cleanup.as_ptr());
                     if cleanup_result != turbine_php_sys::SUCCESS {
                         warn!(
                             pid = std::process::id(),
@@ -1810,13 +1857,7 @@ mod tests {
         let encoded = encode_request(&req);
 
         // Write encoded data to pipe (skip cmd byte — decode expects post-cmd)
-        let written = unsafe {
-            libc::write(
-                write_fd,
-                encoded.as_ptr() as *const _,
-                encoded.len(),
-            )
-        };
+        let written = unsafe { libc::write(write_fd, encoded.as_ptr() as *const _, encoded.len()) };
         assert_eq!(written as usize, encoded.len());
 
         // Decode from the read end
@@ -1873,13 +1914,7 @@ mod tests {
         };
 
         let encoded = encode_request(&req);
-        let written = unsafe {
-            libc::write(
-                write_fd,
-                encoded.as_ptr() as *const _,
-                encoded.len(),
-            )
-        };
+        let written = unsafe { libc::write(write_fd, encoded.as_ptr() as *const _, encoded.len()) };
         assert_eq!(written as usize, encoded.len());
 
         let decoded = decode_request_from_fd(read_fd).expect("decode failed");
