@@ -1000,7 +1000,7 @@ pub fn worker_event_loop_native(cmd_fd: RawFd, resp_fd: RawFd) {
                     }
                 };
 
-                debug!(pid = std::process::id(), script = %req.script_path, "Executing via native SAPI");
+                debug!(pid = std::process::id(), script = ?req.script_path, "Executing via native SAPI");
 
                 // CStrings without allocations (zero-copy references from binary protocol)
                 let c_method = req.method;
@@ -1365,7 +1365,7 @@ impl<'a> NativeRequest<'a> {
     fn decode(data: &'a [u8]) -> Option<Self> {
         let mut pos = 0;
 
-        let mut read_cstr = |data: &'a [u8], pos: &mut usize| -> Option<&'a std::ffi::CStr> {
+        let read_cstr = |data: &'a [u8], pos: &mut usize| -> Option<&'a std::ffi::CStr> {
             if *pos + 2 > data.len() {
                 return None;
             }

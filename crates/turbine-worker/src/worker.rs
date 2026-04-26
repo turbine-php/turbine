@@ -291,7 +291,7 @@ impl Worker {
     ///
     /// Returns (success: bool, output: Vec<u8>).
     pub fn read_response(&self) -> std::io::Result<(bool, Vec<u8>)> {
-        let mut file = unsafe { ManualFd::new(self.resp_fd) };
+        let file = unsafe { ManualFd::new(self.resp_fd) };
         let mut r = std::io::BufReader::with_capacity(8192, file);
 
         // Read status byte

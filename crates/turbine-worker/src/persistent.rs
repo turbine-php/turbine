@@ -325,7 +325,7 @@ where
     let mut got_headers = false;
 
     loop {
-        let frame = read_frame_async(r).await?.ok_or_else(|| {
+        let frame = read_frame_async(&mut r).await?.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "decode_response_async: pipe closed before End frame",
@@ -435,7 +435,7 @@ impl<'a> DecodedRequest<'a> {
     fn decode(data: &'a [u8]) -> Option<Self> {
         let mut pos = 0;
 
-        let mut read_cstr = |data: &'a [u8], pos: &mut usize| -> Option<&'a std::ffi::CStr> {
+        let read_cstr = |data: &'a [u8], pos: &mut usize| -> Option<&'a std::ffi::CStr> {
             if *pos + 4 > data.len() { return None; }
             let len = u32::from_le_bytes([data[*pos], data[*pos+1], data[*pos+2], data[*pos+3]]) as usize;
             *pos += 4;
@@ -445,7 +445,7 @@ impl<'a> DecodedRequest<'a> {
             std::ffi::CStr::from_bytes_with_nul(slice).ok()
         };
 
-        let mut read_bytes = |data: &'a [u8], pos: &mut usize| -> Option<&'a [u8]> {
+        let read_bytes = |data: &'a [u8], pos: &mut usize| -> Option<&'a [u8]> {
             if *pos + 4 > data.len() { return None; }
             let len = u32::from_le_bytes([data[*pos], data[*pos+1], data[*pos+2], data[*pos+3]]) as usize;
             *pos += 4;
@@ -849,9 +849,9 @@ pub fn worker_event_loop_persistent(
 
         debug!(
             pid = std::process::id(),
-            script = %req.script_filename,
-            method = %req.method,
-            uri = %req.uri,
+            script = ?req.script_filename,
+            method = ?req.method,
+            uri = ?req.uri,
             "Executing via native SAPI (persistent)"
         );
 
