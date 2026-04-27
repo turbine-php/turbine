@@ -68,7 +68,7 @@ use websocket::{WsConfig, WsHub};
 
 use cli::{Cli, Command};
 use compat::{AppDetector, AppStructure, FullHttpRequest};
-use config::RuntimeConfig;
+use config::{Lifecycle, RuntimeConfig};
 use response::{
     parse_turbine_response_envelope, postprocess_php_response, response_prevents_caching,
 };
@@ -1728,14 +1728,46 @@ fn cmd_serve(
 
         // Choose whether to use persistent workers (bootstrap-once) or the
         // classic per-request fork+eval model.
-        // Persistent workers: controlled by config.server.persistent_workers (default false).
-        let use_persistent = config.server.persistent_workers.unwrap_or(false);
+        //
+        // The effective lifecycle is computed from the explicit
+        // `[server] lifecycle` field, falling back to the legacy
+        // `persistent_workers` + `worker_boot` + `worker_handler` flags.
+        // See [`config::RuntimeConfig::effective_lifecycle`] for the
+        // exact derivation rules.
+        let lifecycle = config.effective_lifecycle();
+        let use_persistent = lifecycle.workers_are_persistent();
+
+        info!(
+            lifecycle = %lifecycle,
+            worker_mode = %worker_mode,
+            workers = config.server.workers,
+            "Worker lifecycle resolved"
+        );
 
         if use_persistent {
-            info!(mode = "persistent", worker_mode = %worker_mode, "Persistent workers enabled");
+            let mode_label = match lifecycle {
+                Lifecycle::PersistentApp => "persistent_app",
+                Lifecycle::PoolReuse => "pool_reuse",
+                Lifecycle::ForkPerRequest => unreachable!(),
+            };
+            info!(
+                mode = mode_label,
+                worker_mode = %worker_mode,
+                "Persistent workers enabled"
+            );
             let app_root_str = app_root.display().to_string();
-            let w_boot = config.server.worker_boot.as_deref();
-            let w_handler = config.server.worker_handler.as_deref();
+            // In `pool_reuse` mode the persistent worker child loop sees
+            // `worker_boot = None` / `worker_handler = None` and falls
+            // through to the full php_request_startup/shutdown path —
+            // i.e. PHP-FPM-equivalent semantics with binary IPC.
+            let (w_boot, w_handler) = if lifecycle.application_is_persistent() {
+                (
+                    config.server.worker_boot.as_deref(),
+                    config.server.worker_handler.as_deref(),
+                )
+            } else {
+                (None, None)
+            };
             let w_cleanup = config.server.worker_cleanup.as_deref();
 
             if is_thread_mode {
@@ -2082,35 +2114,25 @@ fn cmd_serve(
                     };
                     let (new_fds, new_pids) = {
                         let mut pool = pm.lock();
-                        if reaper_state.persistent_workers {
-                            // Proactively retire workers that have served
-                            // their staggered quota: persistent dispatch
-                            // never goes through `pool.return_worker_persistent`,
-                            // so `mark_idle` (which sends 0xFF on quota
-                            // exhaustion) is never called.  Without this,
-                            // over-quota workers stay alive but unpickable
-                            // forever, and traffic eventually 504s when
-                            // every worker has hit the limit.
-                            let over_quota = td.over_quota_indices();
-                            if !over_quota.is_empty() {
-                                info!(
-                                    count = over_quota.len(),
-                                    indices = ?over_quota,
-                                    "Reaper: recycling over-quota persistent workers"
-                                );
-                            }
-                            for idx in over_quota {
-                                // Mark unhealthy so dispatch drops the worker
-                                // on the floor instead of waiting on stale fds
-                                // while the worker drains.
-                                td.mark_unhealthy(idx);
-                                if let Some(worker) = pool.worker_mut(idx) {
+
+                        // Proactively retire workers that have served their staggered quota.
+                        // Since ThreadDispatch is now used for both persistent and non-persistent
+                        // modes, workers bypass `pool.return_worker` (which used to handle the recycle).
+                        // We must explicitly shut them down here so `reap_and_respawn` will replace them.
+                        let over_quota = td.over_quota_indices();
+                        if !over_quota.is_empty() {
+                            info!(
+                                count = over_quota.len(),
+                                indices = ?over_quota,
+                                "Reaper: recycling over-quota workers"
+                            );
+                        }
+                        for idx in over_quota {
+                            td.mark_unhealthy(idx);
+                            if let Some(worker) = pool.worker_mut(idx) {
+                                if reaper_state.persistent_workers {
                                     let cmd_fd = worker.cmd_fd();
                                     let shutdown_byte: [u8; 1] = [0xFF];
-                                    // Best-effort: worker may have already
-                                    // exited or the pipe may be full.  Either
-                                    // way, the next reaper tick will reap+
-                                    // respawn via `reap_and_respawn_persistent`.
                                     let _ = unsafe {
                                         libc::write(
                                             cmd_fd,
@@ -2118,12 +2140,17 @@ fn cmd_serve(
                                             1,
                                         )
                                     };
-                                    debug!(
-                                        index = idx,
-                                        "Reaper: signalled over-quota persistent worker for shutdown"
-                                    );
+                                } else {
+                                    let _ = worker.send_shutdown();
                                 }
+                                debug!(
+                                    index = idx,
+                                    "Reaper: signalled over-quota worker for shutdown"
+                                );
                             }
+                        }
+
+                        if reaper_state.persistent_workers {
                             if reaper_state.worker_mode == WorkerMode::Thread {
                                 let _ = pool.reap_and_respawn_persistent_threaded(
                                     &reaper_state.persistent_app_root,
@@ -3648,8 +3675,17 @@ async fn handle_request_inner(
         }
     };
 
+    let full_uri_cache = if request.query_string.is_empty() {
+        request.path.clone()
+    } else {
+        format!("{}?{}", request.path, request.query_string)
+    };
+
     let source_hash = ResponseCache::hash_source(&source);
-    if let Some(cached) = state.cache.get(&request.method, &request.path, source_hash) {
+    if let Some(cached) = state
+        .cache
+        .get(&request.method, &full_uri_cache, source_hash)
+    {
         let elapsed = request_start.elapsed();
         state.metrics.record_cache_hit();
         state.metrics.record_request(
@@ -3680,7 +3716,7 @@ async fn handle_request_inner(
     // latency for no hit rate.
     let mut coalesce_guard: Option<turbine_cache::LeaderGuard<CoalescedResponse>> =
         if request.method == "GET" && state.cache.is_enabled() {
-            let key = format!("GET:{}", request.path);
+            let key = format!("GET:{}", full_uri_cache);
             match state.cache_coalescer.acquire(&key) {
                 turbine_cache::LeaderOrFollower::Leader(guard) => Some(guard),
                 turbine_cache::LeaderOrFollower::Follower(follower) => {
@@ -3833,23 +3869,24 @@ async fn handle_request_inner(
                     elapsed_us,
                     response.body.len() as u64,
                 );
-                if !response_prevents_caching(&response.headers) {
+                let prevents_caching = response_prevents_caching(&response.headers);
+                if !prevents_caching {
                     state.cache.put(
                         &request.method,
-                        &request.path,
+                        &full_uri_cache,
                         source_hash,
                         status_code,
                         &content_type,
                         &response.body,
                     );
-                }
-                if let Some(ref mut g) = coalesce_guard {
-                    g.publish(CoalescedResponse {
-                        status: status_code,
-                        content_type: content_type.clone(),
-                        body: Bytes::copy_from_slice(&response.body),
-                        headers: response.headers.clone(),
-                    });
+                    if let Some(ref mut g) = coalesce_guard {
+                        g.publish(CoalescedResponse {
+                            status: status_code,
+                            content_type: content_type.clone(),
+                            body: Bytes::copy_from_slice(&response.body),
+                            headers: response.headers.clone(),
+                        });
+                    }
                 }
 
                 info!(method = %request.method, path = %request.path, status = status_code, elapsed_us = elapsed_us, "Request completed");
@@ -4086,6 +4123,14 @@ async fn handle_request_inner(
             Ok(resp) => {
                 let mut body = resp.body;
                 let mut status_code = resp.http_status;
+                // Honor the worker's `success` flag: if PHP execution
+                // failed but the script never set a non-2xx status code,
+                // returning 200 to the client would mask the failure
+                // (e.g. wrk would count it as a successful request).
+                // Override to 500 unless PHP itself signalled an error.
+                if !resp.success && (200..400).contains(&status_code) {
+                    status_code = 500;
+                }
                 let elapsed_us = request_start.elapsed().as_micros() as u64;
                 let php_content_type = resp
                     .headers
@@ -4107,23 +4152,24 @@ async fn handle_request_inner(
                 state
                     .metrics
                     .record_request(&php_path, status_code, elapsed_us, body.len() as u64);
-                if !response_prevents_caching(&resp_headers) {
+                let prevents_caching = response_prevents_caching(&resp_headers);
+                if !prevents_caching {
                     state.cache.put(
                         &request.method,
-                        &request.path,
+                        &full_uri_cache,
                         source_hash,
                         status_code,
                         &content_type,
                         &body,
                     );
-                }
-                if let Some(ref mut g) = coalesce_guard {
-                    g.publish(CoalescedResponse {
-                        status: status_code,
-                        content_type: content_type.clone(),
-                        body: Bytes::copy_from_slice(&body),
-                        headers: resp_headers.clone(),
-                    });
+                    if let Some(ref mut g) = coalesce_guard {
+                        g.publish(CoalescedResponse {
+                            status: status_code,
+                            content_type: content_type.clone(),
+                            body: Bytes::copy_from_slice(&body),
+                            headers: resp_headers.clone(),
+                        });
+                    }
                 }
                 write_access_log(
                     &state,
@@ -4523,23 +4569,24 @@ async fn handle_request_inner(
                 state
                     .metrics
                     .record_request(&php_path, status_code, elapsed_us, body.len() as u64);
-                if !response_prevents_caching(&resp_headers) {
+                let prevents_caching = response_prevents_caching(&resp_headers);
+                if !prevents_caching {
                     state.cache.put(
                         &request.method,
-                        &request.path,
+                        &full_uri_cache,
                         source_hash,
                         status_code,
                         &content_type,
                         &body,
                     );
-                }
-                if let Some(ref mut g) = coalesce_guard {
-                    g.publish(CoalescedResponse {
-                        status: status_code,
-                        content_type: content_type.clone(),
-                        body: Bytes::copy_from_slice(&body),
-                        headers: resp_headers.clone(),
-                    });
+                    if let Some(ref mut g) = coalesce_guard {
+                        g.publish(CoalescedResponse {
+                            status: status_code,
+                            content_type: content_type.clone(),
+                            body: Bytes::copy_from_slice(&body),
+                            headers: resp_headers.clone(),
+                        });
+                    }
                 }
 
                 info!(method = %request.method, path = %request.path, worker = worker_idx_log, status = status_code, elapsed_us = elapsed_us, bytes = body.len(), "Request completed");
@@ -4650,23 +4697,24 @@ async fn handle_request_inner(
                         elapsed_us,
                         body.len() as u64,
                     );
-                    if !response_prevents_caching(&resp_headers) {
+                    let prevents_caching = response_prevents_caching(&resp_headers);
+                    if !prevents_caching {
                         state.cache.put(
                             &request.method,
-                            &request.path,
+                            &full_uri_cache,
                             source_hash,
                             status_code,
                             &content_type,
                             &body,
                         );
-                    }
-                    if let Some(ref mut g) = coalesce_guard {
-                        g.publish(CoalescedResponse {
-                            status: status_code,
-                            content_type: content_type.clone(),
-                            body: Bytes::copy_from_slice(&body),
-                            headers: resp_headers.clone(),
-                        });
+                        if let Some(ref mut g) = coalesce_guard {
+                            g.publish(CoalescedResponse {
+                                status: status_code,
+                                content_type: content_type.clone(),
+                                body: Bytes::copy_from_slice(&body),
+                                headers: resp_headers.clone(),
+                            });
+                        }
                     }
 
                     info!(method = %request.method, path = %request.path, worker = worker_idx_log, status = status_code, elapsed_us = elapsed_us, bytes = body.len(), "Request completed");
@@ -4748,23 +4796,24 @@ async fn handle_request_inner(
                         elapsed_us,
                         body.len() as u64,
                     );
-                    if !response_prevents_caching(&resp_headers) {
+                    let prevents_caching = response_prevents_caching(&resp_headers);
+                    if !prevents_caching {
                         state.cache.put(
                             &request.method,
-                            &request.path,
+                            &full_uri_cache,
                             source_hash,
                             status_code,
                             &content_type,
                             &body,
                         );
-                    }
-                    if let Some(ref mut g) = coalesce_guard {
-                        g.publish(CoalescedResponse {
-                            status: status_code,
-                            content_type: content_type.clone(),
-                            body: Bytes::copy_from_slice(&body),
-                            headers: resp_headers.clone(),
-                        });
+                        if let Some(ref mut g) = coalesce_guard {
+                            g.publish(CoalescedResponse {
+                                status: status_code,
+                                content_type: content_type.clone(),
+                                body: Bytes::copy_from_slice(&body),
+                                headers: resp_headers.clone(),
+                            });
+                        }
                     }
 
                     info!(method = %request.method, path = %request.path, worker = worker_idx_log, status = status_code, elapsed_us = elapsed_us, bytes = body.len(), "Request completed");

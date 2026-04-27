@@ -27,15 +27,30 @@ workers = 4
 listen = "127.0.0.1:8080"
 # Worker backend: "process" (fork, default) or "thread" (requires ZTS PHP)
 worker_mode = "process"
-# Enable persistent workers (bootstrap once, handle many requests)
-# When true, workers load the autoloader once and handle requests without re-initialization
-# When false (default), each request executes php_execute_script with full lifecycle
+# Worker process lifecycle (preferred over `persistent_workers`):
+#   "fork_per_request" — fork a fresh PHP child per request (max isolation,
+#                        slowest, useful for plugin sandboxing).
+#   "pool_reuse"       — N long-lived workers, full php_request_startup/
+#                        shutdown per request. Equivalent to PHP-FPM with
+#                        binary IPC. Recommended default for raw PHP and
+#                        frameworks running without Octane/Roadrunner.
+#   "persistent_app"   — application is booted ONCE per worker (Laravel
+#                        Octane / FrankenPHP worker model). Maximum
+#                        throughput; requires worker_boot + worker_handler
+#                        and a worker-safe app.
+# lifecycle = "pool_reuse"
+#
+# Legacy alias (still honoured): when `lifecycle` is unset, `persistent_workers`
+# auto-derives the lifecycle:
+#   persistent_workers = false → "fork_per_request"
+#   persistent_workers = true  → "pool_reuse" (or "persistent_app" if
+#                                worker_boot + worker_handler are set).
 # persistent_workers = true
-# Boot script: executed ONCE per worker at startup (enables lightweight lifecycle)
-# Path relative to app root, or absolute. Requires persistent_workers = true.
+# Boot script: executed ONCE per worker at startup (enables persistent_app lifecycle)
+# Path relative to app root, or absolute. Requires lifecycle = "persistent_app".
 # worker_boot = "turbine-boot.php"
-# Handler script: included on EVERY request (lightweight lifecycle)
-# Requires persistent_workers = true and worker_boot to be set.
+# Handler script: included on EVERY request (persistent_app lifecycle)
+# Requires lifecycle = "persistent_app" and worker_boot to be set.
 # worker_handler = "turbine-handler.php"
 # Number of Tokio async I/O threads (default = number of CPU cores)
 # Increase for more concurrent connections; decrease to leave cores for PHP workers
@@ -276,7 +291,8 @@ statistics = true
 | `workers` | integer | CPU cores | Number of PHP worker processes |
 | `listen` | string | `"127.0.0.1:9000"` | Bind address |
 | `worker_mode` | string | `"process"` | Worker backend: `"process"` (fork) or `"thread"` (ZTS) |
-| `persistent_workers` | bool | none | Enable persistent workers (bootstrap once, handle many) |
+| `lifecycle` | string | derived | `"fork_per_request"`, `"pool_reuse"`, or `"persistent_app"`. See [worker-lifecycle.md](worker-lifecycle.md) |
+| `persistent_workers` | bool | none | **Legacy.** Maps to `lifecycle` when the latter is unset. Prefer `lifecycle`. |
 | `worker_boot` | string | none | Boot script path (once per worker). See [worker-lifecycle.md](worker-lifecycle.md) |
 | `worker_handler` | string | none | Handler script path (per request). See [worker-lifecycle.md](worker-lifecycle.md) |
 | `tokio_worker_threads` | integer | CPU cores | Number of Tokio async I/O threads |

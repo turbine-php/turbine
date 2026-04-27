@@ -54,16 +54,17 @@ done = function(summary, latency, requests)
     local rps = math.floor(summary.requests / (summary.duration / 1e6))
 
     -- latency percentiles are in microseconds; convert to ms
-    local p50 = latency:percentile(50) / 1000
-    local p99 = latency:percentile(99) / 1000
+    local p50  = latency:percentile(50)   / 1000
+    local p99  = latency:percentile(99)   / 1000
+    local p999 = latency:percentile(99.9) / 1000
     local pmax = latency.max / 1000
 
     print(string.format(
-        '{"rps":%d,"latency_p50_ms":%.2f,"latency_p99_ms":%.2f,"latency_max_ms":%.2f,' ..
+        '{"rps":%d,"latency_p50_ms":%.2f,"latency_p99_ms":%.2f,"latency_p999_ms":%.2f,"latency_max_ms":%.2f,' ..
         '"req_2xx":%d,"req_errors":%d,"req_non_2xx":%d,' ..
         '"status_2xx":%d,"status_3xx":%d,"status_4xx":%d,"status_5xx":%d,"status_other":%d,' ..
         '"first_bad_status":%d}',
-        rps, p50, p99, pmax,
+        rps, p50, p99, p999, pmax,
         req_2xx, req_errors, req_non_2xx,
         status_2xx, status_3xx, status_4xx, status_5xx, status_other,
         first_bad_status

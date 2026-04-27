@@ -283,12 +283,22 @@ pub fn decode_response(resp_fd: RawFd) -> io::Result<PersistentResponse> {
                 }
                 body.extend_from_slice(&chunk);
             }
-            Frame::End { ok: _ } => {
+            Frame::End { ok } => {
                 if !got_headers {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "decode_response: End before Headers",
                     ));
+                }
+                // Honor the worker's `ok` flag: if PHP execution failed
+                // (fatal error, exception, non-SUCCESS exit) but the
+                // script never called `http_response_code()` to signal
+                // it, the captured status is still the default 200.
+                // Returning 200 to the client would make benchmark tools
+                // (and real monitoring) count failed requests as success.
+                // Override to 500 unless PHP itself set a non-2xx code.
+                if !ok && (200..400).contains(&status) {
+                    status = 500;
                 }
                 return Ok(PersistentResponse {
                     status,
@@ -362,12 +372,17 @@ where
                 }
                 body.extend_from_slice(&chunk);
             }
-            Frame::End { ok: _ } => {
+            Frame::End { ok } => {
                 if !got_headers {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "decode_response_async: End before Headers",
                     ));
+                }
+                // See the sync `decode_response` above for the rationale
+                // behind overriding to 500 on `ok == false`.
+                if !ok && (200..400).contains(&status) {
+                    status = 500;
                 }
                 return Ok(PersistentResponse {
                     status,

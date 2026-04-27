@@ -106,8 +106,35 @@ pub struct ServerConfig {
     /// When enabled, workers handle thousands of requests without
     /// re-initialization.  Pair with `worker_boot` and `worker_handler`
     /// to enable the lightweight lifecycle.
+    ///
+    /// **Deprecated in favour of `lifecycle`** — kept for back-compat.
+    /// When both are set, `lifecycle` wins.
     #[serde(default)]
     pub persistent_workers: Option<bool>,
+    /// Worker process lifecycle. Three modes:
+    ///
+    /// - `"fork_per_request"` (= legacy `persistent_workers = false`):
+    ///   Fork a fresh PHP child per request; child exits at end. Maximum
+    ///   isolation, slowest throughput. Useful for plugin sandboxing.
+    ///
+    /// - `"pool_reuse"` (= legacy `persistent_workers = true` with NO
+    ///   `worker_boot` / `worker_handler`): N long-lived worker
+    ///   processes; each request runs full `php_request_startup` →
+    ///   execute target script → `php_request_shutdown`. Application is
+    ///   re-bootstrapped per request — same semantics as **PHP-FPM** —
+    ///   but with binary IPC instead of FastCGI. **Default for raw PHP
+    ///   apps and frameworks running without Octane/Roadrunner.**
+    ///
+    /// - `"persistent_app"` (= legacy `persistent_workers = true` +
+    ///   `worker_boot` + `worker_handler`): Application is bootstrapped
+    ///   ONCE per worker; every request reuses the booted state.
+    ///   Equivalent to Laravel Octane / FrankenPHP worker / Roadrunner.
+    ///   Maximum throughput, but app must be worker-safe.
+    ///
+    /// If unset, `lifecycle` is auto-derived from `persistent_workers`,
+    /// `worker_boot`, and `worker_handler` for back-compat.
+    #[serde(default)]
+    pub lifecycle: Option<String>,
     /// PHP script executed **once** per worker at boot time.
     /// The script should bootstrap the application (autoloader, framework,
     /// service container) and store the app instance in `$GLOBALS`.
@@ -798,6 +825,48 @@ fn default_worker_mode() -> String {
     "process".to_string()
 }
 
+/// Worker process lifecycle.
+///
+/// See [`ServerConfig::lifecycle`] for the user-facing description.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lifecycle {
+    /// Fork a fresh PHP child per request.
+    ForkPerRequest,
+    /// N long-lived workers; per-request `php_request_startup`/`shutdown`.
+    /// Equivalent to PHP-FPM but with binary IPC.
+    PoolReuse,
+    /// Application bootstrapped once per worker, reused for all requests.
+    /// Equivalent to Laravel Octane / FrankenPHP worker.
+    PersistentApp,
+}
+
+impl Lifecycle {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Lifecycle::ForkPerRequest => "fork_per_request",
+            Lifecycle::PoolReuse => "pool_reuse",
+            Lifecycle::PersistentApp => "persistent_app",
+        }
+    }
+
+    /// Whether this lifecycle keeps worker processes alive between requests.
+    pub fn workers_are_persistent(self) -> bool {
+        matches!(self, Lifecycle::PoolReuse | Lifecycle::PersistentApp)
+    }
+
+    /// Whether this lifecycle keeps the PHP application booted between
+    /// requests (i.e. uses `worker_boot` + `worker_handler`).
+    pub fn application_is_persistent(self) -> bool {
+        matches!(self, Lifecycle::PersistentApp)
+    }
+}
+
+impl std::fmt::Display for Lifecycle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -943,6 +1012,7 @@ impl Default for ServerConfig {
             max_workers: default_max_workers(),
             scale_down_idle_secs: default_scale_down_idle(),
             persistent_workers: None,
+            lifecycle: None,
             worker_boot: None,
             worker_handler: None,
             worker_cleanup: None,
@@ -1123,6 +1193,37 @@ impl Default for WatcherConfig {
 }
 
 impl RuntimeConfig {
+    /// Resolve the effective worker [`Lifecycle`] from the explicit
+    /// `lifecycle` field, falling back to legacy `persistent_workers` +
+    /// `worker_boot` + `worker_handler` flags.
+    ///
+    /// Precedence: explicit `lifecycle` wins; otherwise the legacy
+    /// flags are interpreted as:
+    ///
+    /// - `persistent_workers = true` + `worker_boot` + `worker_handler`
+    ///   → `PersistentApp`
+    /// - `persistent_workers = true`                      → `PoolReuse`
+    /// - `persistent_workers = false` (or unset)          → `ForkPerRequest`
+    pub fn effective_lifecycle(&self) -> Lifecycle {
+        if let Some(ref s) = self.server.lifecycle {
+            match s.as_str() {
+                "fork_per_request" => return Lifecycle::ForkPerRequest,
+                "pool_reuse" => return Lifecycle::PoolReuse,
+                "persistent_app" => return Lifecycle::PersistentApp,
+                _ => { /* fall through to legacy derivation */ }
+            }
+        }
+        let persistent = self.server.persistent_workers.unwrap_or(false);
+        if !persistent {
+            return Lifecycle::ForkPerRequest;
+        }
+        if self.server.worker_boot.is_some() && self.server.worker_handler.is_some() {
+            Lifecycle::PersistentApp
+        } else {
+            Lifecycle::PoolReuse
+        }
+    }
+
     /// Validate configuration and return (errors, warnings).
     ///
     /// Errors are issues that will prevent Turbine from running correctly.
@@ -1138,6 +1239,55 @@ impl RuntimeConfig {
                 "[server] worker_mode = \"{}\" — must be \"process\" or \"thread\"",
                 self.server.worker_mode
             ));
+        }
+
+        // ── Lifecycle validation ────────────────────────────────────
+        // If `lifecycle` is set explicitly, it must be one of the three
+        // known values; legacy flags are also checked for consistency.
+        if let Some(ref s) = self.server.lifecycle {
+            match s.as_str() {
+                "fork_per_request" | "pool_reuse" | "persistent_app" => {}
+                other => {
+                    errors.push(format!(
+                        "[server] lifecycle = \"{}\" — must be \"fork_per_request\", \"pool_reuse\", or \"persistent_app\"",
+                        other
+                    ));
+                }
+            }
+
+            // Cross-field consistency.
+            if s == "persistent_app" {
+                if self.server.worker_boot.is_none() {
+                    errors.push(
+                        "[server] lifecycle = \"persistent_app\" requires `worker_boot` to be set"
+                            .to_string(),
+                    );
+                }
+                if self.server.worker_handler.is_none() {
+                    errors.push("[server] lifecycle = \"persistent_app\" requires `worker_handler` to be set".to_string());
+                }
+            }
+            if s == "fork_per_request"
+                && (self.server.worker_boot.is_some() || self.server.worker_handler.is_some())
+            {
+                errors.push("[server] lifecycle = \"fork_per_request\" cannot use `worker_boot` / `worker_handler` (those require a persistent lifecycle)".to_string());
+            }
+            if s == "pool_reuse"
+                && (self.server.worker_boot.is_some() || self.server.worker_handler.is_some())
+            {
+                errors.push("[server] lifecycle = \"pool_reuse\" cannot use `worker_boot` / `worker_handler` (use lifecycle = \"persistent_app\" for that)".to_string());
+            }
+
+            // Conflicting legacy flag.
+            if let Some(pw) = self.server.persistent_workers {
+                let derived_persistent = s == "pool_reuse" || s == "persistent_app";
+                if pw != derived_persistent {
+                    warnings.push(format!(
+                        "[server] persistent_workers = {} conflicts with lifecycle = \"{}\" — `lifecycle` wins, please remove `persistent_workers`",
+                        pw, s
+                    ));
+                }
+            }
         }
 
         if self.sandbox.execution_mode != "framework" && self.sandbox.execution_mode != "strict" {

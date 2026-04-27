@@ -337,15 +337,27 @@ if (method_exists($kernel, 'reset')) {
 PHPEOF
 
 # ── 7. Turbine config files (all apps × modes × worker counts) ────────────────
-# Naming: {app}-{nts|zts}-{N}w[-p].toml
-#   nts = worker_mode "process"   persistent_workers false/true
-#   zts = worker_mode "thread"    (no persistent variant needed)
+# Naming: {app}-{nts|zts}-{N}w-{fork|pool|app}.toml
+#   nts = worker_mode "process"   |   zts = worker_mode "thread"
+#
+# Lifecycle modes (explicit since v0.x, see docs/config.md):
+#   fork  = lifecycle "fork_per_request"  → spawn fresh PHP per request (CGI-style)
+#   pool  = lifecycle "pool_reuse"        → keep workers alive, full PHP lifecycle
+#                                           per request (PHP-FPM equivalent)
+#   app   = lifecycle "persistent_app"    → boot framework once, reuse handler
+#                                           (Swoole / FrankenPHP-worker equivalent)
+#
+# Matrix (see also run.sh):
+#   raw / php-bench  : fork + pool       (no boot/handler — "app" not applicable)
+#   laravel / symfony: pool + app        (fork removed: architecturally unfair vs FPM)
+#   phalcon          : pool              (no persistent_app variant — boot files n/a)
+#
 # PHP: memory_limit=256M, opcache=128M, worker_max_requests=50000
 log "Creating Turbine config files..."
 mkdir -p /etc/turbine
 
 make_turbine_toml() {
-    local file="$1" workers="$2" mode="$3" persistent="$4"
+    local file="$1" workers="$2" mode="$3" lifecycle="$4"
     local extensions="${5:-[]}"
     local extra_ini="${6:-}"
     local extra_server="${7:-}"      # additional [server] keys (worker_boot, etc.)
@@ -356,7 +368,7 @@ listen = "0.0.0.0:80"
 workers = ${workers}
 worker_mode = "${mode}"
 worker_max_requests = 50000
-persistent_workers = ${persistent}
+lifecycle = "${lifecycle}"
 request_timeout = 30
 ${extra_server}
 [php]
@@ -381,37 +393,47 @@ TOML
 }
 
 for W in 4 8; do
-    # Raw PHP + PHP-bench scripts (stateless)
+    # Raw PHP + PHP-bench scripts (stateless) — pool variants for both 4w/8w.
+    # Fork variants are emitted only for W=8 below: `fork_per_request` mode in
+    # Turbine uses a single executor thread regardless of `workers = N`, so 4w
+    # and 8w would produce identical numbers — emitting both is misleading.
+    # No "app" variant: there is no framework boot to amortize.
     for APP in raw php-bench; do
-        make_turbine_toml /etc/turbine/${APP}-nts-${W}w.toml   ${W} process false
-        make_turbine_toml /etc/turbine/${APP}-nts-${W}w-p.toml ${W} process true
-        make_turbine_toml /etc/turbine/${APP}-zts-${W}w.toml   ${W} thread  false
-        make_turbine_toml /etc/turbine/${APP}-zts-${W}w-p.toml ${W} thread  true
+        make_turbine_toml /etc/turbine/${APP}-nts-${W}w-pool.toml ${W} process pool_reuse
+        make_turbine_toml /etc/turbine/${APP}-zts-${W}w-pool.toml ${W} thread  pool_reuse
     done
+    if [[ "$W" == "8" ]]; then
+        for APP in raw php-bench; do
+            # Single fork variant per runtime — see comment above.
+            make_turbine_toml /etc/turbine/${APP}-nts-${W}w-fork.toml ${W} process fork_per_request
+            make_turbine_toml /etc/turbine/${APP}-zts-${W}w-fork.toml ${W} thread  fork_per_request
+        done
+    fi
 
-    # Laravel — needs [sandbox] for framework detection and full app dir
+    # Laravel — pool (FPM-equivalent) + app (persistent app, framework cached in memory).
+    # fork_per_request is intentionally omitted: framework boot per request makes
+    # the comparison architecturally unfair vs FPM's pool-reuse model.
     LARAVEL_INI=$'[php.ini]\nerror_reporting = "0"\ndisplay_errors = "Off"\n"date.timezone" = "UTC"'
     LARAVEL_SANDBOX=$'[sandbox]\nexecution_mode = "framework"\nfront_controller = true'
     LARAVEL_BOOT=$'worker_boot = "turbine-boot.php"\nworker_handler = "turbine-handler.php"\nworker_cleanup = "turbine-cleanup.php"'
-    make_turbine_toml /etc/turbine/laravel-nts-${W}w.toml   ${W} process false "[]" "$LARAVEL_INI" "" "$LARAVEL_SANDBOX"
-    make_turbine_toml /etc/turbine/laravel-nts-${W}w-p.toml ${W} process true  "[]" "$LARAVEL_INI" "$LARAVEL_BOOT" "$LARAVEL_SANDBOX"
-    make_turbine_toml /etc/turbine/laravel-zts-${W}w.toml   ${W} thread  false "[]" "$LARAVEL_INI" "" "$LARAVEL_SANDBOX"
-    make_turbine_toml /etc/turbine/laravel-zts-${W}w-p.toml ${W} thread  true  "[]" "$LARAVEL_INI" "$LARAVEL_BOOT" "$LARAVEL_SANDBOX"
+    make_turbine_toml /etc/turbine/laravel-nts-${W}w-pool.toml ${W} process pool_reuse      "[]" "$LARAVEL_INI" ""              "$LARAVEL_SANDBOX"
+    make_turbine_toml /etc/turbine/laravel-nts-${W}w-app.toml  ${W} process persistent_app  "[]" "$LARAVEL_INI" "$LARAVEL_BOOT" "$LARAVEL_SANDBOX"
+    make_turbine_toml /etc/turbine/laravel-zts-${W}w-pool.toml ${W} thread  pool_reuse      "[]" "$LARAVEL_INI" ""              "$LARAVEL_SANDBOX"
+    make_turbine_toml /etc/turbine/laravel-zts-${W}w-app.toml  ${W} thread  persistent_app  "[]" "$LARAVEL_INI" "$LARAVEL_BOOT" "$LARAVEL_SANDBOX"
 
-    # Phalcon (requires phalcon extension)
-    make_turbine_toml /etc/turbine/phalcon-nts-${W}w.toml   ${W} process false '["phalcon.so"]'
-    make_turbine_toml /etc/turbine/phalcon-nts-${W}w-p.toml ${W} process true  '["phalcon.so"]'
-    make_turbine_toml /etc/turbine/phalcon-zts-${W}w.toml   ${W} thread  false '["phalcon.so"]'
-    make_turbine_toml /etc/turbine/phalcon-zts-${W}w-p.toml ${W} thread  true  '["phalcon.so"]'
+    # Phalcon — pool only. No persistent_app variant (no boot/handler files).
+    # fork_per_request omitted for the same reason as Laravel/Symfony.
+    make_turbine_toml /etc/turbine/phalcon-nts-${W}w-pool.toml ${W} process pool_reuse '["phalcon.so"]'
+    make_turbine_toml /etc/turbine/phalcon-zts-${W}w-pool.toml ${W} thread  pool_reuse '["phalcon.so"]'
 
-    # Symfony — same pattern as Laravel (framework mode, front controller, worker files)
+    # Symfony — same pattern as Laravel.
     SYMFONY_INI=$'[php.ini]\nerror_reporting = "0"\ndisplay_errors = "Off"\n"date.timezone" = "UTC"\n"realpath_cache_size" = "4096k"\n"realpath_cache_ttl" = "600"'
     SYMFONY_SANDBOX=$'[sandbox]\nexecution_mode = "framework"\nfront_controller = true'
     SYMFONY_BOOT=$'worker_boot = "turbine-boot.php"\nworker_handler = "turbine-handler.php"\nworker_cleanup = "turbine-cleanup.php"'
-    make_turbine_toml /etc/turbine/symfony-nts-${W}w.toml   ${W} process false "[]" "$SYMFONY_INI" "" "$SYMFONY_SANDBOX"
-    make_turbine_toml /etc/turbine/symfony-nts-${W}w-p.toml ${W} process true  "[]" "$SYMFONY_INI" "$SYMFONY_BOOT" "$SYMFONY_SANDBOX"
-    make_turbine_toml /etc/turbine/symfony-zts-${W}w.toml   ${W} thread  false "[]" "$SYMFONY_INI" "" "$SYMFONY_SANDBOX"
-    make_turbine_toml /etc/turbine/symfony-zts-${W}w-p.toml ${W} thread  true  "[]" "$SYMFONY_INI" "$SYMFONY_BOOT" "$SYMFONY_SANDBOX"
+    make_turbine_toml /etc/turbine/symfony-nts-${W}w-pool.toml ${W} process pool_reuse      "[]" "$SYMFONY_INI" ""              "$SYMFONY_SANDBOX"
+    make_turbine_toml /etc/turbine/symfony-nts-${W}w-app.toml  ${W} process persistent_app  "[]" "$SYMFONY_INI" "$SYMFONY_BOOT" "$SYMFONY_SANDBOX"
+    make_turbine_toml /etc/turbine/symfony-zts-${W}w-pool.toml ${W} thread  pool_reuse      "[]" "$SYMFONY_INI" ""              "$SYMFONY_SANDBOX"
+    make_turbine_toml /etc/turbine/symfony-zts-${W}w-app.toml  ${W} thread  persistent_app  "[]" "$SYMFONY_INI" "$SYMFONY_BOOT" "$SYMFONY_SANDBOX"
 done
 
 # ── 8. FrankenPHP worker scripts ──────────────────────────────────────────────
