@@ -149,14 +149,38 @@ jobs:
             > /tmp/bench-report.md
           cat /tmp/bench-report.md
 
+      - name: Compare against previous benchmark
+        # Looks at the most recent JSON in benchmarks/results/history/.
+        # Warn-only by default — pass STRICT=1 (or change --strict below) to
+        # fail the workflow on regressions exceeding the threshold.
+        run: |
+          PREV=$(ls -1 benchmarks/results/history/*.json 2>/dev/null | sort | tail -1 || true)
+          if [[ -z "${PREV:-}" ]]; then
+            echo "No previous JSON results found — skipping regression check."
+            exit 0
+          fi
+          echo "Comparing against ${PREV}"
+          python3 benchmarks/scripts/compare.py \
+            /tmp/bench-results.json "$PREV" \
+            --threshold-pct 10 \
+            | tee /tmp/bench-compare.md
+          # Append compare report to the markdown report so it shows up in the commit
+          {
+            echo
+            echo "---"
+            echo
+            cat /tmp/bench-compare.md
+          } >> /tmp/bench-report.md
+
       - name: Commit results to repository
         if: steps.meta.outputs.commit == 'true'
         run: |
           TAG="${{ steps.meta.outputs.tag }}"
           DATE="${{ steps.meta.outputs.date }}"
           mkdir -p benchmarks/results/history
-          cp /tmp/bench-report.md benchmarks/results/README.md
-          cp /tmp/bench-report.md "benchmarks/results/history/${DATE}-${TAG}.md"
+          cp /tmp/bench-report.md   benchmarks/results/README.md
+          cp /tmp/bench-report.md   "benchmarks/results/history/${DATE}-${TAG}.md"
+          cp /tmp/bench-results.json "benchmarks/results/history/${DATE}-${TAG}.json"
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add benchmarks/results/

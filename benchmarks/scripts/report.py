@@ -99,11 +99,12 @@ def speedup(a_rps, b_rps) -> str:
 
 
 SERVER_LABELS = {
-    # Turbine — fork_per_request (CGI-style cold start; stateless scenarios only)
-    "turbine_nts_4w_fork":  "Turbine NTS · 4w · fork-per-request",
-    "turbine_nts_8w_fork":  "Turbine NTS · 8w · fork-per-request",
-    "turbine_zts_4w_fork":  "Turbine ZTS · 4w · fork-per-request",
-    "turbine_zts_8w_fork":  "Turbine ZTS · 8w · fork-per-request",
+    # Turbine — fork_per_request (single-executor diagnostic; one row per runtime).
+    # See architecture note in CLASS_FORK below: worker count is ignored in
+    # this mode, so we don't emit `_4w_fork` rows — they would be identical
+    # to `_8w_fork`.
+    "turbine_nts_8w_fork":  "Turbine NTS · single-executor (fork_per_request)",
+    "turbine_zts_8w_fork":  "Turbine ZTS · single-executor (fork_per_request)",
     # Turbine — pool_reuse (PHP-FPM-equivalent: workers alive, full PHP lifecycle/req)
     "turbine_nts_4w_pool":  "Turbine NTS · 4w · pool-reuse (FPM-eq)",
     "turbine_nts_8w_pool":  "Turbine NTS · 8w · pool-reuse (FPM-eq)",
@@ -124,8 +125,8 @@ SERVER_LABELS = {
 }
 
 SERVER_ORDER = [
-    "turbine_nts_4w_fork",  "turbine_nts_8w_fork",
-    "turbine_zts_4w_fork",  "turbine_zts_8w_fork",
+    "turbine_nts_8w_fork",
+    "turbine_zts_8w_fork",
     "turbine_nts_4w_pool",  "turbine_nts_8w_pool",
     "turbine_zts_4w_pool",  "turbine_zts_8w_pool",
     "turbine_nts_4w_app",   "turbine_nts_8w_app",
@@ -135,23 +136,63 @@ SERVER_ORDER = [
     "nginx_fpm_4w",         "nginx_fpm_8w",
 ]
 
+# ── Equivalence classes ──────────────────────────────────────────────────────
+# Each row in the report belongs to ONE class. Cross-class comparisons are
+# architecturally unfair (e.g. fork-per-request vs pool-reuse measures cold
+# start cost, not server overhead). We split the table by class so readers
+# don't accidentally compare incompatible runtimes side-by-side.
+#
+# CLASS_FORK   — Turbine `fork_per_request` lifecycle. Despite the name, this
+#                does NOT fork(2) per request: it runs a single PHP engine
+#                with a single executor thread serializing all requests
+#                through `php_request_startup`/`shutdown`. The `workers = N`
+#                config field is ignored, so only one row per runtime is
+#                emitted. Kept as a diagnostic baseline only;
+#                **not architecturally comparable** to FPM or FrankenPHP.
+# CLASS_POOL   — workers alive, full PHP lifecycle per request. The classic
+#                FPM model. Apples-to-apples for: turbine pool, FPM,
+#                FrankenPHP regular mode.
+# CLASS_APP    — framework boots once, handler reused (persistent app).
+#                Apples-to-apples for: turbine app, FrankenPHP worker mode,
+#                Swoole. NOT comparable to FPM (which has no equivalent).
+CLASS_FORK = [
+    "turbine_nts_8w_fork",
+    "turbine_zts_8w_fork",
+]
+CLASS_POOL = [
+    "turbine_nts_4w_pool", "turbine_nts_8w_pool",
+    "turbine_zts_4w_pool", "turbine_zts_8w_pool",
+    "frankenphp_4w",       "frankenphp_8w",
+    "nginx_fpm_4w",        "nginx_fpm_8w",
+]
+CLASS_APP = [
+    "turbine_nts_4w_app",   "turbine_nts_8w_app",
+    "turbine_zts_4w_app",   "turbine_zts_8w_app",
+    "frankenphp_4w_worker", "frankenphp_8w_worker",
+]
 
-def render_table(scenario: dict) -> str:
-    # Determine which servers are present in this scenario
-    servers = [s for s in SERVER_ORDER if s in scenario]
+
+def render_table(scenario: dict, keys: list | None = None,
+                 baseline_key: str | None = None) -> str:
+    """Render a single Markdown table. If `keys` is given, only those rows are
+    shown (filtered by what's actually present in `scenario`). If `baseline_key`
+    is given, the 'vs baseline' column is computed against it; otherwise we
+    pick the FPM 8w row when available, else the last row."""
+    available = keys if keys is not None else SERVER_ORDER
+    servers = [s for s in available if s in scenario]
     if not servers:
         return "_No data available._"
-    # Use 8w FPM as baseline (closest to classic nginx+fpm baseline)
-    for _bk in ("nginx_fpm_8w", "nginx_fpm_4w", "nginx_fpm"):
-        if _bk in scenario:
-            baseline_key = _bk
-            break
-    else:
-        baseline_key = servers[-1]
+    if baseline_key is None or baseline_key not in scenario:
+        for _bk in ("nginx_fpm_8w", "nginx_fpm_4w", "nginx_fpm"):
+            if _bk in scenario and _bk in servers:
+                baseline_key = _bk
+                break
+        else:
+            baseline_key = servers[-1]
     baseline_rps = scenario.get(baseline_key, {}).get("rps", 0)
 
-    header = "| Server | Req/s | vs baseline | p50 | p99 | Avg CPU | Peak Mem | Errors | Status |"
-    sep    = "|--------|------:|:-----------:|----:|----:|:-------:|---------:|-------:|:-------|"
+    header = "| Server | Req/s | vs baseline | p50 | p99 | p99.9 | max | Avg CPU | Peak Mem | Errors | Status |"
+    sep    = "|--------|------:|:-----------:|----:|----:|------:|----:|:-------:|---------:|-------:|:-------|"
     rows   = [header, sep]
 
     for key in servers:
@@ -160,14 +201,73 @@ def render_table(scenario: dict) -> str:
         rps   = fmt_rps_with_flag(data)
         p50   = fmt_ms(data.get("latency_p50"))
         p99   = fmt_ms(data.get("latency_p99"))
+        p999  = fmt_ms(data.get("latency_p999"))
+        pmax  = fmt_ms(data.get("latency_max"))
         cpu   = fmt_cpu(data.get("avg_cpu_pct"))
         mem   = fmt_mem(data.get("peak_mem_mib"))
         errs  = fmt_errors(data.get("req_errors"))
         status = fmt_status_col(data)
         vs    = speedup(data.get("rps", 0), baseline_rps) if key != baseline_key else "baseline"
-        rows.append(f"| {label} | {rps} | {vs} | {p50} | {p99} | {cpu} | {mem} | {errs} | {status} |")
+        rows.append(f"| {label} | {rps} | {vs} | {p50} | {p99} | {p999} | {pmax} | {cpu} | {mem} | {errs} | {status} |")
 
     return "\n".join(rows)
+
+
+def render_scenario(scenario: dict) -> str:
+    """Render a scenario as up to 3 sub-tables grouped by equivalence class.
+    Sections are only emitted if at least one key from the class is present
+    in the scenario data."""
+    if not scenario:
+        return "_No data available._"
+    parts: list[str] = []
+
+    pool_present = [k for k in CLASS_POOL if k in scenario]
+    if pool_present:
+        parts += [
+            "**Pool-reuse class** — apples-to-apples: PHP processes alive, "
+            "full PHP lifecycle per request (PHP-FPM model).",
+            "",
+            render_table(scenario, keys=CLASS_POOL),
+            "",
+        ]
+
+    app_present = [k for k in CLASS_APP if k in scenario]
+    if app_present:
+        # Use the best FrankenPHP-worker as the baseline for the app class
+        # (the natural counterpart to turbine_*_app); fall back to last row.
+        app_baseline = next(
+            (k for k in ("frankenphp_8w_worker", "frankenphp_4w_worker") if k in scenario),
+            app_present[-1],
+        )
+        parts += [
+            "**Persistent-app class** — apples-to-apples: framework boots once "
+            "via `worker_boot`, handler reused (Swoole / FrankenPHP-worker model).",
+            "",
+            render_table(scenario, keys=CLASS_APP, baseline_key=app_baseline),
+            "",
+        ]
+
+    fork_present = [k for k in CLASS_FORK if k in scenario]
+    if fork_present:
+        # Baseline within the fork class itself: NTS is the natural
+        # reference. Comparing fork to FPM here would be misleading.
+        fork_baseline = next(
+            (k for k in ("turbine_nts_8w_fork",) if k in scenario),
+            fork_present[-1],
+        )
+        parts += [
+            "**Single-executor (fork_per_request) class** — diagnostic only. "
+            "Despite the lifecycle name, this mode does **not** fork per request: "
+            "it runs one PHP engine with a single executor thread serializing all "
+            "requests. `workers = N` is ignored, so only one row per runtime is "
+            "shown. **Not comparable** to FPM/FrankenPHP, which maintain warm "
+            "process pools.",
+            "",
+            render_table(scenario, keys=CLASS_FORK, baseline_key=fork_baseline),
+            "",
+        ]
+
+    return "\n".join(parts).rstrip() if parts else "_No data available._"
 
 
 PHP_SCRIPT_LABELS = {
@@ -197,7 +297,7 @@ def render_php_scripts_section(php_scenario: dict) -> str:
             if isinstance(arr, list) and idx < len(arr):
                 single[key] = arr[idx]
         if any(k for k in single if k in SERVER_ORDER):
-            lines += [render_table(single), ""]
+            lines += [render_scenario(single), ""]
 
     return "\n".join(lines)
 
@@ -246,15 +346,22 @@ def render_report(data: dict, version: str, date: str) -> str:
         "> **NTS**: Non-thread-safe PHP — process mode (fork per worker).",
         "> **ZTS**: Thread-safe PHP — thread mode (shared memory, lock-free dispatch).",
         "> **Lifecycle modes** (Turbine):",
-        "> - **fork-per-request** — fresh PHP process per request (CGI-style). "
-        "Shown only for stateless scenarios; **not architecturally comparable** to FPM/FrankenPHP, "
-        "which both reuse processes between requests.",
-        "> - **pool-reuse (FPM-eq)** — workers stay alive, full PHP lifecycle per request. "
-        "This is the apples-to-apples comparison vs Nginx+FPM and FrankenPHP regular mode.",
+        "> - **fork-per-request** — single PHP engine, requests serialized through one executor thread "
+        "(`php_request_startup` + `php_request_shutdown` per request, no inter-process pool). "
+        "Despite the name, **fork(2) is not called per request** — the `workers = N` config field is "
+        "ignored in this mode, so only one row per runtime is reported. Treat as a serial-executor "
+        "diagnostic. **Not architecturally comparable** to FPM/FrankenPHP, which both maintain warm "
+        "process pools.",
+        "> - **pool-reuse (FPM-eq)** — N workers forked at startup, each running its own event loop, "
+        "full PHP lifecycle (startup+shutdown) per request. Apples-to-apples vs Nginx+FPM and FrankenPHP regular.",
         "> - **persistent-app** — framework boots once via `worker_boot`, handler reused. "
-        "Comparable to FrankenPHP **worker** mode and Swoole.",
+        "Apples-to-apples vs FrankenPHP **worker** mode and Swoole.",
         "> **FrankenPHP** uses ZTS PHP internally and does **not** support Phalcon.",
         "> All servers (including FPM) run inside Docker containers for equal overhead.",
+        "> **PHP runtime tuning is identical across all 3 runtimes** for fairness:",
+        "> - OPcache: enabled, 128 MiB, validate_timestamps=0, save_comments=1",
+        "> - JIT: `opcache.jit = function` with 64 MiB buffer",
+        "> - FPM uses `pm = static` with `pm.max_children = N` (no elastic spawning during run)",
         "> CPU and memory metrics are collected via `docker stats --no-stream` during benchmark.",
         "",
         "> **⚠️ Disclaimer:** These benchmarks are synthetic and may not reflect real-world performance. "
@@ -274,19 +381,19 @@ def render_report(data: dict, version: str, date: str) -> str:
         "",
         f"_{raw.get('description', 'Single PHP file returning plain-text Hello World.')}_",
         "",
-        render_table(raw),
+        render_scenario(raw),
         "",
         "## Laravel",
         "",
         f"_{laravel.get('description', 'Laravel framework, single JSON route, no database.')}_",
         "",
-        render_table(laravel),
+        render_scenario(laravel),
         "",
         "## Symfony",
         "",
         f"_{symfony.get('description', 'Symfony framework, mixed JSON routes.')}_",
         "",
-        render_table(symfony),
+        render_scenario(symfony),
         "",
         "## Phalcon",
         "",
@@ -294,7 +401,7 @@ def render_report(data: dict, version: str, date: str) -> str:
         "",
         f"> {phalcon.get('note', '')}",
         "",
-        render_table(phalcon),
+        render_scenario(phalcon),
         "",
         "## PHP Scripts",
         "",

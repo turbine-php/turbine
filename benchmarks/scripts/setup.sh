@@ -393,14 +393,22 @@ TOML
 }
 
 for W in 4 8; do
-    # Raw PHP + PHP-bench scripts (stateless) — fork + pool both make sense.
+    # Raw PHP + PHP-bench scripts (stateless) — pool variants for both 4w/8w.
+    # Fork variants are emitted only for W=8 below: `fork_per_request` mode in
+    # Turbine uses a single executor thread regardless of `workers = N`, so 4w
+    # and 8w would produce identical numbers — emitting both is misleading.
     # No "app" variant: there is no framework boot to amortize.
     for APP in raw php-bench; do
-        make_turbine_toml /etc/turbine/${APP}-nts-${W}w-fork.toml ${W} process fork_per_request
         make_turbine_toml /etc/turbine/${APP}-nts-${W}w-pool.toml ${W} process pool_reuse
-        make_turbine_toml /etc/turbine/${APP}-zts-${W}w-fork.toml ${W} thread  fork_per_request
         make_turbine_toml /etc/turbine/${APP}-zts-${W}w-pool.toml ${W} thread  pool_reuse
     done
+    if [[ "$W" == "8" ]]; then
+        for APP in raw php-bench; do
+            # Single fork variant per runtime — see comment above.
+            make_turbine_toml /etc/turbine/${APP}-nts-${W}w-fork.toml ${W} process fork_per_request
+            make_turbine_toml /etc/turbine/${APP}-zts-${W}w-fork.toml ${W} thread  fork_per_request
+        done
+    fi
 
     # Laravel — pool (FPM-equivalent) + app (persistent app, framework cached in memory).
     # fork_per_request is intentionally omitted: framework boot per request makes
