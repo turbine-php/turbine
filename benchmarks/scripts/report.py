@@ -99,14 +99,22 @@ def speedup(a_rps, b_rps) -> str:
 
 
 SERVER_LABELS = {
-    "turbine_nts_4w":       "Turbine NTS · 4w",
-    "turbine_nts_8w":       "Turbine NTS · 8w",
-    "turbine_nts_4w_p":     "Turbine NTS · 4w · persistent",
-    "turbine_nts_8w_p":     "Turbine NTS · 8w · persistent",
-    "turbine_zts_4w":       "Turbine ZTS · 4w",
-    "turbine_zts_8w":       "Turbine ZTS · 8w",
-    "turbine_zts_4w_p":     "Turbine ZTS · 4w · persistent",
-    "turbine_zts_8w_p":     "Turbine ZTS · 8w · persistent",
+    # Turbine — fork_per_request (CGI-style cold start; stateless scenarios only)
+    "turbine_nts_4w_fork":  "Turbine NTS · 4w · fork-per-request",
+    "turbine_nts_8w_fork":  "Turbine NTS · 8w · fork-per-request",
+    "turbine_zts_4w_fork":  "Turbine ZTS · 4w · fork-per-request",
+    "turbine_zts_8w_fork":  "Turbine ZTS · 8w · fork-per-request",
+    # Turbine — pool_reuse (PHP-FPM-equivalent: workers alive, full PHP lifecycle/req)
+    "turbine_nts_4w_pool":  "Turbine NTS · 4w · pool-reuse (FPM-eq)",
+    "turbine_nts_8w_pool":  "Turbine NTS · 8w · pool-reuse (FPM-eq)",
+    "turbine_zts_4w_pool":  "Turbine ZTS · 4w · pool-reuse (FPM-eq)",
+    "turbine_zts_8w_pool":  "Turbine ZTS · 8w · pool-reuse (FPM-eq)",
+    # Turbine — persistent_app (boot framework once, reuse handler; Laravel/Symfony)
+    "turbine_nts_4w_app":   "Turbine NTS · 4w · persistent-app",
+    "turbine_nts_8w_app":   "Turbine NTS · 8w · persistent-app",
+    "turbine_zts_4w_app":   "Turbine ZTS · 4w · persistent-app",
+    "turbine_zts_8w_app":   "Turbine ZTS · 8w · persistent-app",
+    # FrankenPHP & FPM (unchanged)
     "frankenphp_4w":        "FrankenPHP (ZTS) · 4w",
     "frankenphp_8w":        "FrankenPHP (ZTS) · 8w",
     "frankenphp_4w_worker": "FrankenPHP (ZTS) · 4w · worker",
@@ -116,10 +124,12 @@ SERVER_LABELS = {
 }
 
 SERVER_ORDER = [
-    "turbine_nts_4w",       "turbine_nts_8w",
-    "turbine_nts_4w_p",     "turbine_nts_8w_p",
-    "turbine_zts_4w",       "turbine_zts_8w",
-    "turbine_zts_4w_p",     "turbine_zts_8w_p",
+    "turbine_nts_4w_fork",  "turbine_nts_8w_fork",
+    "turbine_zts_4w_fork",  "turbine_zts_8w_fork",
+    "turbine_nts_4w_pool",  "turbine_nts_8w_pool",
+    "turbine_zts_4w_pool",  "turbine_zts_8w_pool",
+    "turbine_nts_4w_app",   "turbine_nts_8w_app",
+    "turbine_zts_4w_app",   "turbine_zts_8w_app",
     "frankenphp_4w",        "frankenphp_8w",
     "frankenphp_4w_worker", "frankenphp_8w_worker",
     "nginx_fpm_4w",         "nginx_fpm_8w",
@@ -235,7 +245,14 @@ def render_report(data: dict, version: str, date: str) -> str:
         "> **Baseline**: Nginx + PHP-FPM · 8 workers.",
         "> **NTS**: Non-thread-safe PHP — process mode (fork per worker).",
         "> **ZTS**: Thread-safe PHP — thread mode (shared memory, lock-free dispatch).",
-        "> **Persistent**: PHP worker stays alive across requests (bootstrap once, handle many).",
+        "> **Lifecycle modes** (Turbine):",
+        "> - **fork-per-request** — fresh PHP process per request (CGI-style). "
+        "Shown only for stateless scenarios; **not architecturally comparable** to FPM/FrankenPHP, "
+        "which both reuse processes between requests.",
+        "> - **pool-reuse (FPM-eq)** — workers stay alive, full PHP lifecycle per request. "
+        "This is the apples-to-apples comparison vs Nginx+FPM and FrankenPHP regular mode.",
+        "> - **persistent-app** — framework boots once via `worker_boot`, handler reused. "
+        "Comparable to FrankenPHP **worker** mode and Swoole.",
         "> **FrankenPHP** uses ZTS PHP internally and does **not** support Phalcon.",
         "> All servers (including FPM) run inside Docker containers for equal overhead.",
         "> CPU and memory metrics are collected via `docker stats --no-stream` during benchmark.",

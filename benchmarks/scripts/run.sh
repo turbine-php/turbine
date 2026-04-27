@@ -3,13 +3,17 @@
 #
 # Usage: bash run.sh [version] [php-version] [connections] [duration]
 #
-# Servers compared per scenario:
-#   turbine_nts    — Turbine process mode (NTS Docker image)
-#   turbine_nts_p  — Turbine process mode, persistent workers (NTS Docker image)
-#   turbine_zts    — Turbine thread  mode (ZTS Docker image)
-#   turbine_zts_p  — Turbine thread  mode, persistent workers (ZTS Docker image)
-#   frankenphp     — FrankenPHP (ZTS-based Docker image; NOT used for Phalcon)
-#   nginx_fpm      — Nginx + PHP-FPM native, with Phalcon extension installed
+# Servers compared per scenario (key suffix → Turbine lifecycle mode):
+#   turbine_{nts|zts}_{N}w_fork  — fork_per_request (CGI-style; raw + php_scripts only)
+#   turbine_{nts|zts}_{N}w_pool  — pool_reuse       (PHP-FPM-equivalent; all scenarios)
+#   turbine_{nts|zts}_{N}w_app   — persistent_app   (Swoole-style; Laravel + Symfony only)
+#   frankenphp_{N}w              — FrankenPHP regular mode (≈ pool_reuse equivalent)
+#   frankenphp_{N}w_worker       — FrankenPHP worker mode  (≈ persistent_app equivalent)
+#   nginx_fpm_{N}w               — Nginx + PHP-FPM native (always pool-reuse semantics)
+#
+# fork_per_request is intentionally omitted for Laravel/Symfony/Phalcon: rebuilding
+# the framework from scratch on every request makes the comparison architecturally
+# unfair vs FPM/FrankenPHP, which both reuse processes between requests.
 #
 # HTTP metrics: req/s, latency p50/p99/max (wrk + Lua JSON)
 # System metrics: avg CPU%, peak memory MiB (docker stats streaming)
@@ -483,21 +487,23 @@ bench_php_scripts() {
 PHP_SCRIPTS=(html_50k.php pdf_50k.php random_50k.php)
 
 # ─── Raw PHP ─────────────────────────────────────────────────────────────────
+# Both fork and pool make sense here: stateless workload, no framework boot to
+# amortize → useful to show raw cold-start cost vs warm-pool cost.
 log "==> Scenario: Raw PHP"
 for W in 4 8; do
-    for P in "" "-p"; do
-        KEY="turbine_nts_${W}w${P//-/_}"
+    for L in fork pool; do
+        KEY="turbine_nts_${W}w_${L}"
         save_result raw_php "$KEY" \
-            "$(bench_container "nts${P}/${W}w/raw" "$TURBINE_IMAGE_NTS" "/" \
+            "$(bench_container "nts/${L}/${W}w/raw" "$TURBINE_IMAGE_NTS" "/" \
                 -v /var/www/raw:/var/www/html \
-                -v "/etc/turbine/raw-nts-${W}w${P}.toml:/var/www/html/turbine.toml:ro")"
+                -v "/etc/turbine/raw-nts-${W}w-${L}.toml:/var/www/html/turbine.toml:ro")"
     done
-    for P in "" "-p"; do
-        KEY="turbine_zts_${W}w${P//-/_}"
+    for L in fork pool; do
+        KEY="turbine_zts_${W}w_${L}"
         save_result raw_php "$KEY" \
-            "$(bench_container "zts${P}/${W}w/raw" "$TURBINE_IMAGE_ZTS" "/" \
+            "$(bench_container "zts/${L}/${W}w/raw" "$TURBINE_IMAGE_ZTS" "/" \
                 -v /var/www/raw:/var/www/html \
-                -v "/etc/turbine/raw-zts-${W}w${P}.toml:/var/www/html/turbine.toml:ro")"
+                -v "/etc/turbine/raw-zts-${W}w-${L}.toml:/var/www/html/turbine.toml:ro")"
     done
     save_result raw_php "frankenphp_${W}w" \
         "$(bench_container "frankenphp/${W}w/raw" "$FRANKENPHP_IMAGE" "/" \
@@ -517,22 +523,23 @@ for W in 4 8; do
 done
 
 # ─── PHP Scripts ─────────────────────────────────────────────────────────────
+# Same rationale as Raw PHP: fork + pool both make sense for stateless scripts.
 log "==> Scenario: PHP scripts (hello, html_50k, pdf_50k, random_50k)"
 for W in 4 8; do
-    for P in "" "-p"; do
-        KEY="turbine_nts_${W}w${P//-/_}"
+    for L in fork pool; do
+        KEY="turbine_nts_${W}w_${L}"
         save_result php_scripts "$KEY" \
-            "$(bench_php_scripts "nts${P}/${W}w/php-bench" "$TURBINE_IMAGE_NTS" \
+            "$(bench_php_scripts "nts/${L}/${W}w/php-bench" "$TURBINE_IMAGE_NTS" \
                 -v /var/www/php-bench:/var/www/html \
-                -v "/etc/turbine/php-bench-nts-${W}w${P}.toml:/var/www/html/turbine.toml:ro" \
+                -v "/etc/turbine/php-bench-nts-${W}w-${L}.toml:/var/www/html/turbine.toml:ro" \
                 -- "${PHP_SCRIPTS[@]}")"
     done
-    for P in "" "-p"; do
-        KEY="turbine_zts_${W}w${P//-/_}"
+    for L in fork pool; do
+        KEY="turbine_zts_${W}w_${L}"
         save_result php_scripts "$KEY" \
-            "$(bench_php_scripts "zts${P}/${W}w/php-bench" "$TURBINE_IMAGE_ZTS" \
+            "$(bench_php_scripts "zts/${L}/${W}w/php-bench" "$TURBINE_IMAGE_ZTS" \
                 -v /var/www/php-bench:/var/www/html \
-                -v "/etc/turbine/php-bench-zts-${W}w${P}.toml:/var/www/html/turbine.toml:ro" \
+                -v "/etc/turbine/php-bench-zts-${W}w-${L}.toml:/var/www/html/turbine.toml:ro" \
                 -- "${PHP_SCRIPTS[@]}")"
     done
     save_result php_scripts "frankenphp_${W}w" \
@@ -556,23 +563,28 @@ for W in 4 8; do
 done
 
 # ─── Laravel ─────────────────────────────────────────────────────────────────
+# fork_per_request is OMITTED here: rebuilding Laravel on every request is
+# architecturally incomparable to FPM (which reuses processes). The honest
+# Turbine variants for framework comparison are:
+#   pool = PHP lifecycle reused, framework still bootstraps each request (FPM-eq)
+#   app  = framework boots once via worker_boot, handler reused (Swoole / FP-worker eq)
 log "==> Scenario: Laravel (GET /, GET /user/:id, POST /user)"
 for W in 4 8; do
-    for P in "" "-p"; do
-        KEY="turbine_nts_${W}w${P//-/_}"
+    for L in pool app; do
+        KEY="turbine_nts_${W}w_${L}"
         BENCH_LUA_SCRIPT="$WRK_LUA_FRAMEWORK"
         save_result laravel "$KEY" \
-            "$(bench_container "nts${P}/${W}w/laravel" "$TURBINE_IMAGE_NTS" "/" \
+            "$(bench_container "nts/${L}/${W}w/laravel" "$TURBINE_IMAGE_NTS" "/" \
                 -v /var/www/laravel:/var/www/html \
-                -v "/etc/turbine/laravel-nts-${W}w${P}.toml:/var/www/html/turbine.toml:ro")"
+                -v "/etc/turbine/laravel-nts-${W}w-${L}.toml:/var/www/html/turbine.toml:ro")"
     done
-    for P in "" "-p"; do
-        KEY="turbine_zts_${W}w${P//-/_}"
+    for L in pool app; do
+        KEY="turbine_zts_${W}w_${L}"
         BENCH_LUA_SCRIPT="$WRK_LUA_FRAMEWORK"
         save_result laravel "$KEY" \
-            "$(bench_container "zts${P}/${W}w/laravel" "$TURBINE_IMAGE_ZTS" "/" \
+            "$(bench_container "zts/${L}/${W}w/laravel" "$TURBINE_IMAGE_ZTS" "/" \
                 -v /var/www/laravel:/var/www/html \
-                -v "/etc/turbine/laravel-zts-${W}w${P}.toml:/var/www/html/turbine.toml:ro")"
+                -v "/etc/turbine/laravel-zts-${W}w-${L}.toml:/var/www/html/turbine.toml:ro")"
     done
     BENCH_LUA_SCRIPT="$WRK_LUA_FRAMEWORK"
     save_result laravel "frankenphp_${W}w" \
@@ -598,23 +610,24 @@ done
 # Turbine uses [sandbox] front_controller=true to route to public/index.php
 
 # ─── Symfony ─────────────────────────────────────────────────────────────────
+# Same matrix as Laravel: pool + app only (no fork_per_request).
 log "==> Scenario: Symfony (GET /, GET /user/:id, POST /user)"
 for W in 4 8; do
-    for P in "" "-p"; do
-        KEY="turbine_nts_${W}w${P//-/_}"
+    for L in pool app; do
+        KEY="turbine_nts_${W}w_${L}"
         BENCH_LUA_SCRIPT="$WRK_LUA_FRAMEWORK"
         save_result symfony "$KEY" \
-            "$(bench_container "nts${P}/${W}w/symfony" "$TURBINE_IMAGE_NTS" "/" \
+            "$(bench_container "nts/${L}/${W}w/symfony" "$TURBINE_IMAGE_NTS" "/" \
                 -v /var/www/symfony:/var/www/html \
-                -v "/etc/turbine/symfony-nts-${W}w${P}.toml:/var/www/html/turbine.toml:ro")"
+                -v "/etc/turbine/symfony-nts-${W}w-${L}.toml:/var/www/html/turbine.toml:ro")"
     done
-    for P in "" "-p"; do
-        KEY="turbine_zts_${W}w${P//-/_}"
+    for L in pool app; do
+        KEY="turbine_zts_${W}w_${L}"
         BENCH_LUA_SCRIPT="$WRK_LUA_FRAMEWORK"
         save_result symfony "$KEY" \
-            "$(bench_container "zts${P}/${W}w/symfony" "$TURBINE_IMAGE_ZTS" "/" \
+            "$(bench_container "zts/${L}/${W}w/symfony" "$TURBINE_IMAGE_ZTS" "/" \
                 -v /var/www/symfony:/var/www/html \
-                -v "/etc/turbine/symfony-zts-${W}w${P}.toml:/var/www/html/turbine.toml:ro")"
+                -v "/etc/turbine/symfony-zts-${W}w-${L}.toml:/var/www/html/turbine.toml:ro")"
     done
     BENCH_LUA_SCRIPT="$WRK_LUA_FRAMEWORK"
     save_result symfony "frankenphp_${W}w" \
@@ -637,24 +650,23 @@ for W in 4 8; do
 done
 
 # ─── Phalcon (Turbine only + Nginx+FPM — Phalcon incompatible with FrankenPHP) ───────
+# Pool only: no boot/handler files for Phalcon, and fork is excluded (same
+# rationale as Laravel/Symfony — stateless framework boot per request not
+# meaningful vs FPM).
 log "==> Scenario: Phalcon (GET /, GET /user/:id, POST /user)"
 for W in 4 8; do
-    for P in "" "-p"; do
-        KEY="turbine_nts_${W}w${P//-/_}"
-        BENCH_LUA_SCRIPT="$WRK_LUA_FRAMEWORK"
-        save_result phalcon "$KEY" \
-            "$(bench_container "nts${P}/${W}w/phalcon" "$TURBINE_IMAGE_NTS" "/" \
-                -v /var/www/phalcon:/var/www/html \
-                -v "/etc/turbine/phalcon-nts-${W}w${P}.toml:/var/www/html/turbine.toml:ro")"
-    done
-    for P in "" "-p"; do
-        KEY="turbine_zts_${W}w${P//-/_}"
-        BENCH_LUA_SCRIPT="$WRK_LUA_FRAMEWORK"
-        save_result phalcon "$KEY" \
-            "$(bench_container "zts${P}/${W}w/phalcon" "$TURBINE_IMAGE_ZTS" "/" \
-                -v /var/www/phalcon:/var/www/html \
-                -v "/etc/turbine/phalcon-zts-${W}w${P}.toml:/var/www/html/turbine.toml:ro")"
-    done
+    KEY="turbine_nts_${W}w_pool"
+    BENCH_LUA_SCRIPT="$WRK_LUA_FRAMEWORK"
+    save_result phalcon "$KEY" \
+        "$(bench_container "nts/pool/${W}w/phalcon" "$TURBINE_IMAGE_NTS" "/" \
+            -v /var/www/phalcon:/var/www/html \
+            -v "/etc/turbine/phalcon-nts-${W}w-pool.toml:/var/www/html/turbine.toml:ro")"
+    KEY="turbine_zts_${W}w_pool"
+    BENCH_LUA_SCRIPT="$WRK_LUA_FRAMEWORK"
+    save_result phalcon "$KEY" \
+        "$(bench_container "zts/pool/${W}w/phalcon" "$TURBINE_IMAGE_ZTS" "/" \
+            -v /var/www/phalcon:/var/www/html \
+            -v "/etc/turbine/phalcon-zts-${W}w-pool.toml:/var/www/html/turbine.toml:ro")"
     BENCH_LUA_SCRIPT="$WRK_LUA_FRAMEWORK"
     save_result phalcon "nginx_fpm_${W}w" \
         "$(bench_container "fpm/${W}w/phalcon" "$FPM_IMAGE" "/" \
@@ -674,10 +686,16 @@ import json, os
 results_dir = '${RESULTS_DIR}'
 
 SERVER_ORDER = [
-    'turbine_nts_4w',        'turbine_nts_8w',
-    'turbine_nts_4w_p',      'turbine_nts_8w_p',
-    'turbine_zts_4w',        'turbine_zts_8w',
-    'turbine_zts_4w_p',      'turbine_zts_8w_p',
+    # Turbine — fork (CGI-style; only present in stateless scenarios)
+    'turbine_nts_4w_fork',  'turbine_nts_8w_fork',
+    'turbine_zts_4w_fork',  'turbine_zts_8w_fork',
+    # Turbine — pool (PHP-FPM-equivalent; present in all scenarios)
+    'turbine_nts_4w_pool',  'turbine_nts_8w_pool',
+    'turbine_zts_4w_pool',  'turbine_zts_8w_pool',
+    # Turbine — app (persistent_app; only Laravel + Symfony)
+    'turbine_nts_4w_app',   'turbine_nts_8w_app',
+    'turbine_zts_4w_app',   'turbine_zts_8w_app',
+    # FrankenPHP & FPM (unchanged)
     'frankenphp_4w',         'frankenphp_8w',
     'frankenphp_4w_worker',  'frankenphp_8w_worker',
     'nginx_fpm_4w',          'nginx_fpm_8w',
